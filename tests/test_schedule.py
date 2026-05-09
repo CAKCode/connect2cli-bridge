@@ -25,6 +25,7 @@ def test_create_schedule_definition_persists_definition(tmp_path) -> None:
     stored = list_schedule_definitions(tmp_path)
     assert len(stored) == 1
     assert stored[0].chat_key == "single:alice"
+    assert due_schedule_definitions(tmp_path, current_ms=int(__import__("time").time() * 1000)) == []
 
 
 def test_create_one_shot_schedule_marks_due_when_past_now(tmp_path) -> None:
@@ -65,6 +66,22 @@ def test_pause_resume_and_delete_schedule_definition(tmp_path) -> None:
 
     delete_schedule_definition(tmp_path, definition.schedule_id)
     assert read_schedule_definition(tmp_path, definition.schedule_id) is None
+
+
+def test_resume_one_shot_schedule_preserves_one_shot_timing(tmp_path) -> None:
+    definition = create_one_shot_schedule(
+        tmp_path,
+        schedule_id="schedule-1",
+        chat_key="single:alice",
+        message="hello",
+        run_at_ms=1234,
+    )
+
+    paused = pause_schedule_definition(tmp_path, definition.schedule_id)
+    resumed = resume_schedule_definition(tmp_path, paused.schedule_id)
+
+    assert resumed.cron is None
+    assert resumed.next_run_at >= 1234
 
 
 def test_create_schedule_definition_persists_misfire_and_concurrency(tmp_path) -> None:

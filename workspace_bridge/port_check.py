@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import errno
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-
-
-LISTEN_STATE = "0A"
 
 
 @dataclass(frozen=True)
@@ -24,122 +20,72 @@ class PortProbeResult:
     status: str
     host: str
     port: int
-    owners: tuple[PortOwner, ...] = ()
+    owners: tuple[PortOwner, ...] = field(default_factory=tuple)
     error_errno: int | None = None
-    error_message: str | None = None
-
-
-def socket_family_for_host(host: str) -> int:
-    return socket.AF_INET6 if ":" in host and host != "localhost" else socket.AF_INET
-
-
-def normalize_host(host: str) -> str:
-    return "127.0.0.1" if host == "localhost" else host
 
 
 def bind_host_port(host: str, port: int) -> None:
-    family = socket_family_for_host(host)
+    family = socket.AF_INET6 if ":" in host and host != "localhost" else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
     finally:
         sock.close()
 
 
-def decode_ipv4(hex_value: str) -> str:
-    raw = bytes.fromhex(hex_value)
-    return socket.inet_ntop(socket.AF_INET, raw[::-1])
+def _parse_proc_net_tcp(path: Path) -> dict[str, str]:
+    listeners: dict[str, str] = {}
+    if not path.exists():
+        return listeners
+    for line in path.read_text(encoding="utf-8").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        local_address = parts[1]
+        inode = parts[9]
+        listeners[inode] = local_address
+    return listeners
 
 
-def decode_ipv6(hex_value: str) -> str:
-    raw = bytes.fromhex(hex_value)
-    try:
-        return socket.inet_ntop(socket.AF_INET6, raw)
-    except OSError:
-        words = [raw[index : index + 4][::-1] for index in range(0, len(raw), 4)]
-        return socket.inet_ntop(socket.AF_INET6, b"".join(words))
+def _decode_listener(local_address: str) -> str:
+    host_hex, port_hex = local_address.split(":")
+    port = int(port_hex, 16)
+    if host_hex == "00000000":
+        host = "0.0.0.0"
+    else:
+        host = socket.inet_ntoa(bytes.fromhex(host_hex)[::-1])
+    return f"{host}:{port}"
 
 
-def iter_listeners(table_path: Path, family: int) -> tuple[tuple[str, int, str], ...]:
-    listeners: list[tuple[str, int, str]] = []
-    if not table_path.exists():
-        return ()
-    with table_path.open(encoding="utf-8") as handle:
-        next(handle, None)
-        for line in handle:
-            parts = line.split()
-            if len(parts) < 10 or parts[3] != LISTEN_STATE:
-                continue
-            try:
-                address_hex, port_hex = parts[1].split(":")
-                listener = decode_ipv4(address_hex) if family == socket.AF_INET else decode_ipv6(address_hex)
-                listeners.append((listener, int(port_hex, 16), parts[9]))
-            except (OSError, ValueError):
-                continue
-    return tuple(listeners)
-
-
-def listener_conflicts(target_host: str, listener_host: str) -> bool:
-    normalized_target = normalize_host(target_host)
-    if ":" in normalized_target:
-        if normalized_target == "::":
-            return True
-        return listener_host in {normalized_target, "::"}
-    if normalized_target == "0.0.0.0":
-        return True
-    return listener_host in {normalized_target, "0.0.0.0"}
-
-
-def find_port_owners(host: str, port: int, *, proc_root: str = "/proc") -> tuple[PortOwner, ...]:
-    proc_path = Path(proc_root)
-    family = socket_family_for_host(host)
-    tables = [("net/tcp", socket.AF_INET)] if family == socket.AF_INET else [("net/tcp6", socket.AF_INET6)]
-    matches: dict[str, str] = {}
-    for relative_path, table_family in tables:
-        for listener_host, listener_port, inode in iter_listeners(proc_path / relative_path, table_family):
-            if listener_port != port:
-                continue
-            if listener_conflicts(host, listener_host):
-                matches[inode] = f"{listener_host}:{listener_port}"
-    if not matches:
-        return ()
-
+def find_port_owners(host: str, port: int, *, proc_root: str = "/proc") -> list[PortOwner]:
+    proc_root_path = Path(proc_root)
+    listeners = _parse_proc_net_tcp(proc_root_path / "net" / "tcp")
     owners: list[PortOwner] = []
-    for entry in sorted(proc_path.iterdir(), key=lambda path: path.name):
+    for entry in proc_root_path.iterdir():
         if not entry.name.isdigit():
             continue
         fd_dir = entry / "fd"
         if not fd_dir.exists():
             continue
-        listener = None
-        try:
-            fds = sorted(fd_dir.iterdir(), key=lambda path: path.name)
-        except OSError:
-            continue
-        for fd_path in fds:
+        for fd in fd_dir.iterdir():
             try:
-                link_target = os.readlink(fd_path)
+                target = os.readlink(fd)
             except OSError:
                 continue
-            if not link_target.startswith("socket:["):
+            if not target.startswith("socket:["):
                 continue
-            inode = link_target[8:-1]
-            listener = matches.get(inode)
-            if listener:
-                break
-        if not listener:
-            continue
-        try:
-            cwd = os.readlink(entry / "cwd")
-        except OSError:
-            cwd = ""
-        try:
-            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode().strip()
-        except OSError:
-            cmdline = ""
-        owners.append(PortOwner(pid=int(entry.name), listener=listener, cwd=cwd, cmdline=cmdline))
-    return tuple(owners)
+            inode = target[8:-1]
+            local_address = listeners.get(inode)
+            if not local_address:
+                continue
+            listener = _decode_listener(local_address)
+            listener_host, listener_port = listener.rsplit(":", 1)
+            if int(listener_port) != port:
+                continue
+            cwd = os.readlink(entry / "cwd") if (entry / "cwd").exists() else ""
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "ignore").strip() if (entry / "cmdline").exists() else ""
+            owners.append(PortOwner(pid=int(entry.name), listener=listener, cwd=cwd, cmdline=cmdline))
+    return owners
 
 
 def probe_port(host: str, port: int) -> PortProbeResult:
@@ -147,60 +93,19 @@ def probe_port(host: str, port: int) -> PortProbeResult:
         bind_host_port(host, port)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
-            return PortProbeResult(
-                status="in_use",
-                host=host,
-                port=port,
-                owners=find_port_owners(host, port),
-                error_errno=exc.errno,
-                error_message=str(exc),
-            )
-        return PortProbeResult(
-            status="error",
-            host=host,
-            port=port,
-            error_errno=exc.errno,
-            error_message=str(exc),
-        )
+            return PortProbeResult(status="in_use", host=host, port=port, owners=tuple(find_port_owners(host, port)))
+        return PortProbeResult(status="error", host=host, port=port, error_errno=exc.errno)
     return PortProbeResult(status="available", host=host, port=port)
 
 
-def format_probe_result(result: PortProbeResult) -> str:
-    if result.status == "available":
-        return f"port {result.host}:{result.port} is available"
-    if result.status == "error":
-        if result.error_errno is not None:
-            return f"port probe failed for {result.host}:{result.port}: [Errno {result.error_errno}] {result.error_message}"
-        return f"port probe failed for {result.host}:{result.port}: {result.error_message}"
-    if not result.owners:
-        return f"port {result.host}:{result.port} is already in use"
-    lines = [f"port {result.host}:{result.port} is already in use"]
-    for owner in result.owners:
-        details = [f"pid={owner.pid}", f"listener={owner.listener}"]
-        if owner.cwd:
-            details.append(f"cwd={owner.cwd}")
-        if owner.cmdline:
-            details.append(f"cmd={owner.cmdline}")
-        lines.append(" ".join(details))
-    return "\n".join(lines)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Probe whether a TCP port can be bound.")
-    parser.add_argument("--describe", action="store_true", help="print a human-readable result")
-    parser.add_argument("host")
-    parser.add_argument("port", type=int)
-    args = parser.parse_args(argv)
-
-    result = probe_port(args.host, args.port)
-    if args.describe or result.status != "available":
-        print(format_probe_result(result))
-    if result.status == "available":
+def main(argv: list[str]) -> int:
+    if len(argv) >= 3 and argv[0] == "--describe":
+        host, port = argv[1], int(argv[2])
+        result = probe_port(host, port)
+        if result.status == "in_use":
+            print(f"port {host}:{port} is already in use")
+            for owner in result.owners:
+                print(f"pid={owner.pid} listener={owner.listener} cwd={owner.cwd} cmdline={owner.cmdline}")
+            return 1
         return 0
-    if result.status == "in_use":
-        return 1
-    return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return 0

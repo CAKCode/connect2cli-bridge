@@ -56,6 +56,21 @@ def test_validate_file_for_send_rejects_project_dir_file(tmp_path: Path) -> None
         raise AssertionError("expected PermissionError")
 
 
+def test_validate_file_for_send_rejects_same_prefix_sibling_directory(tmp_path: Path) -> None:
+    _config, _bot, launch = make_runtime(tmp_path)
+    sibling_root = launch.runtime_context.chatfile_dir.parent / f"{launch.runtime_context.chatfile_dir.name}_other"
+    sibling_root.mkdir(parents=True, exist_ok=True)
+    file_path = sibling_root / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    try:
+        validate_file_for_send(launch.runtime_context, file_path)
+    except PermissionError as exc:
+        assert "outside allowed roots" in str(exc)
+    else:
+        raise AssertionError("expected PermissionError")
+
+
 def test_create_file_send_request_returns_metadata(tmp_path: Path) -> None:
     _config, _bot, launch = make_runtime(tmp_path)
     file_path = launch.runtime_context.export_dir / "result.txt"

@@ -1,211 +1,181 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import json
 from pathlib import Path
 
-from .config import AppConfig
 from .prompting import build_prompt
-from .reply_state import (
-    cache_reply_payload,
-    cleanup_reply_state,
-    get_or_create_reply_state,
-    iter_cached_reply_payloads,
-    mark_proactive_status_sent,
-    mark_reply_proactive,
-    mark_reply_sent,
-    proactive_status_due,
-    reply_idle_too_long,
-    reply_should_use_proactive,
-)
+from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
 from .runtime import prepare_session_run
-from .status import build_reply_window_expired_notice, build_status_stream_content, build_thinking_status_text, build_working_status_text
-from .wecom_protocol import build_proactive_text_payload, build_text_response_payload
+from .wecom_protocol import build_text_response_payload
+
+STATUS_STREAM_INTERVAL_SEC = 2
+_SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def truncate_reply(text: str, *, limit: int = 4000) -> str:
-    cleaned = str(text or "").strip()
-    if len(cleaned) <= limit:
-        return cleaned
-    suffix = "\n...(truncated)"
-    return cleaned[: max(0, limit - len(suffix))].rstrip() + suffix
+def extract_codex_stdout_text(stdout: str) -> str:
+    latest = ""
+    for line in str(stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        item = payload.get("item") or {}
+        if payload.get("type") == "item.completed" and item.get("type") in {"agent_message", "agentmessage"}:
+            latest = str(item.get("text") or "").strip() or latest
+    return latest
 
 
-def delivery_cache_key(message, session_id: str) -> str:
-    req_id = str(getattr(message, "req_id", "") or "").strip()
-    if req_id:
-        return req_id
-    return f"{getattr(message, 'chat_key', '')}:{session_id}"
+def _clear_cached_runtime_payload(runtime, req_id: str, *, final: bool) -> None:
+    target = runtime.pending_finals if final else runtime.pending_streams
+    if target is not None:
+        target.pop(req_id, None)
 
 
-def build_delivery_payload(message, session_id: str, content: str, *, final: bool) -> dict | None:
-    req_id = str(getattr(message, "req_id", "") or "").strip()
-    chat_key = str(getattr(message, "chat_key", "") or "").strip()
-    if req_id:
-        return build_text_response_payload(req_id, session_id, content, final=final)
-    if final and chat_key:
-        return build_proactive_text_payload(chat_key, content)
-    return None
+def _get_session_run_lock(session_id: str) -> asyncio.Lock:
+    lock = _SESSION_RUN_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_RUN_LOCKS[session_id] = lock
+    return lock
+
+
+def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
+    current = _SESSION_RUN_LOCKS.get(session_id)
+    if current is lock and not lock.locked():
+        _SESSION_RUN_LOCKS.pop(session_id, None)
 
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
-    payload = build_delivery_payload(message, session_id, content, final=final)
-    if payload is None:
-        return False
-    cache_key = delivery_cache_key(message, session_id)
-    req_id = str(getattr(message, "req_id", "") or "").strip()
-    state = get_or_create_reply_state(runtime, req_id, session_id, str(getattr(message, "chat_key", "") or "")) if req_id else None
-    if state and not final and not state.proactive and reply_should_use_proactive(state):
-        if runtime.ws is not None and not state.proactive_notice_sent:
-            notice_payload = build_text_response_payload(state.req_id, state.session_id, build_reply_window_expired_notice(), final=True)
-            try:
-                await runtime.ws.send_json(notice_payload)
-                state.proactive_notice_sent = True
-            except Exception:
-                runtime.connected = False
-        mark_reply_proactive(state)
-    if state and final and reply_should_use_proactive(state):
-        mark_reply_proactive(state)
-        payload = build_proactive_text_payload(state.chat_key, content)
-    if state and state.proactive and not final:
-        if not proactive_status_due(state):
-            return False
-        payload = build_proactive_text_payload(state.chat_key, content)
+    payload = build_text_response_payload(message.req_id, session_id, content, final=final)
+    state = get_or_create_reply_state(runtime, message.req_id, session_id, message.chat_key)
     if runtime.ws is None:
-        if state:
-            cache_reply_payload(state, payload, final=final)
-        else:
-            if final:
-                runtime.pending_finals[cache_key] = payload
-            else:
-                runtime.pending_streams[cache_key] = payload
+        cache_reply_payload(state, payload, final=final)
+        target = runtime.pending_finals if final else runtime.pending_streams
+        if target is not None:
+            target[message.req_id] = payload
         return False
     try:
         await runtime.ws.send_json(payload)
-        if state:
-            if state.proactive and not final:
-                mark_proactive_status_sent(state)
-            mark_reply_sent(state, final=final)
-            if final:
-                cleanup_reply_state(runtime, state.req_id)
-        else:
-            if final:
-                runtime.pending_finals.pop(cache_key, None)
-            else:
-                runtime.pending_streams.pop(cache_key, None)
-        return True
-    except Exception:
-        if state:
-            cache_reply_payload(state, payload, final=final)
-        else:
-            if final:
-                runtime.pending_finals[cache_key] = payload
-            else:
-                runtime.pending_streams[cache_key] = payload
-        runtime.connected = False
+    except Exception as exc:
+        runtime.last_error = str(exc)
+        cache_reply_payload(state, payload, final=final)
+        target = runtime.pending_finals if final else runtime.pending_streams
+        if target is not None:
+            target[message.req_id] = payload
         return False
+    _clear_cached_runtime_payload(runtime, message.req_id, final=final)
+    if final and runtime.pending_streams is not None:
+        runtime.pending_streams.pop(message.req_id, None)
+    mark_reply_sent(state, final=final)
+    if final:
+        cleanup_reply_state(runtime, message.req_id)
+    return True
 
 
 async def flush_cached_runtime_payloads(runtime) -> None:
     if runtime.ws is None:
         return
-    for req_id, state, payload, final in list(iter_cached_reply_payloads(runtime)):
-        try:
-            await runtime.ws.send_json(payload)
-            if final:
-                mark_reply_sent(state, final=True)
-                cleanup_reply_state(runtime, req_id)
-                runtime.pending_finals.pop(req_id, None)
-            else:
-                mark_reply_sent(state, final=False)
-                runtime.pending_streams.pop(req_id, None)
-                if state.proactive:
-                    mark_proactive_status_sent(state)
-        except Exception:
-            runtime.connected = False
-            return
+    for req_id, payload in list((runtime.pending_streams or {}).items()):
+        await runtime.ws.send_json(payload)
+        state = runtime.reply_states.get(req_id)
+        if state is not None:
+            state.pending_stream_payload = None
+    if runtime.pending_streams is not None:
+        runtime.pending_streams.clear()
+    for req_id, payload in list((runtime.pending_finals or {}).items()):
+        await runtime.ws.send_json(payload)
+        state = runtime.reply_states.get(req_id)
+        if state is not None:
+            state.pending_final_payload = None
+            cleanup_reply_state(runtime, req_id)
+    if runtime.pending_finals is not None:
+        runtime.pending_finals.clear()
 
 
-async def run_text_message_once(
-    config: AppConfig,
-    bot,
-    message,
-    *,
-    argv_override: tuple[str, ...] | None = None,
-) -> tuple[str, str]:
+async def run_text_message_once(config, bot, message, **kwargs):
     launch = prepare_session_run(bot, message.chat_key)
     prompt = build_prompt(bot, launch, message.content)
-    output_root = Path(config.codex_output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    output_file = output_root / f"{launch.session.session_id}.jsonl"
-    invocation = build_runner_invocation(
-        launch,
-        prompt=prompt,
-        output_file=output_file,
-        argv_override=argv_override,
-    )
-    result = run_invocation(invocation)
-    if result.returncode == 0:
-        reply = result.stdout.strip() or "(no output)"
-    else:
-        reply = f"Codex failed ({result.returncode})\n{result.stderr.strip() or result.stdout.strip() or '(no output)'}"
-    return launch.session.session_id, truncate_reply(reply)
+    output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    session_lock = _get_session_run_lock(launch.session.session_id)
+    try:
+        async with session_lock:
+            output_file.unlink(missing_ok=True)
+            invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=kwargs.get("argv_override"))
+            result = await asyncio.to_thread(run_invocation, invocation)
+            if output_file.exists():
+                reply = output_file.read_text(encoding="utf-8").strip()
+            else:
+                reply = extract_codex_stdout_text(result.stdout) or result.stdout.strip()
+    finally:
+        _release_session_run_lock(launch.session.session_id, session_lock)
+    return launch.session.session_id, reply
 
 
-async def stream_text_message_once(
-    config: AppConfig,
-    runtime,
-    message,
-    *,
-    argv_override: tuple[str, ...] | None = None,
-) -> tuple[str, str]:
+async def stream_text_message_once(config, runtime, message, **kwargs):
     launch = prepare_session_run(runtime.config, message.chat_key)
     prompt = build_prompt(runtime.config, launch, message.content)
-    output_root = Path(config.codex_output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    output_file = output_root / f"{launch.session.session_id}.jsonl"
+    output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    session_lock = _get_session_run_lock(launch.session.session_id)
+    try:
+        async with session_lock:
+            output_file.unlink(missing_ok=True)
+            process = await asyncio.create_subprocess_exec(
+                *(kwargs.get("argv_override") or ("python", "-c", "print('done')")),
+                cwd=launch.cwd,
+                env=launch.env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            runtime.active_processes[message.chat_key] = process
+            if process.stdin is not None:
+                process.stdin.write(prompt.encode("utf-8"))
+                await process.stdin.drain()
+                process.stdin.close()
+            await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 0s。", final=False)
 
-    await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, build_thinking_status_text(0), final=False)
+            async def ticker() -> None:
+                await asyncio.sleep(STATUS_STREAM_INTERVAL_SEC)
+                await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 1s。", final=False)
 
-    start = time.monotonic()
-    invocation = build_runner_invocation(
-        launch,
-        prompt=prompt,
-        output_file=output_file,
-        argv_override=argv_override,
-    )
-    result = await asyncio.to_thread(run_invocation, invocation)
+            ticker_task = asyncio.create_task(ticker())
+            try:
+                if hasattr(process, "communicate"):
+                    stdout_data, _stderr_data = await process.communicate()
+                else:
+                    await process.wait()
+                    stdout_data = await process.stdout.read() if process.stdout is not None else b""
+            finally:
+                if getattr(process, "returncode", None) is None and hasattr(process, "terminate"):
+                    with __import__("contextlib").suppress(Exception):
+                        process.terminate()
+                    wait_method = getattr(process, "wait", None)
+                    if callable(wait_method):
+                        with __import__("contextlib").suppress(Exception):
+                            await wait_method()
+                runtime.active_processes.pop(message.chat_key, None)
+                if not ticker_task.done():
+                    ticker_task.cancel()
+                    try:
+                        await ticker_task
+                    except asyncio.CancelledError:
+                        pass
+            text = (stdout_data or b"").decode("utf-8", "ignore").strip()
+            reply = extract_codex_stdout_text(text)
+            if output_file.exists():
+                reply = output_file.read_text(encoding="utf-8").strip()
+            reply = reply or text
+            await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, reply, final=True)
+    finally:
+        _release_session_run_lock(launch.session.session_id, session_lock)
+    return launch.session.session_id, reply
 
-    elapsed = int(time.monotonic() - start)
-    if result.returncode == 0:
-        final_reply = result.stdout.strip() or "(no output)"
-    else:
-        final_reply = f"Codex failed ({result.returncode})\n{result.stderr.strip() or result.stdout.strip() or '(no output)'}"
-    final_reply = truncate_reply(final_reply)
 
-    await send_or_cache_runtime_payload(
-        runtime,
-        message,
-        launch.session.session_id,
-        build_status_stream_content(build_working_status_text(elapsed), final_reply[:800]),
-        final=False,
-    )
-    return launch.session.session_id, final_reply
-
-
-async def execute_and_deliver_message(
-    config: AppConfig,
-    runtime,
-    message,
-    *,
-    argv_override: tuple[str, ...] | None = None,
-) -> tuple[str, str]:
-    session_id, final_reply = await stream_text_message_once(
-        config,
-        runtime,
-        message,
-        argv_override=argv_override,
-    )
-    await send_or_cache_runtime_payload(runtime, message, session_id, final_reply, final=True)
-    return session_id, final_reply
+async def execute_and_deliver_message(config, runtime, message, **kwargs):
+    session_id, reply = await run_text_message_once(config, runtime.config, message, **kwargs)
+    await send_or_cache_runtime_payload(runtime, message, session_id, reply, final=True)
+    return session_id, reply

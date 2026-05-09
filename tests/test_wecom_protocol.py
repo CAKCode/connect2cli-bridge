@@ -79,3 +79,17 @@ def test_is_subscribe_ok_accepts_success_payload() -> None:
     assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": 0}) is True
     assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": 1}) is False
     assert is_subscribe_ok({"headers": {"req_id": "req-1"}, "errcode": 0, "errmsg": "ok"}) is True
+
+
+def test_uid_is_unique_within_same_millisecond() -> None:
+    from workspace_bridge import wecom_protocol
+
+    original_time = wecom_protocol.time.time
+    wecom_protocol.time.time = lambda: 1000.0
+    try:
+        first = wecom_protocol.uid()
+        second = wecom_protocol.uid()
+    finally:
+        wecom_protocol.time.time = original_time
+
+    assert first != second

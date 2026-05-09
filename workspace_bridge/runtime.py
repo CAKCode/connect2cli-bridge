@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from .context import build_runtime_context
+from .context import build_runtime_context, resolve_workspace_cwd
 from .layout import build_workspace_ref
 from .models import BotConfig, CodexLaunchSpec, SessionRecord, SourceConfig
 from .provision import provision_workspace
@@ -83,6 +83,8 @@ def load_session_record(runtime_root: Path | str, session_id: str) -> SessionRec
         workspace_scope=str(payload["workspaceScope"]),
         project_dir=Path(payload["projectDir"]).resolve(),
         chatfile_dir=Path(payload["chatfileDir"]).resolve(),
+        workfile_dir=Path(payload["workfileDir"]).resolve() if payload.get("workfileDir") else None,
+        roomfile_dir=Path(payload["roomfileDir"]).resolve() if payload.get("roomfileDir") else None,
         created_at=int(payload["createdAt"]),
         updated_at=int(payload["updatedAt"]),
     )
@@ -100,6 +102,8 @@ def store_session_record(runtime_root: Path | str, session: SessionRecord) -> Se
             "workspaceScope": session.workspace_scope,
             "projectDir": str(session.project_dir),
             "chatfileDir": str(session.chatfile_dir),
+            "workfileDir": str(session.workfile_dir) if session.workfile_dir else None,
+            "roomfileDir": str(session.roomfile_dir) if session.roomfile_dir else None,
             "createdAt": session.created_at,
             "updatedAt": session.updated_at,
         },
@@ -128,6 +132,8 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             workspace_scope=workspace_ref.scope,
             project_dir=runtime_context.project_dir,
             chatfile_dir=runtime_context.chatfile_dir,
+            workfile_dir=runtime_context.workfile_dir,
+            roomfile_dir=runtime_context.roomfile_dir,
             created_at=created_at,
             updated_at=now_ms(),
         )
@@ -143,6 +149,6 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             session=session,
             workspace=provisioned,
             runtime_context=runtime_context,
-            cwd=runtime_context.project_dir,
+            cwd=resolve_workspace_cwd(workspace_ref),
             env=env,
         )

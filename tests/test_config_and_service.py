@@ -77,13 +77,15 @@ async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
         async def json(self):
             return {"chatKey": "single:alice", "message": "hello"}
 
-    prepare_match = next(route for route in app.router.routes() if route.method == "POST")
+    prepare_match = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/prepare")
     prepared_response = await prepare_match.handler(JsonRequest(app))
     prepared_payload = json.loads(prepared_response.text)
     assert prepared_payload["ok"] is True
     assert prepared_payload["workspaceId"].startswith("user:")
     assert prepared_payload["cwd"].endswith("/project")
+    assert prepared_payload["workfileDir"].endswith("/workfile")
     assert "prompt" in prepared_payload
+    assert prepared_payload["sessionId"].startswith("session-")
 
 
 def test_build_bot_from_app_config_returns_runtime_bot(tmp_path: Path) -> None:

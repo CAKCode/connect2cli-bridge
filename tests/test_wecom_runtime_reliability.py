@@ -41,6 +41,20 @@ async def test_flush_cached_runtime_payloads_delivers_reply_state_payloads() -> 
 
     assert runtime.ws.sent == [payload]
     assert state.pending_stream_payload is None
+    assert "req-1" in runtime.reply_states
+
+
+async def test_flush_cached_runtime_payloads_cleans_final_reply_state() -> None:
+    runtime = make_runtime()
+    state = get_or_create_reply_state(runtime, "req-1", "session-1", "single:alice")
+    payload = {"headers": {"req_id": "req-1"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True)
+    runtime.pending_finals["req-1"] = payload
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.ws.sent == [payload]
+    assert "req-1" not in runtime.reply_states
 
 
 async def test_reject_pending_requests_sets_future_exception() -> None:

@@ -42,6 +42,8 @@ def test_build_bridge_context_mentions_project_dir_and_skills(tmp_path: Path) ->
     assert "PROJECT_DIR:" in context
     assert "SOURCE_DIR:" in context
     assert "WORKSPACE_SKILL_DIR:" in context
+    assert "WORKFILE_DIR:" in context
+    assert "ROOMFILE_DIR:" in context
     assert "effectiveSkills: deploy" in context
     assert "cwd=PROJECT_DIR" in context
 

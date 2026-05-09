@@ -45,6 +45,22 @@ def test_provision_workspace_keeps_existing_project_files(tmp_path: Path) -> Non
     assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "custom"
 
 
+def test_provision_workspace_skips_runtime_root_copy_to_avoid_recursive_project(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "repo" / ".workspace-bridge-runtime"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    runtime_root.mkdir(parents=True)
+    (source_dir / "README.md").write_text("repo", encoding="utf-8")
+    nested_runtime_file = runtime_root / "marker.txt"
+    nested_runtime_file.write_text("runtime", encoding="utf-8")
+    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
+
+    provision_workspace(workspace)
+
+    assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "repo"
+    assert not (workspace.project_dir / ".workspace-bridge-runtime").exists()
+
+
 def test_workspace_lock_creates_lock_file(tmp_path: Path) -> None:
     runtime_root = tmp_path / "runtime"
     source_dir = tmp_path / "repo"
@@ -73,7 +89,13 @@ def test_build_runtime_context_uses_workspace_skill_precedence(tmp_path: Path) -
     assert context.project_dir == workspace.project_dir
     assert context.chatfile_dir.is_dir()
     assert context.export_dir == context.chatfile_dir
+    assert context.workfile_dir == workspace.workfile_dir
+    assert context.roomfile_dir == workspace.roomfile_dir
+    assert workspace.workfile_dir.resolve() in context.allowed_file_roots
+    assert workspace.roomfile_dir.resolve() in context.allowed_file_roots
     assert context.effective_skill_names == ("deploy", "lint")
     assert context.env["WECOM_BRIDGE_PROJECT_DIR"] == str(workspace.project_dir)
+    assert context.env["WECOM_BRIDGE_WORKFILE_DIR"] == str(workspace.workfile_dir)
+    assert context.env["WECOM_BRIDGE_ROOMFILE_DIR"] == str(workspace.roomfile_dir)
     assert context.env["WECOM_BRIDGE_USER_ID"] == "alice"
     assert context.env["WECOM_BRIDGE_ROOM_ID"] == "room-1"

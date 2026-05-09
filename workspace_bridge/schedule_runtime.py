@@ -1,153 +1,206 @@
 from __future__ import annotations
 
-import asyncio
+import json
 import time
+from pathlib import Path
 
-from .config import AppConfig, build_bot_from_app_config
-from .execution import run_text_message_once
+from .config import build_bot_from_app_config
+from .models import WeComTextMessage
 from .schedule import (
-    build_scheduled_job,
+    ScheduleDefinition,
+    ScheduledJob,
     compute_next_cron_run_on_or_after,
     due_schedule_definitions,
-    finalize_scheduled_job,
-    iter_due_scheduled_job_files,
-    now_ms,
-    read_scheduled_job,
-    schedule_definition_file,
+    schedule_done_root,
+    schedule_failed_root,
     schedule_pending_root,
     schedule_processing_root,
-    write_json_atomic,
-    write_scheduled_job,
+    write_schedule_definition,
 )
+from .execution import run_text_message_once
+
+SCHEDULE_ORPHAN_TTL_MS = 60_000
+SCHEDULE_DEFINITION_POLL_MS = 1_000
 
 
-def uid() -> str:
-    return f"{int(time.time() * 1000):x}"
-
-
-def schedule_has_processing_job(config: AppConfig, schedule_id: str) -> bool:
-    root = schedule_processing_root(config.runtime_root)
-    if not root.exists():
-        return False
-    for item in root.glob("*.json"):
-        job = read_scheduled_job(item)
-        if job and job.schedule_id == schedule_id:
+def _schedule_has_processing_work(config, schedule_id: str) -> bool:
+    for path in schedule_processing_root(config.runtime_root).glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(payload.get("schedule_id") or payload.get("scheduleId") or "") == schedule_id:
             return True
     return False
 
 
-async def process_due_schedules_once(config: AppConfig) -> list[str]:
-    for definition in due_schedule_definitions(config.runtime_root):
-        if definition.misfire_policy == "skip_missed":
-            grace_ms = max(1000, config.schedule_poll_ms * 2)
-            if now_ms() - definition.next_run_at > grace_ms:
-                enabled = False if definition.max_runs == 1 else definition.enabled
-                next_run_at = 0
-                if enabled:
-                    next_run_at = compute_next_cron_run_on_or_after(
-                        definition.cron,
-                        definition.timezone_name,
-                        max(now_ms() + 1, definition.next_run_at + 1),
-                    )
-                next_payload = {
-                    "scheduleId": definition.schedule_id,
-                    "chatKey": definition.chat_key,
-                    "message": definition.message,
-                    "cron": definition.cron,
-                    "timezone": definition.timezone_name,
-                    "nextRunAt": next_run_at,
-                    "enabled": enabled,
-                    "maxRuns": definition.max_runs,
-                    "runCount": definition.run_count,
-                    "misfirePolicy": definition.misfire_policy,
-                    "concurrencyPolicy": definition.concurrency_policy,
-                }
-                write_json_atomic(schedule_definition_file(config.runtime_root, definition.schedule_id), next_payload)
-                continue
-        if definition.concurrency_policy == "skip_if_running" and schedule_has_processing_job(config, definition.schedule_id):
-            next_payload = {
-                "scheduleId": definition.schedule_id,
-                "chatKey": definition.chat_key,
-                "message": definition.message,
-                "cron": definition.cron,
-                "timezone": definition.timezone_name,
-                "nextRunAt": compute_next_cron_run_on_or_after(
-                    definition.cron,
-                    definition.timezone_name,
-                    max(now_ms() + 1, definition.next_run_at + 1),
-                ),
-                "enabled": definition.enabled,
-                "maxRuns": definition.max_runs,
-                "runCount": definition.run_count,
-                "misfirePolicy": definition.misfire_policy,
-                "concurrencyPolicy": definition.concurrency_policy,
-            }
-            write_json_atomic(schedule_definition_file(config.runtime_root, definition.schedule_id), next_payload)
-            continue
-        job = build_scheduled_job(definition, definition.next_run_at)
-        pending_root = schedule_pending_root(config.runtime_root)
-        pending_root.mkdir(parents=True, exist_ok=True)
-        write_scheduled_job(pending_root / f"{job.run_at:013d}-{job.request_id}.json", job)
-        enabled = False if definition.max_runs == 1 else definition.enabled
-        next_run_at = 0
-        if enabled:
-            next_run_at = compute_next_cron_run_on_or_after(
-                definition.cron,
-                definition.timezone_name,
-                max(now_ms() + 1, definition.next_run_at + 1),
-            )
-        next_payload = {
-            "scheduleId": definition.schedule_id,
-            "chatKey": definition.chat_key,
-            "message": definition.message,
-            "cron": definition.cron,
-            "timezone": definition.timezone_name,
-            "nextRunAt": next_run_at,
-            "enabled": enabled,
-            "maxRuns": definition.max_runs,
-            "runCount": definition.run_count + 1,
-            "misfirePolicy": definition.misfire_policy,
-            "concurrencyPolicy": definition.concurrency_policy,
-        }
-        write_json_atomic(schedule_definition_file(config.runtime_root, definition.schedule_id), next_payload)
-    return await process_scheduled_jobs_once(config)
+def _schedule_marker_path(config, schedule_id: str) -> Path:
+    return schedule_processing_root(config.runtime_root) / f"definition-{schedule_id}.json"
 
 
-async def process_scheduled_jobs_once(config: AppConfig) -> list[str]:
-    bot = build_bot_from_app_config(config)
-    executed: list[str] = []
+def _acquire_schedule_processing_marker(config, schedule_id: str) -> Path | None:
+    marker_path = _schedule_marker_path(config, schedule_id)
+    try:
+        with marker_path.open("x", encoding="utf-8") as handle:
+            json.dump({"scheduleId": schedule_id, "claimedAt": int(time.time() * 1000)}, handle, ensure_ascii=False)
+    except FileExistsError:
+        return None
+    return marker_path
+
+
+def _claim_pending_job(config, path: Path) -> Path | None:
+    processing_path = schedule_processing_root(config.runtime_root) / f"{path.stem}.{int(time.time() * 1000)}.processing.json"
+    try:
+        path.replace(processing_path)
+    except FileNotFoundError:
+        return None
+    return processing_path
+
+
+def _cleanup_orphaned_processing_files(config, *, now_ms: int) -> None:
     processing_root = schedule_processing_root(config.runtime_root)
-    processing_root.mkdir(parents=True, exist_ok=True)
-    for job_file in iter_due_scheduled_job_files(config.runtime_root):
-        job = read_scheduled_job(job_file)
-        if job is None:
-            finalize_scheduled_job(config.runtime_root, job_file, ok=False)
+    for path in processing_root.glob("*.json"):
+        try:
+            mtime_ms = int(path.stat().st_mtime * 1000)
+        except FileNotFoundError:
             continue
-        if job_file.parent != processing_root:
-            target = processing_root / job_file.name
-            try:
-                job_file.replace(target)
-            except Exception:
-                continue
-            job_file = target
+        if now_ms - mtime_ms <= SCHEDULE_ORPHAN_TTL_MS:
+            continue
+        if path.name.startswith("definition-"):
+            path.unlink(missing_ok=True)
+            continue
+        original_name = path.name.split(".", 1)[0] + ".json"
+        target = schedule_pending_root(config.runtime_root) / original_name
+        if target.exists():
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            path.replace(target)
+        except FileNotFoundError:
+            continue
+
+
+def _should_skip_due_to_misfire(config, definition, *, now_ms: int) -> bool:
+    if definition.misfire_policy != "skip_missed":
+        return False
+    grace_ms = max(
+        1_000,
+        int(config.schedule_poll_ms) * 2 if getattr(config, "schedule_poll_ms", None) else SCHEDULE_DEFINITION_POLL_MS * 2,
+    )
+    return bool(definition.next_run_at) and now_ms - int(definition.next_run_at) > grace_ms
+
+
+async def process_due_schedules_once(config) -> list[str]:
+    executed: list[str] = []
+    now_ms = int(time.time() * 1000)
+    _cleanup_orphaned_processing_files(config, now_ms=now_ms)
+    bot = build_bot_from_app_config(config)
+    for definition in due_schedule_definitions(config.runtime_root, current_ms=now_ms):
+        if _should_skip_due_to_misfire(config, definition, now_ms=now_ms):
+            next_run_count = definition.run_count
+            if definition.cron:
+                next_run_at = compute_next_cron_run_on_or_after(
+                    definition.cron,
+                    definition.timezone_name or "UTC",
+                    now_ms + 1,
+                )
+                write_schedule_definition(
+                    config.runtime_root,
+                    ScheduleDefinition(
+                        **{
+                            **definition.__dict__,
+                            "next_run_at": next_run_at,
+                            "run_count": next_run_count,
+                        }
+                    ),
+                )
+            else:
+                write_schedule_definition(
+                    config.runtime_root,
+                    ScheduleDefinition(
+                        **{
+                            **definition.__dict__,
+                            "enabled": False,
+                            "next_run_at": 0,
+                            "run_count": next_run_count,
+                        }
+                    ),
+                )
+            continue
+        if definition.concurrency_policy == "skip_if_running" and _schedule_has_processing_work(config, definition.schedule_id):
+            continue
+        marker_path = _acquire_schedule_processing_marker(config, definition.schedule_id)
+        if marker_path is None:
+            continue
         try:
             await run_text_message_once(
                 config,
                 bot,
-                type("ScheduleMessage", (), {"chat_key": job.chat_key, "content": job.message, "req_id": uid(), "raw_payload": {}})(),
+                WeComTextMessage(req_id="", chat_key=definition.chat_key, content=definition.message, raw_payload={}),
             )
+            executed.append(definition.schedule_id)
+            next_run_count = definition.run_count + 1
+            if definition.max_runs is not None and next_run_count >= definition.max_runs:
+                next_definition = ScheduleDefinition(
+                    **{
+                        **definition.__dict__,
+                        "enabled": False,
+                        "next_run_at": 0,
+                        "run_count": next_run_count,
+                    }
+                )
+            elif definition.cron:
+                next_run_at = compute_next_cron_run_on_or_after(
+                    definition.cron,
+                    definition.timezone_name or "UTC",
+                    int(time.time() * 1000) + 1,
+                )
+                next_definition = ScheduleDefinition(
+                    **{
+                        **definition.__dict__,
+                        "next_run_at": next_run_at,
+                        "run_count": next_run_count,
+                    }
+                )
+            else:
+                next_definition = ScheduleDefinition(
+                    **{
+                        **definition.__dict__,
+                        "enabled": False,
+                        "next_run_at": 0,
+                        "run_count": next_run_count,
+                    }
+                )
+            write_schedule_definition(config.runtime_root, next_definition)
+            (schedule_done_root(config.runtime_root) / f"{definition.schedule_id}.json").write_text("{}", encoding="utf-8")
         except Exception:
-            finalize_scheduled_job(config.runtime_root, job_file, ok=False)
             continue
-        finalize_scheduled_job(config.runtime_root, job_file, ok=True)
-        executed.append(job.schedule_id)
+        finally:
+            marker_path.unlink(missing_ok=True)
     return executed
 
 
-async def schedule_loop(config: AppConfig, *, stop_event: asyncio.Event) -> None:
-    while not stop_event.is_set():
-        await process_due_schedules_once(config)
-        try:
-            await asyncio.wait_for(stop_event.wait(), config.schedule_poll_ms / 1000)
-        except asyncio.TimeoutError:
+async def process_scheduled_jobs_once(config) -> list[str]:
+    executed: list[str] = []
+    _cleanup_orphaned_processing_files(config, now_ms=int(time.time() * 1000))
+    bot = build_bot_from_app_config(config)
+    for path in sorted(schedule_pending_root(config.runtime_root).glob("*.json")):
+        processing_path = _claim_pending_job(config, path)
+        if processing_path is None:
             continue
+        try:
+            payload = __import__("json").loads(processing_path.read_text(encoding="utf-8"))
+            job = ScheduledJob(**payload)
+            await run_text_message_once(
+                config,
+                bot,
+                WeComTextMessage(req_id="", chat_key=job.chat_key, content=job.message, raw_payload={}),
+            )
+        except Exception:
+            target = schedule_failed_root(config.runtime_root) / path.name
+            processing_path.replace(target)
+            continue
+        executed.append(job.request_id)
+        target = schedule_done_root(config.runtime_root) / path.name
+        processing_path.replace(target)
+    return executed

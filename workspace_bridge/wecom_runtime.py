@@ -2,229 +2,191 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Awaitable, Callable
+from contextlib import suppress
 
 import aiohttp
 from aiohttp import WSMsgType
 
-from .config import AppConfig, build_bot_from_app_config
-from .execution import execute_and_deliver_message, flush_cached_runtime_payloads
-from .inbound_media import download_incoming_media, extract_mixed_images, extract_mixed_text
-from .logging_utils import get_logger
-from .models import WeComBotRuntime
-from .wecom_protocol import WECOM_WS_URL, build_subscribe_payload, build_text_response_payload, is_subscribe_ok, parse_text_callback, payload_msg_type
-from .wecom_upload import create_request_future, reject_pending_requests, resolve_pending_request
+from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
+from .reply_state import cleanup_reply_state
+from .wecom_protocol import build_subscribe_payload, build_text_response_payload, is_subscribe_ok, parse_text_callback
+from .wecom_upload import reject_pending_requests, resolve_pending_request
 
-LOG = get_logger("workspace_bridge.wecom")
+WECOM_WS = "wss://openws.work.weixin.qq.com"
 
 
-async def default_text_handler(bot, message) -> tuple[str, str]:
-    raise RuntimeError("default_text_handler requires an app config-aware wrapper")
-
-
-async def ws_send_json(ws: aiohttp.ClientWebSocketResponse, payload: dict) -> None:
-    await ws.send_json(payload)
-
-
-async def flush_pending_payloads(bot: WeComBotRuntime) -> None:
-    if bot.ws is None:
-        return
-    for payload in list((bot.pending_streams or {}).values()):
-        await bot.ws.send_json(payload)
-    for payload in list((bot.pending_finals or {}).values()):
-        await bot.ws.send_json(payload)
-    if bot.pending_streams is not None:
-        bot.pending_streams.clear()
-    if bot.pending_finals is not None:
-        bot.pending_finals.clear()
-    await flush_cached_runtime_payloads(bot)
-
-
-async def handle_wecom_payload(
-    config: AppConfig,
-    bot: WeComBotRuntime,
-    ws: aiohttp.ClientWebSocketResponse,
-    data: dict,
-    handler: Callable[[AppConfig, object, object], Awaitable[tuple[str, str]]],
-) -> None:
-    if resolve_pending_request(bot, data):
-        return
-    LOG.info(
-        "wecom prelude/unsolicited message botId=%s cmd=%s body_keys=%s",
-        bot.config.bot_id,
-        data.get("cmd"),
-        sorted((data.get("body") or {}).keys()),
+def build_runtime_status_text(runtime, chat_key: str) -> str:
+    active = chat_key in runtime.active_processes
+    return "\n".join(
+        [
+            f"chatKey: {chat_key}",
+            f"connected: {'yes' if runtime.connected else 'no'}",
+            f"running: {'yes' if active else 'no'}",
+        ]
     )
-    message = parse_text_callback(data)
-    if message:
-        LOG.info("wecom recv text chatKey=%s req_id=%s", message.chat_key, message.req_id)
-        await handler(config, bot, message)
+
+
+def _handle_message_task(chat_key: str, task, runtime) -> None:
+    runtime.message_tasks.discard(task)
+    if runtime.active_message_tasks.get(chat_key) is task:
+        runtime.active_message_tasks.pop(chat_key, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
         return
-    msg_type = payload_msg_type(data)
-    if msg_type == "image":
-        parsed = type(
-            "InboundMessage",
-            (),
-            {
-                "req_id": str(((data.get("headers") or {}).get("req_id")) or "").strip(),
-                "chat_key": parse_text_callback({"cmd": "aibot_msg_callback", "headers": data.get("headers") or {}, "body": {"msgtype": "text", "text": {"content": "."}, **(data.get("body") or {})}}).chat_key,
-            },
-        )()
-        try:
-            media = await download_incoming_media(bot.config, parsed, "image", (data.get("body") or {}).get("image") or {})
-            LOG.info("wecom recv image chatKey=%s file=%s", parsed.chat_key, media["fileName"])
-            await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), f"Received image: {media['fileName']}", final=True))
-        except Exception as exc:
-            LOG.exception("wecom image handling failed chatKey=%s", parsed.chat_key)
-            await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), f"Receive image failed: {exc}", final=True))
-        return
-    if msg_type == "file":
-        parsed = type(
-            "InboundMessage",
-            (),
-            {
-                "req_id": str(((data.get("headers") or {}).get("req_id")) or "").strip(),
-                "chat_key": parse_text_callback({"cmd": "aibot_msg_callback", "headers": data.get("headers") or {}, "body": {"msgtype": "text", "text": {"content": "."}, **(data.get("body") or {})}}).chat_key,
-            },
-        )()
-        try:
-            media = await download_incoming_media(bot.config, parsed, "file", (data.get("body") or {}).get("file") or {})
-            LOG.info("wecom recv file chatKey=%s file=%s", parsed.chat_key, media["fileName"])
-            await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), f"Received file: {media['fileName']}", final=True))
-        except Exception as exc:
-            LOG.exception("wecom file handling failed chatKey=%s", parsed.chat_key)
-            await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), f"Receive file failed: {exc}", final=True))
-        return
-    if msg_type == "mixed":
-        body = data.get("body") or {}
-        mixed = body.get("mixed") or {}
-        parsed = type(
-            "InboundMessage",
-            (),
-            {
-                "req_id": str(((data.get("headers") or {}).get("req_id")) or "").strip(),
-                "chat_key": parse_text_callback({"cmd": "aibot_msg_callback", "headers": data.get("headers") or {}, "body": {"msgtype": "text", "text": {"content": "."}, **body}}).chat_key,
-            },
-        )()
-        saved_files = []
-        for image in extract_mixed_images(mixed):
+    except Exception as exc:
+        runtime.last_status = "message_failed"
+        runtime.last_error = str(exc)
+
+
+async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
+    try:
+        await stream_text_message_once(config, runtime, parsed)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        runtime.last_status = "message_failed"
+        runtime.last_error = str(exc)
+        if runtime.ws is None and ws is not None:
+            original_ws = runtime.ws
+            runtime.ws = ws
             try:
-                media = await download_incoming_media(bot.config, parsed, "image", image or {})
-                saved_files.append(media["fileName"])
-            except Exception:
-                continue
-        mixed_text = extract_mixed_text(mixed)
-        response_lines = []
-        if saved_files:
-            response_lines.append("Received mixed images: " + ", ".join(saved_files))
-        if mixed_text:
-            response_lines.append("Mixed text captured.")
-            text_message = type("MixedTextMessage", (), {"req_id": parsed.req_id, "chat_key": parsed.chat_key, "content": mixed_text, "raw_payload": data})()
-            _session_id, _content = await handler(config, bot, text_message)
-            if response_lines and bot.ws is not None:
-                await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), "\n".join(response_lines), final=False))
-        elif response_lines:
-            await ws_send_json(ws, build_text_response_payload(parsed.req_id, uid(), "\n".join(response_lines), final=True))
+                await send_or_cache_runtime_payload(runtime, parsed, "session-error", f"执行失败: {exc}", final=True)
+            finally:
+                runtime.ws = original_ws
+        else:
+            await send_or_cache_runtime_payload(runtime, parsed, "session-error", f"执行失败: {exc}", final=True)
+
+
+async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
+    active_task = runtime.active_message_tasks.get(parsed.chat_key)
+    if active_task is not None and not active_task.done():
+        if runtime.ws is None and ws is not None:
+            original_ws = runtime.ws
+            runtime.ws = ws
+            try:
+                await send_or_cache_runtime_payload(
+                    runtime,
+                    parsed,
+                    "session-busy",
+                    "已有任务在运行，请稍后再试或使用 /bridge-interrupt。",
+                    final=True,
+                )
+            finally:
+                runtime.ws = original_ws
+        else:
+            await send_or_cache_runtime_payload(
+                runtime,
+                parsed,
+                "session-busy",
+                "已有任务在运行，请稍后再试或使用 /bridge-interrupt。",
+                final=True,
+            )
         return
-    if msg_type:
-        LOG.info("wecom recv unsupported msgtype=%s", msg_type)
+    task = asyncio.create_task(_run_message_task(config, runtime, parsed, ws=ws))
+    runtime.message_tasks.add(task)
+    runtime.active_message_tasks[parsed.chat_key] = task
+    task.add_done_callback(lambda completed, chat_key=parsed.chat_key: _handle_message_task(chat_key, completed, runtime))
 
 
-async def ws_reader_loop(
-    config: AppConfig,
-    bot: WeComBotRuntime,
-    ws: aiohttp.ClientWebSocketResponse,
-    handler: Callable[[AppConfig, object, object], Awaitable[tuple[str, str]]],
-) -> None:
-    async for raw_msg in ws:
-        if raw_msg.type == WSMsgType.TEXT:
-            data = json.loads(raw_msg.data)
-            await handle_wecom_payload(config, bot, ws, data, handler)
-        elif raw_msg.type == WSMsgType.ERROR:
-            raise RuntimeError(f"websocket error: {ws.exception()}")
-        elif raw_msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED):
-            break
+async def handle_wecom_payload(config, runtime, ws, payload, handler):
+    if resolve_pending_request(runtime, payload):
+        return
+    parsed = parse_text_callback(payload)
+    if parsed is None:
+        return
+    text = parsed.content
+    if text == "/bridge-status":
+        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", build_runtime_status_text(runtime, parsed.chat_key), final=True))
+        cleanup_reply_state(runtime, parsed.req_id)
+        return
+    if text == "/bridge-reset":
+        process = runtime.active_processes.pop(parsed.chat_key, None)
+        if process is not None:
+            process.terminate()
+        active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
+        if active_task is not None:
+            active_task.cancel()
+        req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
+        for req_id in req_ids:
+            cleanup_reply_state(runtime, req_id)
+            if runtime.pending_streams is not None:
+                runtime.pending_streams.pop(req_id, None)
+            if runtime.pending_finals is not None:
+                runtime.pending_finals.pop(req_id, None)
+        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "Session reset.", final=True))
+        cleanup_reply_state(runtime, parsed.req_id)
+        return
+    if text == "/bridge-interrupt":
+        process = runtime.active_processes.get(parsed.chat_key)
+        if process is not None:
+            process.terminate()
+        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "Current task interrupted.", final=True))
+        cleanup_reply_state(runtime, parsed.req_id)
+        return
+    await handler(config, runtime, parsed, ws=ws)
 
 
-async def run_wecom_ws_once(
-    config: AppConfig,
-    runtime: WeComBotRuntime | None = None,
-    *,
-    handler: Callable[[AppConfig, object, object], Awaitable[tuple[str, str]]] = execute_and_deliver_message,
-) -> None:
-    bot = runtime or WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
-    bot.last_status = "starting"
-    backoff_sec = 1
+async def run_wecom_runtime_once(config, runtime) -> None:
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=config.wecom_subscribe_timeout_sec)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.ws_connect(WECOM_WS) as ws:
+            runtime.ws = ws
+            subscribe_payload = build_subscribe_payload(runtime.config)
+            await ws.send_json(subscribe_payload)
+            subscribe_msg = await ws.receive()
+            if subscribe_msg.type != WSMsgType.TEXT:
+                runtime.connected = False
+                runtime.last_status = "subscribe_failed"
+                runtime.last_error = f"unexpected subscribe message type: {subscribe_msg.type!s}"
+                raise RuntimeError(runtime.last_error)
+            subscribe_response = json.loads(subscribe_msg.data)
+            if resolve_pending_request(runtime, subscribe_response):
+                pass
+            if not is_subscribe_ok(subscribe_response):
+                runtime.connected = False
+                runtime.last_status = "subscribe_failed"
+                runtime.last_error = str(subscribe_response.get("errmsg") or "subscribe failed")
+                raise RuntimeError(runtime.last_error)
+            runtime.connected = True
+            runtime.last_status = "subscribe_ok"
+            runtime.last_error = None
+            await flush_cached_runtime_payloads(runtime)
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg.type == WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
+                        await handle_wecom_payload(config, runtime, ws, payload, _dispatch_message)
+                        continue
+                    if msg.type in {WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.CLOSING}:
+                        runtime.connected = False
+                        runtime.last_status = "websocket_closed"
+                        runtime.last_error = "bot websocket closed"
+                        reject_pending_requests(runtime, runtime.last_error)
+                        return
+                    if msg.type == WSMsgType.ERROR:
+                        runtime.connected = False
+                        runtime.last_status = "websocket_error"
+                        runtime.last_error = str(ws.exception() or "bot websocket error")
+                        reject_pending_requests(runtime, runtime.last_error)
+                        raise RuntimeError(runtime.last_error)
+            finally:
+                runtime.connected = False
+                runtime.ws = None
+                reject_pending_requests(runtime, runtime.last_error or "bot websocket closed")
+
+
+async def run_wecom_runtime(config, runtime) -> None:
+    retry_delay_sec = 1
     while True:
         try:
-            LOG.info("wecom connecting botId=%s ws=%s", bot.config.bot_id, WECOM_WS_URL)
-            async with aiohttp.ClientSession(trust_env=True) as session:
-                async with session.ws_connect(WECOM_WS_URL, heartbeat=None, autoping=True) as ws:
-                    bot.ws = ws
-                    bot.connected = False
-                    bot.last_status = "connecting"
-                    bot.last_error = None
-                    reader_task = asyncio.create_task(ws_reader_loop(config, bot, ws, handler))
-                    sub_payload = build_subscribe_payload(bot.config)
-                    sub_req_id = str(((sub_payload.get("headers") or {}).get("req_id")) or "")
-                    sub_future = create_request_future(bot, sub_req_id)
-                    LOG.info(
-                        "wecom subscribe request botId=%s secret_len=%s req_id=%s",
-                        bot.config.bot_id,
-                        len(bot.config.bot_secret or ""),
-                        sub_req_id,
-                    )
-                    await ws_send_json(ws, sub_payload)
-                    try:
-                        subscribe_response = await asyncio.wait_for(sub_future, timeout=config.wecom_subscribe_timeout_sec)
-                    except asyncio.TimeoutError as exc:
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except asyncio.CancelledError:
-                            pass
-                        bot.connected = False
-                        bot.last_status = "subscribe_timeout"
-                        bot.last_error = f"subscribe timeout after {config.wecom_subscribe_timeout_sec}s"
-                        LOG.error("wecom subscribe timeout botId=%s timeout=%ss", bot.config.bot_id, config.wecom_subscribe_timeout_sec)
-                        raise RuntimeError(bot.last_error) from exc
-                    LOG.info(
-                        "wecom subscribe response botId=%s errcode=%s errmsg=%s",
-                        bot.config.bot_id,
-                        subscribe_response.get("errcode"),
-                        subscribe_response.get("errmsg"),
-                    )
-                    if not subscribe_response or not is_subscribe_ok(subscribe_response):
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except asyncio.CancelledError:
-                            pass
-                        bot.connected = False
-                        bot.last_status = "subscribe_failed"
-                        bot.last_error = json.dumps(subscribe_response or {"error": "no subscribe response"}, ensure_ascii=False)
-                        LOG.error("wecom subscribe failed botId=%s detail=%s", bot.config.bot_id, bot.last_error)
-                        raise RuntimeError(f"subscribe failed: {bot.last_error}")
-                    bot.connected = True
-                    bot.last_status = "running"
-                    LOG.info("wecom connected botId=%s", bot.config.bot_id)
-                    await flush_pending_payloads(bot)
-                    backoff_sec = 1
-                    await reader_task
+            await run_wecom_runtime_once(config, runtime)
         except asyncio.CancelledError:
-            bot.connected = False
-            bot.ws = None
-            bot.last_status = "stopped"
-            LOG.info("wecom runner stopped botId=%s", bot.config.bot_id)
-            reject_pending_requests(bot, "bot websocket closed")
             raise
-        except Exception as exc:
-            bot.connected = False
-            bot.ws = None
-            bot.last_status = "reconnecting"
-            bot.last_error = str(exc)
-            LOG.exception("wecom runtime error botId=%s", bot.config.bot_id)
-            reject_pending_requests(bot, "bot websocket closed")
-            await asyncio.sleep(backoff_sec)
-            LOG.info("wecom reconnecting in %ss botId=%s", backoff_sec, bot.config.bot_id)
-            backoff_sec = min(backoff_sec * 2, 30)
+        except Exception:
+            if runtime.last_status == "subscribe_failed":
+                raise
+            await asyncio.sleep(retry_delay_sec)
+            continue
+        await asyncio.sleep(retry_delay_sec)

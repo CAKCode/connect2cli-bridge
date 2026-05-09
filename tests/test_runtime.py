@@ -42,12 +42,14 @@ def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: P
     assert launch.session.chat_key == "single:alice"
     assert launch.env["WECOM_BRIDGE_SESSION_ID"] == launch.session.session_id
     assert launch.env["WECOM_BRIDGE_PROJECT_DIR"] == str(launch.cwd)
+    assert launch.session.workfile_dir == launch.runtime_context.workfile_dir
     assert launch.runtime_context.effective_skill_names == ("deploy",)
 
     stored = load_session_record(runtime_root, launch.session.session_id)
     assert stored is not None
     assert stored.workspace_id == launch.session.workspace_id
     assert stored.project_dir == launch.cwd
+    assert stored.workfile_dir == launch.runtime_context.workfile_dir
 
 
 def test_prepare_session_run_reuses_stable_session_id_for_same_chat(tmp_path: Path) -> None:

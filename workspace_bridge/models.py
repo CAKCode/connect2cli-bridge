@@ -35,6 +35,9 @@ class WeComBotRuntime:
     pending_finals: dict[str, dict] | None = None
     connected: bool = False
     reply_states: dict[str, "ReplyState"] = field(default_factory=dict)
+    active_processes: dict[str, object] = field(default_factory=dict)
+    message_tasks: set[object] = field(default_factory=set)
+    active_message_tasks: dict[str, object] = field(default_factory=dict)
     last_error: str | None = None
     last_status: str | None = None
 
@@ -52,6 +55,8 @@ class WorkspaceRef:
     project_dir: Path
     skill_dir: Path
     state_dir: Path
+    workfile_dir: Path | None
+    roomfile_dir: Path | None
     lock_file: Path
     metadata_file: Path
 
@@ -93,6 +98,8 @@ class WorkspaceRuntimeContext:
     project_dir: Path
     chatfile_dir: Path
     export_dir: Path
+    workfile_dir: Path | None
+    roomfile_dir: Path | None
     allowed_file_roots: tuple[Path, ...]
     global_skill_dir: Path
     effective_skill_names: tuple[str, ...]
@@ -109,6 +116,8 @@ class SessionRecord:
     workspace_scope: WorkspaceScope
     project_dir: Path
     chatfile_dir: Path
+    workfile_dir: Path | None
+    roomfile_dir: Path | None
     created_at: int
     updated_at: int
 
@@ -159,3 +168,29 @@ class ReplyState:
     pending_stream_payload: dict | None = None
     pending_final_payload: dict | None = None
     proactive_status_sent_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class ScheduleDefinition:
+    schedule_id: str
+    chat_key: str
+    message: str
+    cron: str | None
+    timezone_name: str | None
+    next_run_at: int
+    enabled: bool
+    max_runs: int | None
+    run_count: int
+    misfire_policy: str
+    concurrency_policy: str
+    run_at_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class ScheduledJob:
+    request_id: str
+    schedule_id: str
+    chat_key: str
+    message: str
+    run_at: int
+    created_at: int
