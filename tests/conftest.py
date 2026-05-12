@@ -23,14 +23,16 @@ def bridge_module(tmp_path):
     spec.loader.exec_module(module)
 
     module.BASE_DIR = tmp_path
+    module.SHARED_RUNTIME_ROOT = tmp_path / "shared-runtime"
+    module.INSTANCE_RUNTIME_ROOT = tmp_path / "instance-runtime"
     module.DATA_FILE = tmp_path / ".bots.json"
-    module.BOT_TOMBSTONE_ROOT = tmp_path / ".bot-tombstones"
-    module.BOT_RUNTIME_LOCK_ROOT = tmp_path / ".bot-runtime-locks"
-    module.SESSION_LOCK_ROOT = tmp_path / ".session-locks"
-    module.SESSION_REGISTRY_ROOT = tmp_path / ".session-registry"
-    module.CHATFILE_ROOT = tmp_path / "chatfile"
-    module.WORKSPACE_ROOT = tmp_path / "workspace"
-    module.BRIDGE_CODEX_HOME_ROOT = tmp_path / ".bridge-codex-home"
+    module.BOT_TOMBSTONE_ROOT = module.SHARED_RUNTIME_ROOT / ".bot-tombstones"
+    module.BOT_RUNTIME_LOCK_ROOT = module.SHARED_RUNTIME_ROOT / ".bot-runtime-locks"
+    module.SESSION_LOCK_ROOT = module.SHARED_RUNTIME_ROOT / ".session-locks"
+    module.SESSION_REGISTRY_ROOT = module.SHARED_RUNTIME_ROOT / ".session-registry"
+    module.CHATFILE_ROOT = module.INSTANCE_RUNTIME_ROOT / "chatfile"
+    module.WORKSPACE_ROOT = module.INSTANCE_RUNTIME_ROOT / "workspace"
+    module.BRIDGE_CODEX_HOME_ROOT = module.INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
     module.BRIDGE_GLOBAL_SKILLS_ROOT = module.BRIDGE_CODEX_HOME_ROOT / "skills"
     module.PROJECT_SHARED_SKILLS_ROOT = tmp_path / "relate-skills"
     module.DEFAULT_CODEX_HOME = tmp_path / ".real-codex-home"
@@ -40,13 +42,14 @@ def bridge_module(tmp_path):
     module.LOCAL_FILE_SEND_RESULT_ROOT = module.LOCAL_FILE_SEND_QUEUE_ROOT / "results"
     module.LOCAL_FILE_SEND_DONE_ROOT = module.LOCAL_FILE_SEND_QUEUE_ROOT / "done"
     module.LOCAL_FILE_SEND_FAILED_ROOT = module.LOCAL_FILE_SEND_QUEUE_ROOT / "failed"
-    module.SCHEDULE_ROOT = tmp_path / ".scheduled-messages"
+    module.SCHEDULE_ROOT = module.SHARED_RUNTIME_ROOT / ".scheduled-messages"
     module.SCHEDULE_PENDING_ROOT = module.SCHEDULE_ROOT / "pending"
     module.SCHEDULE_PROCESSING_ROOT = module.SCHEDULE_ROOT / "processing"
     module.SCHEDULE_DONE_ROOT = module.SCHEDULE_ROOT / "done"
     module.SCHEDULE_FAILED_ROOT = module.SCHEDULE_ROOT / "failed"
     module.SCHEDULE_DEFINITION_ROOT = module.SCHEDULE_ROOT / "definitions"
     module.SCHEDULE_DEFINITION_LOCK_ROOT = module.SCHEDULE_ROOT / "definition-locks"
+    module.USER_ALIAS_ROOT = module.SHARED_RUNTIME_ROOT / ".user-aliases"
     module.BOTS.clear()
     module.RECENT_EVENTS.clear()
     module.HTTP_SESSION = None

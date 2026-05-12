@@ -62,6 +62,8 @@ cp .env.example .env
 BRIDGE_BIND=127.0.0.1:9299
 WORK_DIR=/home/jenkins
 BRIDGE_BASIC_AUTH=bridge:change-me
+BRIDGE_SHARED_RUNTIME_ROOT=/srv/wecom-bridge-shared
+BRIDGE_RUNTIME_ROOT=/var/tmp/wecom-bridge-runtime
 CODEX_EXEC_MODE=sandboxed
 
 WECOM_BOT_NAME=default
@@ -77,6 +79,8 @@ WECOM_BOT_ENABLED=true
 - `BRIDGE_BASIC_AUTH` 和 `BRIDGE_TOKEN` 二选一即可；如果都不配，API 只允许 localhost 访问
 - `WECOM_BOT_SECRET_FILE` 必须指向 secret 文件；当前版本不再支持明文 `secret`
 - `WECOM_BOT_WORK_DIR` 是 Bot 的共享项目根，不等于实际会话 `cwd`
+- `BRIDGE_SHARED_RUNTIME_ROOT` 用于 Bot 锁、session 注册表、schedule、用户别名等共享协调状态；多实例部署时应指向共享且持久的目录
+- `BRIDGE_RUNTIME_ROOT` 用于实例本地 workspace、chatfile、per-session `CODEX_HOME` 等高频 I/O 目录；建议放在本地快盘
 
 ### 4. 启动服务
 
@@ -107,14 +111,24 @@ curl -s http://127.0.0.1:9299/
 
 ### Workspace 布局
 
-当前实现会把运行态和会话文件放在仓库根目录下的这些位置：
+当前实现将运行态分成两类目录：
 
-- `workspace/<bot>/users/<user>/workfile`
-  用户级长期工作区
-- `workspace/<bot>/rooms/<room>/roomfile`
-  群共享工作区
-- `workspace/<bot>/sessions/<chat-key>/chatfile`
-  当前会话的文件交换区
+- 共享协调状态，默认在 bridge 项目根目录下，或由 `BRIDGE_SHARED_RUNTIME_ROOT` 指定
+  - `.bot-runtime-locks/`
+  - `.session-registry/`
+  - `.session-locks/`
+  - `.scheduled-messages/`
+  - `.user-aliases/`
+- 实例本地运行态，默认也在 bridge 项目根目录下，或由 `BRIDGE_RUNTIME_ROOT` 指定
+  - `workspace/<bot>/users/<user>/workfile`
+    用户级长期工作区
+  - `workspace/<bot>/rooms/<room>/roomfile`
+    群共享工作区
+  - `workspace/<bot>/sessions/<chat-key>/chatfile`
+    当前会话的文件交换区
+  - `.bridge-codex-home/sessions/<session-id>/`
+    当前会话隔离出来的 `CODEX_HOME`
+
 - `relate-skills/<skill>/SKILL.md`
   项目级共享 skills
 - `<workfile 或 roomfile>/.codex/skills/<skill>/SKILL.md`

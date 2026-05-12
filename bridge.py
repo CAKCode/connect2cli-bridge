@@ -35,14 +35,40 @@ if str(BASE_DIR) not in sys.path:
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
 
 
-def resolve_local_file_send_queue_root(base_dir: Optional[Path] = None) -> Path:
+def resolve_shared_runtime_root(base_dir: Optional[Path] = None) -> Path:
     root_base_dir = (base_dir or BASE_DIR).resolve()
-    raw = str(os.environ.get("LOCAL_FILE_SEND_QUEUE_ROOT") or "").strip()
+    raw = str(os.environ.get("BRIDGE_SHARED_RUNTIME_ROOT") or "").strip()
     if not raw:
-        return (root_base_dir / ".local-file-send-queue").resolve()
+        return root_base_dir
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = (root_base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def resolve_runtime_root(base_dir: Optional[Path] = None) -> Path:
+    root_base_dir = (base_dir or BASE_DIR).resolve()
+    raw = str(os.environ.get("BRIDGE_RUNTIME_ROOT") or "").strip()
+    if not raw:
+        return root_base_dir
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (root_base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def resolve_local_file_send_queue_root(base_dir: Optional[Path] = None) -> Path:
+    runtime_root = resolve_runtime_root(base_dir)
+    raw = str(os.environ.get("LOCAL_FILE_SEND_QUEUE_ROOT") or "").strip()
+    if not raw:
+        return (runtime_root / ".local-file-send-queue").resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (runtime_root / path).resolve()
     else:
         path = path.resolve()
     return path
@@ -86,16 +112,18 @@ RECENT_EVENT_TTL = 10 * 60
 MAX_STREAM_CONTENT = 8000
 
 DATA_FILE = Path(os.environ.get("BOTS_FILE", str(BASE_DIR / ".bots.json"))).expanduser().resolve()
-BOT_TOMBSTONE_ROOT = BASE_DIR / ".bot-tombstones"
-BOT_RUNTIME_LOCK_ROOT = BASE_DIR / ".bot-runtime-locks"
-SESSION_LOCK_ROOT = BASE_DIR / ".session-locks"
-SESSION_REGISTRY_ROOT = BASE_DIR / ".session-registry"
-CHATFILE_ROOT = BASE_DIR / "chatfile"
-WORKSPACE_ROOT = BASE_DIR / "workspace"
-BRIDGE_CODEX_HOME_ROOT = BASE_DIR / ".bridge-codex-home"
+SHARED_RUNTIME_ROOT = resolve_shared_runtime_root(BASE_DIR)
+INSTANCE_RUNTIME_ROOT = resolve_runtime_root(BASE_DIR)
+BOT_TOMBSTONE_ROOT = SHARED_RUNTIME_ROOT / ".bot-tombstones"
+BOT_RUNTIME_LOCK_ROOT = SHARED_RUNTIME_ROOT / ".bot-runtime-locks"
+SESSION_LOCK_ROOT = SHARED_RUNTIME_ROOT / ".session-locks"
+SESSION_REGISTRY_ROOT = SHARED_RUNTIME_ROOT / ".session-registry"
+CHATFILE_ROOT = INSTANCE_RUNTIME_ROOT / "chatfile"
+WORKSPACE_ROOT = INSTANCE_RUNTIME_ROOT / "workspace"
+BRIDGE_CODEX_HOME_ROOT = INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
 BRIDGE_GLOBAL_SKILLS_ROOT = BRIDGE_CODEX_HOME_ROOT / "skills"
 PROJECT_SHARED_SKILLS_ROOT = BASE_DIR / "relate-skills"
-USER_ALIAS_ROOT = BASE_DIR / ".user-aliases"
+USER_ALIAS_ROOT = SHARED_RUNTIME_ROOT / ".user-aliases"
 LOCAL_FILE_SEND_COMMAND = BASE_DIR / "send_file.py"
 LOCAL_SCHEDULE_MESSAGE_COMMAND = BASE_DIR / "schedule_message.py"
 LOCAL_FILE_SEND_QUEUE_ROOT = resolve_local_file_send_queue_root()
@@ -107,7 +135,7 @@ LOCAL_FILE_SEND_FAILED_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "failed"
 LOCAL_FILE_SEND_POLL_MS = int(os.environ.get("LOCAL_FILE_SEND_POLL_MS", 1000))
 LOCAL_FILE_SEND_DEFAULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_TIMEOUT_MS", "120000")))
 LOCAL_FILE_SEND_RESULT_RETENTION_MS = max(60000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_RETENTION_MS", str(86400000))))
-SCHEDULE_ROOT = BASE_DIR / ".scheduled-messages"
+SCHEDULE_ROOT = SHARED_RUNTIME_ROOT / ".scheduled-messages"
 SCHEDULE_PENDING_ROOT = SCHEDULE_ROOT / "pending"
 SCHEDULE_PROCESSING_ROOT = SCHEDULE_ROOT / "processing"
 SCHEDULE_DONE_ROOT = SCHEDULE_ROOT / "done"
@@ -683,6 +711,69 @@ def ensure_schedule_dirs() -> None:
         SCHEDULE_DEFINITION_LOCK_ROOT,
     ):
         ensure_dir(item)
+
+
+def legacy_shared_runtime_root() -> Path:
+    return BASE_DIR.resolve()
+
+
+def legacy_instance_runtime_root() -> Path:
+    return BASE_DIR.resolve()
+
+
+def get_shared_runtime_migration_marker() -> Path:
+    return SHARED_RUNTIME_ROOT / ".legacy-shared-runtime-migrated.json"
+
+
+def get_instance_runtime_migration_marker() -> Path:
+    return INSTANCE_RUNTIME_ROOT / ".legacy-instance-runtime-migrated.json"
+
+
+def maybe_migrate_legacy_shared_runtime_state() -> None:
+    if SHARED_RUNTIME_ROOT == legacy_shared_runtime_root() or get_shared_runtime_migration_marker().exists():
+        return
+    legacy_root = legacy_shared_runtime_root()
+    migrations = (
+        (legacy_root / ".bot-tombstones", BOT_TOMBSTONE_ROOT),
+        (legacy_root / ".bot-runtime-locks", BOT_RUNTIME_LOCK_ROOT),
+        (legacy_root / ".session-locks", SESSION_LOCK_ROOT),
+        (legacy_root / ".session-registry", SESSION_REGISTRY_ROOT),
+        (legacy_root / ".scheduled-messages", SCHEDULE_ROOT),
+        (legacy_root / ".user-aliases", USER_ALIAS_ROOT),
+    )
+    for source, target in migrations:
+        if not source.exists():
+            continue
+        ensure_dir(target)
+        copy_missing_tree_contents(source, target)
+    write_json_atomic(
+        get_shared_runtime_migration_marker(),
+        {"source": str(legacy_root), "migratedAt": now_ms()},
+    )
+
+
+def maybe_migrate_legacy_instance_runtime_state() -> None:
+    if INSTANCE_RUNTIME_ROOT == legacy_instance_runtime_root() or get_instance_runtime_migration_marker().exists():
+        return
+    legacy_root = legacy_instance_runtime_root()
+    migrations = (
+        (legacy_root / "workspace", WORKSPACE_ROOT),
+        (legacy_root / ".bridge-codex-home", BRIDGE_CODEX_HOME_ROOT),
+        (legacy_root / "chatfile", CHATFILE_ROOT),
+    )
+    for source, target in migrations:
+        if not source.exists():
+            continue
+        ensure_dir(target)
+        copy_missing_tree_contents(source, target)
+    write_json_atomic(
+        get_instance_runtime_migration_marker(),
+        {"source": str(legacy_root), "migratedAt": now_ms()},
+    )
+
+
+def remove_session_codex_home(session_id: str) -> None:
+    remove_tree_if_exists(get_session_codex_home_root(session_id))
 
 
 def get_registry_key_file(bot_id: str, key: str) -> Path:
@@ -5068,6 +5159,21 @@ def sync_tree_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, destination)
 
 
+def copy_missing_tree_contents(source: Path, target: Path) -> None:
+    ensure_dir(target)
+    for child in sorted(source.iterdir(), key=lambda item: item.name):
+        destination = target / child.name
+        if destination.exists():
+            if child.is_dir() and destination.is_dir():
+                copy_missing_tree_contents(child, destination)
+            continue
+        if child.is_dir():
+            shutil.copytree(child, destination)
+        else:
+            ensure_dir_for(destination)
+            shutil.copy2(child, destination)
+
+
 def sync_project_shared_skills_to_bridge_global() -> list[str]:
     source_root = project_shared_skills_root()
     target_root = get_bridge_global_skills_root()
@@ -5131,10 +5237,10 @@ def cleanup_bot_session_storage(bot_id: str) -> None:
             if not record or str(record.get("botId") or "") != bot_id:
                 continue
             remove_path_if_exists(Path(record["lockFile"]))
+            remove_session_codex_home(record["sessionId"])
             remove_path_if_exists(session_file)
     remove_tree_if_exists(SESSION_REGISTRY_ROOT / "keys" / bot_id)
     remove_tree_if_exists(SESSION_LOCK_ROOT / bot_id)
-    remove_tree_if_exists(CHATFILE_ROOT / bot_id)
     remove_tree_if_exists(get_bot_workspace_dir(bot_id))
 
 
@@ -5202,11 +5308,32 @@ def filter_deleted_persisted_bot_configs(configs: list[dict[str, Any]]) -> list[
     return filtered
 
 
+def filter_deleted_bot_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in configs:
+        wecom_bot_id = str(item.get("botId") or "").strip()
+        if not wecom_bot_id:
+            filtered.append(item)
+            continue
+        deleted_at = bot_tombstone_deleted_at(wecom_bot_id)
+        if not deleted_at:
+            filtered.append(item)
+            continue
+        updated_at = normalize_optional_int(item.get("updatedAt") or item.get("updated_at"))
+        created_at = normalize_optional_int(item.get("createdAt") or item.get("created_at"))
+        config_generation = updated_at if updated_at is not None else created_at
+        if config_generation is None or config_generation <= deleted_at:
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def prepare_bot_configs() -> list[dict[str, Any]]:
     PREPARED_PREVIOUS_BOT_CONFIGS.clear()
-    bootstrap = load_env_bootstrap_bot_configs()
+    raw_bootstrap = load_env_bootstrap_bot_configs()
     with persisted_bot_configs_lock():
         stored = filter_deleted_persisted_bot_configs(read_persisted_bot_configs_unlocked())
+        bootstrap = filter_deleted_bot_configs(raw_bootstrap)
         runtime_payload = stored if not bootstrap else merge_bot_configs(stored, bootstrap)
         seen_bot_ids: dict[str, str] = {}
         for item in runtime_payload:
@@ -6226,6 +6353,8 @@ async def main() -> None:
     ensure_dir(USER_ALIAS_ROOT)
     ensure_dir(get_bridge_codex_home_root())
     ensure_dir(get_bridge_global_skills_root())
+    maybe_migrate_legacy_shared_runtime_state()
+    maybe_migrate_legacy_instance_runtime_state()
     sync_project_shared_skills_to_bridge_global()
     if not DATA_FILE.exists():
         write_json_atomic(DATA_FILE, [])

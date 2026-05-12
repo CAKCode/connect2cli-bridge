@@ -573,6 +573,39 @@ def test_prepare_bot_configs_filters_tombstoned_persisted_bot(bridge_module):
     assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
 
 
+def test_prepare_bot_configs_filters_tombstoned_env_bootstrap_bot(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+    bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_NAME", "default")
+    monkeypatch.setenv("WECOM_BOT_CONFIG_ID", "bot-1")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert configs == []
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+
+
+def test_filter_deleted_bot_configs_does_not_persist_changes(bridge_module):
+    payload = [
+        {
+            "id": "bot-1",
+            "name": "default",
+            "botId": "bot-id",
+            "secretFile": str(write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")),
+            "enabled": True,
+        }
+    ]
+    bridge_module.write_json_atomic(bridge_module.DATA_FILE, [{"id": "keep-bot", "name": "keep"}])
+    bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
+
+    filtered = bridge_module.filter_deleted_bot_configs(payload)
+
+    assert filtered == []
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == [{"id": "keep-bot", "name": "keep"}]
+
+
 def test_prepare_bot_configs_keeps_recreated_persisted_bot_newer_than_tombstone(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
     bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
@@ -2503,6 +2536,8 @@ def test_remove_bot_cleans_persisted_state_and_artifacts(bridge_module):
     chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
     bridge_module.ensure_dir(chatfile_dir)
     (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
     definition = bridge_module.create_schedule_definition_record(
         {
             "sessionId": sess.session_id,
@@ -2568,12 +2603,56 @@ def test_remove_bot_cleans_persisted_state_and_artifacts(bridge_module):
     assert not (bridge_module.SESSION_REGISTRY_ROOT / "keys" / bot.config["id"]).exists()
     assert not (bridge_module.SESSION_LOCK_ROOT / bot.config["id"]).exists()
     assert not chatfile_dir.exists()
+    assert not codex_home.exists()
     assert bridge_module.read_schedule_definition(definition["scheduleId"]) is None
     assert not bridge_module.get_schedule_definition_lock_file(definition["scheduleId"]).exists()
     assert not pending.exists()
     assert not orphan_done.exists()
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     assert stored == [{"id": "keep-bot", "name": "keep"}]
+
+
+def test_migrate_legacy_runtime_state_only_copies_missing_files(bridge_module):
+    bridge_module.SHARED_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    bridge_module.INSTANCE_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    legacy_registry = bridge_module.BASE_DIR / ".session-registry" / "sessions"
+    new_registry = bridge_module.SESSION_REGISTRY_ROOT / "sessions"
+    legacy_registry.mkdir(parents=True, exist_ok=True)
+    new_registry.mkdir(parents=True, exist_ok=True)
+    (legacy_registry / "old.json").write_text('{"sessionId":"old"}', encoding="utf-8")
+    (new_registry / "old.json").write_text('{"sessionId":"new"}', encoding="utf-8")
+    legacy_workspace = bridge_module.BASE_DIR / "workspace" / "bot-1"
+    new_workspace = bridge_module.WORKSPACE_ROOT / "bot-1"
+    legacy_workspace.mkdir(parents=True, exist_ok=True)
+    new_workspace.mkdir(parents=True, exist_ok=True)
+    (legacy_workspace / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    (new_workspace / "from-legacy.txt").write_text("current", encoding="utf-8")
+    (legacy_workspace / "new-only.txt").write_text("legacy-new", encoding="utf-8")
+
+    bridge_module.maybe_migrate_legacy_shared_runtime_state()
+    bridge_module.maybe_migrate_legacy_instance_runtime_state()
+
+    assert (new_registry / "old.json").read_text(encoding="utf-8") == '{"sessionId":"new"}'
+    assert (new_workspace / "from-legacy.txt").read_text(encoding="utf-8") == "current"
+    assert (new_workspace / "new-only.txt").read_text(encoding="utf-8") == "legacy-new"
+
+
+def test_migrate_legacy_runtime_state_runs_only_once(bridge_module):
+    bridge_module.SHARED_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    legacy_registry = bridge_module.BASE_DIR / ".session-registry" / "sessions"
+    new_registry = bridge_module.SESSION_REGISTRY_ROOT / "sessions"
+    legacy_registry.mkdir(parents=True, exist_ok=True)
+    new_registry.mkdir(parents=True, exist_ok=True)
+    (legacy_registry / "session.json").write_text('{"sessionId":"legacy"}', encoding="utf-8")
+
+    bridge_module.maybe_migrate_legacy_shared_runtime_state()
+    assert (new_registry / "session.json").read_text(encoding="utf-8") == '{"sessionId":"legacy"}'
+    assert bridge_module.get_shared_runtime_migration_marker().exists()
+
+    (new_registry / "session.json").unlink()
+    bridge_module.maybe_migrate_legacy_shared_runtime_state()
+
+    assert not (new_registry / "session.json").exists()
 
 
 def test_remove_bot_removes_persisted_config_before_cleanup_finishes(bridge_module):
