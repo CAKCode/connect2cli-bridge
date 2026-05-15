@@ -4,13 +4,23 @@
 
 English overview: [README.en.md](README.en.md)
 
+这个项目的主要定位不是面向公网的通用聊天机器人，而是面向组内协作的多人工作空间桥接层：
+
+- 每个成员有各自独立的会话工作区和文件目录
+- 同一个 Bot 下多人同时拉代码、改文件、跑命令时互不影响
+- 通过企业微信作为入口，把 `codex` 变成组内可复用的协作开发工具
+
 这是一个无前端的 headless 服务，负责：
 
 - 维护企业微信 WebSocket 长连
 - 管理多 Bot 配置与持久化
 - 为会话启动 `codex exec` / `codex exec resume`
+- 为组内多人协作提供隔离 workspace，保证每人文件和代码操作互不影响
+- 提供全局共享 skill 与个人私有 skill 的分层注入和隔离
 - 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`
 - 下载企微图片/文件到本地 workspace
+- 对外暴露运行状态和最新摘要，便于前端轮询刷新
+- 对超长运行会话支持企微 10 分钟后的分段回复与后续续传
 - 通过本地命令或 API 回传文件到企微
 - 支持一次性定时消息和 cron 周期调度
 - 暴露 Bot / Session / Schedule JSON API
@@ -141,12 +151,34 @@ curl -s http://127.0.0.1:9299/
 - `<workfile 或 roomfile>/.codex/skills/<skill>/SKILL.md`
   当前 workspace 私有 skills
 
+这套布局的核心目标是把 bridge 当作多人协作工作空间来用，而不是单用户临时会话：
+
+- 单聊或 `groupSessionMode=per-user` 下，每个成员都有自己的 `workfile`
+- 同一项目根下，多个人同时 `git pull`、改代码、生成文件时不会互相覆盖
+- 会话级 `chatfile` 负责当前轮次文件交换，用户长期文件放在 `workfile` 或 `roomfile`
+- `CODEX_HOME` 也按 session 隔离，避免不同成员的会话状态、个人 skill、临时运行态互相污染
+
 Bridge 运行 `codex` 时：
 
 - 默认 `cwd` 是 `workfile`
 - 纯群共享会话会使用 `roomfile`
 - `TMPDIR` / `TMP` / `TEMP` 会指向当前会话 `chatfile`
 - 登录态继承 bridge 运行用户的 `CODEX_HOME`
+
+### Skill 分层
+
+Skill 目前分成两层：
+
+- 全局共享层
+  `relate-skills/<skill>/SKILL.md`
+- 个人/工作区私有层
+  `<workfile 或 roomfile>/.codex/skills/<skill>/SKILL.md`
+
+规则：
+
+- 工作区私有 skill 与全局同名时，优先使用私有层
+- 每个成员自己的 `workfile/.codex/skills` 彼此隔离，不会串到其他成员会话
+- 群共享模式下可使用 `roomfile/.codex/skills` 作为群级共享 skill 空间
 
 ### Session 模式
 
@@ -158,6 +190,23 @@ Bridge 运行 `codex` 时：
   整个群共用一个会话
 
 对外部调用方，建议优先保存并使用 `chatKey`；`sessionId` 只作为补充兜底。
+
+### 前端状态与摘要
+
+Bridge 自身不内置网页 UI，但会暴露足够的运行态和会话数据，方便外部前端或控制台持续刷新：
+
+- Bot 连接状态
+- 当前会话是否运行中
+- 排队长度
+- `sessionId` / `threadId`
+- 最新一次可见摘要或最终回复
+
+适合做一个轻前端面板，轮询展示：
+
+- 当前谁在跑
+- 每个会话的最新摘要
+- 运行状态是否仍在推进
+- 是否已经进入超时后的分段回复
 
 ### Codex 执行模式
 
@@ -335,6 +384,17 @@ python3 ./schedule_message.py \
   中断当前任务，并清空当前会话上下文
 - `/bridge-resume`
   列出当前用户可恢复的历史会话；回复编号可选择，或直接发送 `/bridge-resume <sessionId>`
+
+## 长时运行回复策略
+
+企业微信单次会话回包存在时效限制。对运行时间很长的任务，Bridge 会在原始响应窗口内尽量持续更新；超过窗口后，会切换到主动消息续传模式。
+
+这意味着：
+
+- 运行早期优先走同一条回复流，便于用户看到连续状态
+- 超过较长时长后，会转为分段主动回复，而不是整段结果丢失
+- 在群 `per-user` 会话里，主动续传消息会继续 `@` 原触发成员，避免消息混淆
+- 前端或调用方可根据运行状态和最近摘要判断是否仍在继续输出
 
 同样的控制能力也可通过 session API 完成：
 
