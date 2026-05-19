@@ -1,5 +1,5 @@
 # WeCom Codex Bridge Python
-
+ 意见反馈：chenzhak@sues.edu.cn
 企业微信智能机器人与 `codex` CLI 之间的纯 Python 会话桥接服务。
 
 English overview: [README.en.md](README.en.md)
