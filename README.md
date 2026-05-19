@@ -1,5 +1,4 @@
 # WeCom Codex Bridge Python
- 意见反馈：chenzhak@sues.edu.cn
 
 企业微信智能机器人与 `codex` CLI 之间的纯 Python 会话桥接服务。
 
@@ -496,3 +495,5 @@ sh ./test.sh
 - 项目默认端口是 `9299`
 - `.bots.json` 不再持久化明文 secret
 - 如果旧版本 `.bots.json` 里还残留明文 `secret`，新版本会拒绝加载，需要先改成 `secretFile`
+
+ 意见反馈：chenzhak@sues.edu.cn
