@@ -11,7 +11,7 @@ from workspace_bridge.execution import (
     run_text_message_once,
     stream_text_message_once,
 )
-from workspace_bridge.service import APP_WECOM_RUNTIME_KEY, APP_WECOM_TASK_KEY, create_app
+from workspace_bridge.service import APP_SCHEDULE_TASK_KEY, APP_WECOM_RUNTIME_KEY, APP_WECOM_TASK_KEY, create_app
 from workspace_bridge.models import WeComBotRuntime
 from workspace_bridge.wecom_protocol import WeComTextMessage
 
@@ -124,15 +124,37 @@ async def test_stream_text_message_once_emits_status_then_final(tmp_path: Path) 
 
 
 async def test_service_lifecycle_skips_wecom_task_when_disabled(tmp_path: Path) -> None:
+    from workspace_bridge import service as service_module
+
     config = make_config(tmp_path, wecom_enabled=False)
     app = create_app(config)
+    started = {"schedules": 0}
 
-    assert app[APP_WECOM_RUNTIME_KEY] is not None
-    for callback in app.on_startup:
-        await callback(app)
-    assert app[APP_WECOM_TASK_KEY] is None
-    for callback in app.on_cleanup:
-        await callback(app)
+    async def fake_process_due_schedules_once(_config, _runtime):
+        started["schedules"] += 1
+        await asyncio.sleep(3600)
+
+    async def fake_process_scheduled_jobs_once(_config, _runtime):
+        await asyncio.sleep(3600)
+
+    original_due = service_module.process_due_schedules_once
+    original_jobs = service_module.process_scheduled_jobs_once
+    service_module.process_due_schedules_once = fake_process_due_schedules_once
+    service_module.process_scheduled_jobs_once = fake_process_scheduled_jobs_once
+
+    try:
+        assert app[APP_WECOM_RUNTIME_KEY] is not None
+        for callback in app.on_startup:
+            await callback(app)
+        assert app[APP_WECOM_TASK_KEY] is None
+        assert app[APP_SCHEDULE_TASK_KEY] is None
+        await asyncio.sleep(0)
+        assert started["schedules"] == 0
+    finally:
+        for callback in app.on_cleanup:
+            await callback(app)
+        service_module.process_due_schedules_once = original_due
+        service_module.process_scheduled_jobs_once = original_jobs
 
 
 async def test_service_lifecycle_keeps_health_safe_when_wecom_enabled(tmp_path: Path) -> None:
@@ -161,6 +183,8 @@ async def test_service_lifecycle_keeps_health_safe_when_wecom_enabled(tmp_path: 
         assert payload["ok"] is True
         assert payload["wecomTaskPresent"] is True
         assert payload["wecomTaskDone"] is False
+        assert payload["scheduleTaskPresent"] is True
+        assert payload["scheduleTaskDone"] is False
         assert started["value"] is False
 
         await asyncio.sleep(0)
@@ -169,6 +193,41 @@ async def test_service_lifecycle_keeps_health_safe_when_wecom_enabled(tmp_path: 
         for callback in app.on_cleanup:
             await callback(app)
         service_module.run_wecom_runtime = original
+
+
+async def test_service_schedule_loop_waits_for_wecom_connection(tmp_path: Path) -> None:
+    from workspace_bridge import service as service_module
+
+    config = make_config(tmp_path, wecom_enabled=True)
+    app = create_app(config)
+    calls = {"due": 0, "jobs": 0}
+
+    async def fake_run_wecom_runtime(_config, _runtime):
+        await asyncio.sleep(3600)
+
+    async def fake_process_due_schedules_once(_config, _runtime):
+        calls["due"] += 1
+
+    async def fake_process_scheduled_jobs_once(_config, _runtime):
+        calls["jobs"] += 1
+
+    original_run = service_module.run_wecom_runtime
+    original_due = service_module.process_due_schedules_once
+    original_jobs = service_module.process_scheduled_jobs_once
+    service_module.run_wecom_runtime = fake_run_wecom_runtime
+    service_module.process_due_schedules_once = fake_process_due_schedules_once
+    service_module.process_scheduled_jobs_once = fake_process_scheduled_jobs_once
+    try:
+        for callback in app.on_startup:
+            await callback(app)
+        await asyncio.sleep(0)
+        assert calls == {"due": 0, "jobs": 0}
+    finally:
+        for callback in app.on_cleanup:
+            await callback(app)
+        service_module.run_wecom_runtime = original_run
+        service_module.process_due_schedules_once = original_due
+        service_module.process_scheduled_jobs_once = original_jobs
 
 
 async def test_execute_and_deliver_message_caches_final_when_ws_missing(tmp_path: Path) -> None:
@@ -246,6 +305,26 @@ async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat
     assert runtime.pending_finals["req-1"]["cmd"] == "aibot_send_msg"
     assert runtime.pending_finals["req-1"]["body"]["markdown"]["content"] == "final"
     assert runtime.reply_states["req-1"].pending_final_payload is not None
+
+
+async def test_send_or_cache_runtime_payload_does_not_cache_empty_req_id_state(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    message = WeComTextMessage(req_id="", chat_key="single:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "final", final=True)
+
+    assert delivered is False
+    assert len(runtime.pending_finals or {}) == 1
+    cached_req_id = next(iter(runtime.pending_finals))
+    assert cached_req_id
+    assert runtime.pending_finals[cached_req_id]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_streams == {}
+    assert cached_req_id in runtime.reply_states
 
 
 async def test_send_or_cache_runtime_payload_falls_back_to_cache_on_send_error(tmp_path: Path) -> None:

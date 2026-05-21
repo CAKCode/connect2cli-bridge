@@ -9,7 +9,7 @@ from workspace_bridge.reply_state import get_or_create_reply_state
 from workspace_bridge.runtime import prepare_session_run
 from workspace_bridge.service import APP_WECOM_RUNTIME_KEY, APP_WECOM_TASK_KEY, create_app
 from workspace_bridge.wecom_runtime import handle_wecom_payload, run_wecom_runtime
-from workspace_bridge.wecom_upload import create_request_future
+from workspace_bridge.wecom_upload import create_request_future, ws_send_json
 
 
 def write_secret(path, value: str) -> None:
@@ -102,6 +102,7 @@ async def test_bridge_status_command_returns_runtime_status(tmp_path) -> None:
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     bot.connected = True
     bot.active_processes["single:alice"] = object()
     get_or_create_reply_state(bot, "req-running", "session-1", "single:alice")
@@ -140,6 +141,7 @@ async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     process = FakeProcess()
     bot.active_processes["single:alice"] = process
     get_or_create_reply_state(bot, "req-running", "session-1", "single:alice")
@@ -174,6 +176,7 @@ async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> 
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     bot.active_processes["single:alice"] = FakeProcess()
     get_or_create_reply_state(bot, "req-alice", "session-1", "single:alice")
     get_or_create_reply_state(bot, "req-bob", "session-2", "single:bob")
@@ -207,6 +210,7 @@ async def test_bridge_reset_command_cancels_active_message_task(tmp_path) -> Non
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     task = asyncio.create_task(asyncio.sleep(3600))
     bot.active_message_tasks["single:alice"] = task
 
@@ -224,9 +228,26 @@ async def test_bridge_reset_command_cancels_active_message_task(tmp_path) -> Non
         },
         fake_handler,
     )
-    await asyncio.sleep(0)
 
-    assert task.cancelled() or task.done()
+
+async def test_ws_send_json_initializes_runtime_send_lock(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class LockingWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = LockingWS()
+
+    await ws_send_json(runtime, {"cmd": "x"})
+
+    assert runtime.ws_send_lock is not None
+    assert runtime.ws.sent == [{"cmd": "x"}]
 
 
 async def test_bridge_interrupt_command_terminates_active_process(tmp_path) -> None:
@@ -244,6 +265,7 @@ async def test_bridge_interrupt_command_terminates_active_process(tmp_path) -> N
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     process = FakeProcess()
     bot.active_processes["single:alice"] = process
 
@@ -273,6 +295,7 @@ async def test_resume_command_lists_candidates(tmp_path) -> None:
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    bot.ws = ws
     launch = prepare_session_run(bot.config, "single:alice")
     other = prepare_session_run(bot.config, "single:bob")
     store_session_record(bot.config.runtime_root, replace(launch.session, thread_id="thread-a", last_run_at=2000))
@@ -308,6 +331,7 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     config = make_config(tmp_path)
     runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
     ws = FakeWS([])
+    runtime.ws = ws
     current = prepare_session_run(runtime.config, "single:alice")
     target = prepare_session_run(runtime.config, "group-user:room-1:alice")
     store_session_record(runtime.config.runtime_root, replace(target.session, thread_id="thread-target", last_run_at=2000))

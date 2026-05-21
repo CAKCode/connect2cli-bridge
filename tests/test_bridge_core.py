@@ -412,6 +412,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "WORK_DIR=/tmp/from-dotenv\n"
         "BRIDGE_TOKEN=token-from-dotenv\n"
         "LOCAL_FILE_SEND_POLL_MS=4321\n"
+        "LOCAL_FILE_SEND_RESULT_RETENTION_MS=654321\n"
         "PROACTIVE_TEXT_MAX_CHARS=987\n",
         encoding="utf-8",
     )
@@ -421,7 +422,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
             "sh",
             "-c",
             '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
-            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
             "sh",
             str(script_dir),
         ],
@@ -434,6 +435,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "/tmp/from-dotenv",
         "token-from-dotenv",
         "4321",
+        "654321",
         "987",
     ]
 
@@ -1087,6 +1089,66 @@ def test_get_session_runtime_cwd_uses_workfile_for_single_chat(bridge_module):
     runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "single:test-user")
 
     assert runtime_cwd == bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
+
+
+def test_ensure_session_workspace_dirs_bootstraps_workfile_from_workdir(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "tracked.txt").write_text("hello", encoding="utf-8")
+    (work_dir / ".git").mkdir()
+    (work_dir / "__pycache__").mkdir()
+    (work_dir / "__pycache__" / "ignored.pyc").write_text("x", encoding="utf-8")
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    assert (paths["workfile"] / "tracked.txt").read_text(encoding="utf-8") == "hello"
+    assert not (paths["workfile"] / ".git").exists()
+    assert not (paths["workfile"] / "__pycache__").exists()
+
+
+def test_ensure_session_workspace_dirs_bootstraps_non_git_project_tree(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (work_dir / "tests").mkdir()
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    assert (paths["workfile"] / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
+    assert (paths["workfile"] / "tests").is_dir()
+
+
+def test_ensure_session_workspace_dirs_does_not_overwrite_existing_workfile(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "tracked.txt").write_text("source", encoding="utf-8")
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    workfile = bridge_module.get_workfile_dir(bot.config["id"], "test-user")
+    workfile.mkdir(parents=True, exist_ok=True)
+    (workfile / "tracked.txt").write_text("user", encoding="utf-8")
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    assert (paths["workfile"] / "tracked.txt").read_text(encoding="utf-8") == "user"
+
+
+def test_ensure_session_workspace_dirs_writes_bootstrap_marker(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "app.py").write_text("print('source')\n", encoding="utf-8")
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    marker = paths["workfile"] / ".workspace-bootstrap.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["source"] == str(work_dir.resolve())
 
 
 def test_get_session_runtime_cwd_uses_workfile_for_group_user_chat(bridge_module):

@@ -30,6 +30,7 @@ class BotConfig:
 class WeComBotRuntime:
     config: BotConfig
     ws: object | None = None
+    ws_send_lock: object | None = None
     pending_requests: dict[str, object] | None = None
     pending_streams: dict[str, dict] | None = None
     pending_finals: dict[str, dict] | None = None

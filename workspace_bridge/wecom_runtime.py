@@ -20,7 +20,7 @@ from .wecom_protocol import (
     parse_text_callback,
     strip_text_mentions,
 )
-from .wecom_upload import reject_pending_requests, resolve_pending_request
+from .wecom_upload import reject_pending_requests, resolve_pending_request, ws_send_json
 
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 RESUME_SELECTION_TTL_MS = 5 * 60 * 1000
@@ -215,18 +215,18 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
     text = strip_text_mentions(parsed.content, runtime.config.bot_name)
     parsed = type(parsed)(req_id=parsed.req_id, chat_key=parsed.chat_key, content=text, raw_payload=parsed.raw_payload)
     if text == "/bridge-status":
-        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", build_runtime_status_text(runtime, parsed.chat_key), final=True))
+        await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", build_runtime_status_text(runtime, parsed.chat_key), final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
     if text == "/bridge-resume":
         candidates = _build_resume_candidates(runtime, parsed.chat_key)
         if not candidates:
-            await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "没有可恢复的会话。", final=True))
+            await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "没有可恢复的会话。", final=True))
             cleanup_reply_state(runtime, parsed.req_id)
             return
         runtime.resume_candidates[parsed.chat_key] = candidates
         runtime.resume_selection_expires_at[parsed.chat_key] = int(__import__("time").time() * 1000) + RESUME_SELECTION_TTL_MS
-        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", _build_resume_candidates_text(candidates), final=True))
+        await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", _build_resume_candidates_text(candidates), final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
     if text.startswith("/bridge-resume "):
@@ -235,11 +235,12 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
             candidates = _build_resume_candidates(runtime, parsed.chat_key)
             candidate = next((item for item in candidates if item["sessionId"] == text.split(None, 1)[1].strip()), None)
         if candidate is None:
-            await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "未找到可恢复会话。", final=True))
+            await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "未找到可恢复会话。", final=True))
             cleanup_reply_state(runtime, parsed.req_id)
             return
         source_session_id = _bind_resume_candidate(runtime, parsed.chat_key, candidate)
-        await ws.send_json(
+        await ws_send_json(
+            runtime,
             build_text_response_payload(parsed.req_id, "session-1", f"已选择会话 {source_session_id}，接下来会继续该上下文。", final=True)
         )
         cleanup_reply_state(runtime, parsed.req_id)
@@ -259,7 +260,7 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
                 runtime.pending_streams.pop(req_id, None)
             if runtime.pending_finals is not None:
                 runtime.pending_finals.pop(req_id, None)
-        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "Session reset.", final=True))
+        await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "Session reset.", final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
     if text == "/bridge-interrupt":
@@ -267,24 +268,26 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         process = runtime.active_processes.get(parsed.chat_key)
         if process is not None:
             process.terminate()
-        await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "Current task interrupted.", final=True))
+        await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "Current task interrupted.", final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
     if _resume_selection_active(runtime, parsed.chat_key):
         if text in {"取消", "cancel", "Cancel", "CANCEL"}:
             _clear_resume_selection(runtime, parsed.chat_key)
-            await ws.send_json(build_text_response_payload(parsed.req_id, "session-1", "已取消恢复选择。", final=True))
+            await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "已取消恢复选择。", final=True))
             cleanup_reply_state(runtime, parsed.req_id)
             return
         candidate = _select_resume_candidate(runtime, parsed.chat_key, text)
         if candidate is None:
-            await ws.send_json(
+            await ws_send_json(
+                runtime,
                 build_text_response_payload(parsed.req_id, "session-1", "无效选择，请回复列表编号、sessionId，或回复“取消”。", final=True)
             )
             cleanup_reply_state(runtime, parsed.req_id)
             return
         source_session_id = _bind_resume_candidate(runtime, parsed.chat_key, candidate)
-        await ws.send_json(
+        await ws_send_json(
+            runtime,
             build_text_response_payload(parsed.req_id, "session-1", f"已选择会话 {source_session_id}，接下来会继续该上下文。", final=True)
         )
         cleanup_reply_state(runtime, parsed.req_id)
@@ -298,7 +301,7 @@ async def run_wecom_runtime_once(config, runtime) -> None:
         async with session.ws_connect(WECOM_WS) as ws:
             runtime.ws = ws
             subscribe_payload = build_subscribe_payload(runtime.config)
-            await ws.send_json(subscribe_payload)
+            await ws_send_json(runtime, subscribe_payload)
             subscribe_msg = await ws.receive()
             if subscribe_msg.type != WSMsgType.TEXT:
                 runtime.connected = False

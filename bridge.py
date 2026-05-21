@@ -933,11 +933,158 @@ def get_session_runtime_cwd(bot: BotState, key: str) -> Path:
     return paths["workDir"].resolve()
 
 
+def path_contains(candidate: Path, target: Path) -> bool:
+    try:
+        target.resolve().relative_to(candidate.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def workspace_bootstrap_skip_paths(target_root: Path) -> tuple[Path, ...]:
+    return (
+        target_root,
+        DATA_FILE,
+        BOT_TOMBSTONE_ROOT,
+        BOT_RUNTIME_LOCK_ROOT,
+        SESSION_LOCK_ROOT,
+        SESSION_REGISTRY_ROOT,
+        CHATFILE_ROOT,
+        WORKSPACE_ROOT,
+        BRIDGE_CODEX_HOME_ROOT,
+        SCHEDULE_ROOT,
+        USER_ALIAS_ROOT,
+        LOCAL_FILE_SEND_QUEUE_ROOT,
+        BASE_DIR / ".bridge.pid",
+        BASE_DIR / ".bridge.guard.pid",
+        BASE_DIR / ".bridge.watchdog.restarts",
+        BASE_DIR / "bridge.log",
+        BASE_DIR / "bridge.log.prev",
+    )
+
+
+def should_skip_workspace_bootstrap_path(path: Path, target_root: Path) -> bool:
+    if path.name in {".git", "__pycache__", ".pytest_cache"}:
+        return True
+    for skip_path in workspace_bootstrap_skip_paths(target_root):
+        if path_contains(path, skip_path):
+            return True
+    return False
+
+
+def is_likely_workspace_source_root(source_root: Path, target_root: Path) -> bool:
+    marker_files = {
+        "README",
+        "README.md",
+        "README.en.md",
+        "Makefile",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "package.json",
+        "go.mod",
+        "Cargo.toml",
+        "pom.xml",
+        "CMakeLists.txt",
+    }
+    marker_dirs = {"src", "lib", "app", "cmd", "pkg", "tests", "test", "docs", ".codex"}
+    marker_suffixes = {
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".rb",
+        ".php",
+        ".sh",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".md",
+    }
+    if (source_root / ".git").exists():
+        return True
+    for child in source_root.iterdir():
+        if should_skip_workspace_bootstrap_path(child, target_root):
+            continue
+        if child.name in marker_files:
+            return True
+        if child.is_dir() and child.name in marker_dirs:
+            return True
+        if child.is_file() and child.suffix.lower() in marker_suffixes:
+            return True
+    return False
+
+
+def copy_missing_tree_contents_filtered(source: Path, target: Path, *, target_root: Path) -> None:
+    ensure_dir(target)
+    for child in sorted(source.iterdir(), key=lambda item: item.name):
+        if should_skip_workspace_bootstrap_path(child, target_root):
+            continue
+        destination = target / child.name
+        try:
+            if child.is_symlink():
+                if destination.exists():
+                    continue
+                ensure_dir_for(destination)
+                os.symlink(os.readlink(child), destination)
+                continue
+            if child.is_dir():
+                copy_missing_tree_contents_filtered(child, destination, target_root=target_root)
+                continue
+            if not child.is_file() or destination.exists():
+                continue
+            ensure_dir_for(destination)
+            shutil.copy2(child, destination, follow_symlinks=False)
+        except OSError:
+            continue
+
+
+def bootstrap_workspace_from_workdir(source_root: Path, target_root: Optional[Path]) -> None:
+    if target_root is None:
+        return
+    if not source_root.exists() or not source_root.is_dir():
+        return
+    marker_file = target_root / ".workspace-bootstrap.json"
+    if marker_file.exists():
+        return
+    source_root_resolved = source_root.resolve()
+    if source_root_resolved == Path(DEFAULT_WORK_DIR).expanduser().resolve():
+        return
+    if source_root_resolved in {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}:
+        return
+    if not is_likely_workspace_source_root(source_root, target_root):
+        return
+    ensure_dir(target_root)
+    copy_missing_tree_contents_filtered(source_root, target_root, target_root=target_root)
+    write_json_atomic(
+        marker_file,
+        {
+            "source": str(source_root_resolved),
+            "bootstrappedAt": now_ms(),
+        },
+    )
+
+
 def ensure_session_workspace_dirs(bot: BotState, key: str) -> dict[str, Optional[Path]]:
     paths = get_session_workspace_paths(bot, key)
     for path in (paths["chatfile"], paths["workfile"], paths["roomfile"]):
         if path is not None:
             ensure_dir(path)
+    for path in (paths["workfile"], paths["roomfile"]):
+        bootstrap_workspace_from_workdir(paths["workDir"], path)
     ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key)))
     return paths
 

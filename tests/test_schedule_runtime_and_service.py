@@ -46,11 +46,11 @@ async def test_process_due_schedules_once_executes_due_schedule(tmp_path, monkey
     )
     calls = []
 
-    async def fake_run_text_message_once(_config, _bot, message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, message, **_kwargs):
         calls.append((message.chat_key, message.content))
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == ["schedule-1"]
@@ -81,11 +81,11 @@ async def test_process_due_schedules_once_skips_missed_when_policy_demands(tmp_p
     )
     calls = []
 
-    async def fake_run_text_message_once(_config, _bot, message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, message, **_kwargs):
         calls.append((message.chat_key, message.content))
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == []
@@ -111,10 +111,10 @@ async def test_process_scheduled_jobs_once_moves_failed_jobs_to_failed(tmp_path,
     )
     write_scheduled_job(pending_root / "0000000000000-job-1.json", job)
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_scheduled_jobs_once(config)
 
     assert executed == []
@@ -137,16 +137,41 @@ async def test_process_scheduled_jobs_once_claims_pending_job_before_run(tmp_pat
     write_scheduled_job(pending_root / "0000000000000-job-1.json", job)
     processing_files_seen = []
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         processing_files_seen.extend(sorted((config.runtime_root / "schedules" / "processing").glob("*.json")))
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_scheduled_jobs_once(config)
 
     assert executed == ["job-1"]
     assert processing_files_seen
     assert not list(schedule_pending_root(config.runtime_root).glob("*.json"))
+
+
+async def test_process_scheduled_jobs_once_moves_delivery_failures_to_failed(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    pending_root = schedule_pending_root(config.runtime_root)
+    pending_root.mkdir(parents=True, exist_ok=True)
+    job = ScheduledJob(
+        request_id="job-1",
+        schedule_id="schedule-1",
+        chat_key="single:alice",
+        message="hello",
+        run_at=0,
+        created_at=0,
+    )
+    write_scheduled_job(pending_root / "0000000000000-job-1.json", job)
+
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
+        raise RuntimeError("delivery failed")
+
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
+    executed = await process_scheduled_jobs_once(config)
+
+    assert executed == []
+    failed_files = list(schedule_failed_root(config.runtime_root).glob("*.json"))
+    assert len(failed_files) == 1
 
 
 async def test_process_scheduled_jobs_once_reclaims_orphaned_processing_job(tmp_path, monkeypatch) -> None:
@@ -166,10 +191,10 @@ async def test_process_scheduled_jobs_once_reclaims_orphaned_processing_job(tmp_
     old = __import__("time").time() - 120
     __import__("os").utime(orphan, (old, old))
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_scheduled_jobs_once(config)
 
     assert executed == ["job-1"]
@@ -192,10 +217,10 @@ async def test_process_due_schedules_once_reclaims_orphaned_definition_marker(tm
     old = __import__("time").time() - 120
     __import__("os").utime(marker, (old, old))
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == ["schedule-1"]
@@ -233,11 +258,11 @@ async def test_process_due_schedules_once_respects_skip_if_running(tmp_path, mon
     )
     calls = []
 
-    async def fake_run_text_message_once(_config, _bot, message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, message, **_kwargs):
         calls.append((message.chat_key, message.content))
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == []
@@ -270,10 +295,10 @@ async def test_process_due_schedules_once_advances_recurring_schedule(tmp_path, 
         ),
     )
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == ["schedule-1"]
@@ -292,10 +317,10 @@ async def test_process_due_schedules_once_disables_one_shot_after_run(tmp_path, 
         run_at_ms=0,
     )
 
-    async def fake_run_text_message_once(_config, _bot, _message, **_kwargs):
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
         return "session-1", "done"
 
-    monkeypatch.setattr("workspace_bridge.schedule_runtime.run_text_message_once", fake_run_text_message_once)
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
     executed = await process_due_schedules_once(config)
 
     assert executed == ["schedule-1"]
@@ -310,6 +335,7 @@ async def test_process_due_schedules_once_disables_one_shot_after_run(tmp_path, 
 
 async def test_service_schedule_endpoints_create_and_list(tmp_path) -> None:
     config = make_config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "wecom_enabled": True})
     app = create_app(config)
 
     class CreateRequest:
@@ -334,6 +360,7 @@ async def test_service_schedule_endpoints_create_and_list(tmp_path) -> None:
 
 async def test_service_schedule_endpoint_uses_distinct_ids_for_distinct_payloads(tmp_path) -> None:
     config = make_config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "wecom_enabled": True})
     app = create_app(config)
 
     class CreateRequest:
@@ -365,6 +392,7 @@ async def test_service_schedule_endpoint_uses_distinct_ids_for_distinct_payloads
 
 async def test_service_schedule_endpoint_allows_duplicate_payload_as_distinct_schedule(tmp_path) -> None:
     config = make_config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "wecom_enabled": True})
     app = create_app(config)
 
     class CreateRequest:
@@ -385,6 +413,7 @@ async def test_service_schedule_endpoint_allows_duplicate_payload_as_distinct_sc
 
 async def test_service_schedule_management_endpoints(tmp_path) -> None:
     config = make_config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "wecom_enabled": True})
     app = create_app(config)
 
     class CreateRequest:
@@ -420,6 +449,7 @@ async def test_service_schedule_endpoints_return_not_found_for_missing_id(tmp_pa
     from aiohttp import web
 
     config = make_config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "wecom_enabled": True})
     app = create_app(config)
 
     get_route = next(route for route in app.router.routes() if route.method == "GET" and route.resource.canonical == "/api/schedules/{schedule_id}")
@@ -434,3 +464,44 @@ async def test_service_schedule_endpoints_return_not_found_for_missing_id(tmp_pa
             pass
         else:
             raise AssertionError("expected HTTPNotFound")
+
+
+async def test_service_schedule_endpoints_require_wecom_runtime(tmp_path) -> None:
+    from aiohttp import web
+    from workspace_bridge.service import create_app
+
+    config = make_config(tmp_path)
+    app = create_app(config)
+
+    class CreateRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {"chatKey": "single:alice", "message": "hello", "cron": "0 9 * * *"}
+
+    targets = [
+        next(route for route in app.router.routes() if route.method == "GET" and route.resource.canonical == "/api/schedules"),
+        next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/schedules"),
+        next(route for route in app.router.routes() if route.method == "GET" and route.resource.canonical == "/api/schedules/{schedule_id}"),
+        next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/schedules/{schedule_id}/pause"),
+        next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/schedules/{schedule_id}/resume"),
+        next(route for route in app.router.routes() if route.method == "DELETE" and route.resource.canonical == "/api/schedules/{schedule_id}"),
+    ]
+
+    requests = [
+        type("Req", (), {"app": app})(),
+        CreateRequest(app),
+        type("Req", (), {"app": app, "match_info": {"schedule_id": "x"}})(),
+        type("Req", (), {"app": app, "match_info": {"schedule_id": "x"}})(),
+        type("Req", (), {"app": app, "match_info": {"schedule_id": "x"}})(),
+        type("Req", (), {"app": app, "match_info": {"schedule_id": "x"}})(),
+    ]
+
+    for route, req in zip(targets, requests):
+        try:
+            await route.handler(req)
+        except web.HTTPServiceUnavailable:
+            pass
+        else:
+            raise AssertionError("expected HTTPServiceUnavailable")

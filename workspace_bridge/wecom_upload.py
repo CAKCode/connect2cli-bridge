@@ -67,7 +67,10 @@ def reject_pending_requests(bot: WeComBotRuntime, message: str) -> None:
 async def ws_send_json(bot: WeComBotRuntime, payload: dict) -> None:
     if bot.ws is None:
         raise RuntimeError("bot websocket not connected")
-    await bot.ws.send_json(payload)
+    if bot.ws_send_lock is None:
+        bot.ws_send_lock = asyncio.Lock()
+    async with bot.ws_send_lock:
+        await bot.ws.send_json(payload)
 
 
 async def send_ws_payload_with_ack(bot: WeComBotRuntime, payload: dict, timeout_sec: int) -> dict:
