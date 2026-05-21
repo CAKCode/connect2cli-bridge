@@ -10,13 +10,34 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BRIDGE_PATH = REPO_ROOT / "bridge.py"
+ISOLATED_ENV_VARS = (
+    "BOTS_FILE",
+    "BRIDGE_RUNTIME_ROOT",
+    "BRIDGE_SHARED_RUNTIME_ROOT",
+    "FILE_SEND_ROOTS",
+    "LOCAL_FILE_SEND_QUEUE_ROOT",
+    "WECOM_BOOTSTRAP_BOTS_JSON",
+    "WECOM_BOOTSTRAP_BOTS_JSON_FILE",
+    "WECOM_BOT_CONFIG_ID",
+    "WECOM_BOT_ENABLED",
+    "WECOM_BOT_GROUP_SESSION_MODE",
+    "WECOM_BOT_ID",
+    "WECOM_BOT_NAME",
+    "WECOM_BOT_SECRET",
+    "WECOM_BOT_SECRET_FILE",
+    "WECOM_BOT_WELCOME",
+    "WECOM_BOT_WORK_DIR",
+)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
 @pytest.fixture
-def bridge_module(tmp_path):
+def bridge_module(tmp_path, monkeypatch):
+    for env_name in ISOLATED_ENV_VARS:
+        monkeypatch.delenv(env_name, raising=False)
+
     spec = importlib.util.spec_from_file_location(f"bridge_test_{id(tmp_path)}", BRIDGE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
