@@ -2,11 +2,14 @@ from pathlib import Path
 
 from workspace_bridge.models import BotConfig, SourceConfig
 from workspace_bridge.wecom_protocol import (
+    build_proactive_text_payload,
     build_subscribe_payload,
     build_text_response_payload,
     chat_key_from_message,
+    chat_key_to_send_target,
     is_subscribe_ok,
     parse_text_callback,
+    strip_text_mentions,
 )
 
 
@@ -66,6 +69,23 @@ def test_parse_text_callback_extracts_text_message(tmp_path: Path) -> None:
     assert message.content == "hello"
 
 
+def test_parse_text_callback_keeps_raw_content_for_later_strip(tmp_path: Path) -> None:
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-2"},
+        "body": {
+            "msgtype": "text",
+            "text": {"content": "@robot, hello"},
+            "from": {"userid": "alice"},
+        },
+    }
+
+    message = parse_text_callback(payload)
+
+    assert message is not None
+    assert message.content == "@robot, hello"
+
+
 def test_build_text_response_payload_uses_stream_format() -> None:
     payload = build_text_response_payload("req-1", "session-1", "done", final=True)
 
@@ -73,6 +93,44 @@ def test_build_text_response_payload_uses_stream_format() -> None:
     assert payload["body"]["msgtype"] == "stream"
     assert payload["body"]["stream"]["id"] == "session-1"
     assert payload["body"]["stream"]["finish"] is True
+
+
+def test_chat_key_to_send_target_preserves_group_for_per_user_mode() -> None:
+    assert chat_key_to_send_target("group-user:room-1:alice") == (2, "room-1")
+    assert chat_key_to_send_target("single:alice") == (1, "alice")
+
+
+def test_build_proactive_text_payload_mentions_group_user() -> None:
+    payload = build_proactive_text_payload("group-user:room-1:alice", "done")
+
+    assert payload["cmd"] == "aibot_send_msg"
+    assert payload["body"]["chat_type"] == 2
+    assert payload["body"]["chatid"] == "room-1"
+    assert payload["body"]["markdown"]["content"] == "<@alice>\ndone"
+
+
+def test_build_proactive_text_payload_does_not_mention_single_chat_user() -> None:
+    payload = build_proactive_text_payload("single:alice", "done")
+
+    assert payload["cmd"] == "aibot_send_msg"
+    assert payload["body"]["chat_type"] == 1
+    assert payload["body"]["chatid"] == "alice"
+    assert payload["body"]["markdown"]["content"] == "done"
+
+
+def test_build_proactive_text_payload_truncates_long_content() -> None:
+    payload = build_proactive_text_payload("group-user:room-1:alice", "x" * 5000)
+
+    assert payload["body"]["markdown"]["content"].startswith("<@alice>\n")
+    assert payload["body"]["markdown"]["content"].endswith("...(truncated)")
+
+
+def test_strip_text_mentions_supports_bot_name_with_spaces() -> None:
+    assert strip_text_mentions("@Leo C /bridge-interrupt", "Leo C") == "/bridge-interrupt"
+    assert strip_text_mentions("@Leo C 请分析这句话里的 @Leo C 是否会被保留", "Leo C") == "请分析这句话里的 @Leo C 是否会被保留"
+    assert strip_text_mentions("@Alice Bob @Leo C hello", "Leo C") == "hello"
+    assert strip_text_mentions("@robot, /bridge-status", "robot") == "/bridge-status"
+    assert strip_text_mentions("@bot2 hello", "bot") == "@bot2 hello"
 
 
 def test_is_subscribe_ok_accepts_success_payload() -> None:

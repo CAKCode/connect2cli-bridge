@@ -176,6 +176,13 @@ while true; do
     sleep "$BRIDGE_WATCHDOG_COOLDOWN_SEC"
   fi
 
+  bridge_pid=$(read_bridge_pid)
+  if pid_is_running "$bridge_pid" && bridge_health_ok; then
+    fail_count=0
+    log "bridge recovered before restart; skip restart pid=$bridge_pid"
+    continue
+  fi
+
   stop_bridge_process "$bridge_pid"
   sleep "$BRIDGE_WATCHDOG_RESTART_BACKOFF_SEC"
   start_bridge_process

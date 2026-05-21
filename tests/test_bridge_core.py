@@ -411,7 +411,8 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "BRIDGE_BIND=127.0.0.1:19399\n"
         "WORK_DIR=/tmp/from-dotenv\n"
         "BRIDGE_TOKEN=token-from-dotenv\n"
-        "LOCAL_FILE_SEND_POLL_MS=4321\n",
+        "LOCAL_FILE_SEND_POLL_MS=4321\n"
+        "PROACTIVE_TEXT_MAX_CHARS=987\n",
         encoding="utf-8",
     )
 
@@ -420,7 +421,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
             "sh",
             "-c",
             '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
-            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\'))"',
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
             "sh",
             str(script_dir),
         ],
@@ -433,6 +434,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "/tmp/from-dotenv",
         "token-from-dotenv",
         "4321",
+        "987",
     ]
 
 
@@ -1077,6 +1079,30 @@ def test_get_session_workspace_paths_for_group_shared_chat(bridge_module):
     assert paths["chatfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "sessions" / "group_group-1" / "chatfile"
     assert paths["workfile"] is None
     assert paths["roomfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "rooms" / "group-1" / "roomfile"
+
+
+def test_get_session_runtime_cwd_uses_workfile_for_single_chat(bridge_module):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
+
+    runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "single:test-user")
+
+    assert runtime_cwd == bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
+
+
+def test_get_session_runtime_cwd_uses_workfile_for_group_user_chat(bridge_module):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
+
+    runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "group-user:group-1:user-a")
+
+    assert runtime_cwd == bridge_module.get_workfile_dir(bot.config["id"], "user-a").resolve()
+
+
+def test_get_session_runtime_cwd_uses_roomfile_for_group_shared_chat(bridge_module):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
+
+    runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "group:group-1")
+
+    assert runtime_cwd == bridge_module.get_roomfile_dir(bot.config["id"], "group-1").resolve()
 
 
 def test_validate_file_for_upload_only_allows_chatfile_by_default(bridge_module):
@@ -5957,7 +5983,7 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
 
 
 @pytest.mark.asyncio
-async def test_run_codex_uses_workdir_as_cwd_in_sandbox_mode(bridge_module, monkeypatch):
+async def test_run_codex_uses_workfile_as_cwd_in_sandbox_mode(bridge_module, monkeypatch):
     bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
     Path(bot.config["workDir"]).mkdir(parents=True, exist_ok=True)
     sess = make_session(bridge_module, bot)
@@ -5997,8 +6023,56 @@ async def test_run_codex_uses_workdir_as_cwd_in_sandbox_mode(bridge_module, monk
 
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
-    assert captured["cwd"] == str(Path(bot.config["workDir"]).resolve())
-    assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == str(Path(bot.config["workDir"]).resolve())
+    expected_workfile_dir = str(bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve())
+    assert captured["cwd"] == expected_workfile_dir
+    assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_workfile_dir
+
+
+@pytest.mark.asyncio
+async def test_run_codex_uses_roomfile_as_cwd_for_group_session_in_sandbox_mode(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
+    Path(bot.config["workDir"]).mkdir(parents=True, exist_ok=True)
+    bot.config["groupSessionMode"] = "shared"
+    sess = make_session(bridge_module, bot, key="group:test-room")
+    sess.running = True
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            event = {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}
+            self.stdout.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cwd"] = kwargs["cwd"]
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    async def fake_send_session_status(*args, **kwargs):
+        return True
+
+    async def fake_send_or_store_session_payload(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(bridge_module, "CODEX_EXEC_MODE", "sandboxed")
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payload", fake_send_or_store_session_payload)
+
+    await bridge_module.run_codex(bot, sess, "group:test-room", "prompt", "req-1", [])
+
+    expected_roomfile_dir = str(bridge_module.get_roomfile_dir(bot.config["id"], "test-room").resolve())
+    assert captured["cwd"] == expected_roomfile_dir
+    assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_roomfile_dir
 
 
 def test_build_codex_home_for_subprocess_preserves_global_skills_and_adds_project_skills(bridge_module):

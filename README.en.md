@@ -126,6 +126,7 @@ When the bridge starts Codex:
 
 - default `cwd` is `workfile`
 - room-shared sessions use `roomfile`
+- both `sandboxed` and `host` keep this `cwd` selection and do not force a fallback to `workDir`
 - `TMPDIR`, `TMP`, and `TEMP` point to the current session `chatfile`
 - auth state still comes from the runtime user's `CODEX_HOME`
 

@@ -230,6 +230,24 @@ async def test_send_or_cache_runtime_payload_uses_proactive_group_markdown_for_f
     assert runtime.reply_states["req-1"].pending_final_payload is not None
 
 
+async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat_final_fallback(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "final", final=True)
+
+    assert delivered is False
+    assert "req-1" in runtime.pending_finals
+    assert runtime.pending_finals["req-1"]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_finals["req-1"]["body"]["markdown"]["content"] == "final"
+    assert runtime.reply_states["req-1"].pending_final_payload is not None
+
+
 async def test_send_or_cache_runtime_payload_falls_back_to_cache_on_send_error(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config

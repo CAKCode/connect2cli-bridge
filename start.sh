@@ -6,32 +6,24 @@ cd "$SCRIPT_DIR"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/bridge_env.sh"
 load_bridge_runtime_env "$SCRIPT_DIR" || exit 1
-
-export HOST PORT BRIDGE_TOKEN BRIDGE_BASIC_AUTH WORK_DIR MAX_JSON_BODY MAX_UPLOAD_SIZE FILE_SEND_ROOTS
-export BRIDGE_BIND BRIDGE_HOST BRIDGE_PORT
-export BRIDGE_SHARED_RUNTIME_ROOT
-export BRIDGE_RUNTIME_ROOT
-export MAX_INBOUND_IMAGE_SIZE MAX_INBOUND_FILE_SIZE
-export SESSION_LEASE_TTL HTTP_PROXY HTTPS_PROXY NO_PROXY
-export MEDIA_CONNECT_TIMEOUT MEDIA_TOTAL_TIMEOUT LOCAL_FILE_SEND_QUEUE_ROOT LOCAL_FILE_SEND_POLL_MS
-export LOCAL_FILE_SEND_RESULT_TIMEOUT_MS
-export CODEX_EXEC_MODE MAX_CONCURRENT_CODEX_RUNS
-export SUBPROCESS_STREAM_LIMIT SUBPROCESS_STREAM_READ_SIZE SUBPROCESS_STREAM_MAX_LINE
-export WEBSOCKET_SEND_TIMEOUT_SEC STATUS_STREAM_INTERVAL_SEC STATUS_SEND_TIMEOUT_SEC STATUS_SEND_LOCK_TIMEOUT_SEC
-export REPLY_IDLE_FALLBACK_SEC REPLY_MAX_AGE_FALLBACK_SEC PROACTIVE_STATUS_INTERVAL_SEC
-export SCHEDULE_POLL_MS
-export SCHEDULE_DEFINITION_POLL_MS SCHEDULE_DEFINITION_LEASE_TTL_MS
-export PROACTIVE_SEND_ACK_TIMEOUT_SEC
-export SCHEDULE_PROCESSING_RETRY_MS
-export SCHEDULE_ORPHAN_TTL_MS
-export BOTS_FILE WECOM_BOOTSTRAP_BOTS_JSON WECOM_BOOTSTRAP_BOTS_JSON_FILE
-export WECOM_BOT_CONFIG_ID WECOM_BOT_NAME WECOM_BOT_ID WECOM_BOT_SECRET_FILE
-export WECOM_BOT_WORK_DIR WECOM_BOT_WELCOME WECOM_BOT_GROUP_SESSION_MODE WECOM_BOT_ENABLED
+export_bridge_runtime_env
 
 PID_FILE="$SCRIPT_DIR/.bridge.pid"
+GUARD_PID_FILE="$SCRIPT_DIR/.bridge.guard.pid"
 LOG_FILE="$SCRIPT_DIR/bridge.log"
 PREV_LOG_FILE="$SCRIPT_DIR/bridge.log.prev"
 STOPPED_PIDS=""
+
+: "${BRIDGE_WATCHDOG_ENABLED:=true}"
+
+is_truthy() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)
+      return 0
+      ;;
+  esac
+  return 1
+}
 
 wait_for_pid_exit() {
   target_pid="$1"
@@ -39,6 +31,20 @@ wait_for_pid_exit() {
   tries="${2:-50}"
   while [ "$tries" -gt 0 ]; do
     if ! kill -0 "$target_pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
+wait_for_started_bridge_pid() {
+  tries="${1:-50}"
+  while [ "$tries" -gt 0 ]; do
+    target_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
+      printf '%s\n' "$target_pid"
       return 0
     fi
     sleep 0.2
@@ -79,6 +85,48 @@ wait_for_port_release() {
   return 1
 }
 
+stop_pid_from_file() {
+  target_file="$1"
+  if [ ! -f "$target_file" ]; then
+    return
+  fi
+  target_pid=$(cat "$target_file" 2>/dev/null || true)
+  if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
+    kill "$target_pid" 2>/dev/null || true
+    STOPPED_PIDS="$STOPPED_PIDS $target_pid"
+  fi
+  rm -f "$target_file"
+}
+
+stop_existing_watchdogs() {
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return
+  fi
+  pgrep -f 'bridge_watchdog\.sh' 2>/dev/null | while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" != "$$" ] || continue
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+
+    case "$cmdline" in
+      *"$SCRIPT_DIR/bridge_watchdog.sh"*)
+        kill "$pid" 2>/dev/null || true
+        echo "$pid"
+        continue
+        ;;
+    esac
+
+    if [ "$cwd" = "$SCRIPT_DIR" ]; then
+      case "$cmdline" in
+        *"bridge_watchdog.sh"*)
+          kill "$pid" 2>/dev/null || true
+          echo "$pid"
+          ;;
+      esac
+    fi
+  done
+}
+
 stop_existing_bridges() {
   if ! command -v pgrep >/dev/null 2>&1; then
     return
@@ -108,18 +156,11 @@ stop_existing_bridges() {
   done
 }
 
-if [ -f "$PID_FILE" ]; then
-  OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
-  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    kill "$OLD_PID" 2>/dev/null
-    STOPPED_PIDS="$STOPPED_PIDS $OLD_PID"
-  fi
-  rm -f "$PID_FILE"
-fi
+stop_pid_from_file "$GUARD_PID_FILE"
+stop_pid_from_file "$PID_FILE"
 
-if [ -f "$LOG_FILE" ]; then
-  mv "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || cp "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || true
-fi
+MORE_GUARD_PIDS=$(stop_existing_watchdogs)
+STOPPED_PIDS="$STOPPED_PIDS $MORE_GUARD_PIDS"
 
 MORE_PIDS=$(stop_existing_bridges)
 STOPPED_PIDS="$STOPPED_PIDS $MORE_PIDS"
@@ -128,6 +169,10 @@ for pid in $STOPPED_PIDS; do
   wait_for_pid_exit "$pid" 50 || true
 done
 
+if [ -f "$LOG_FILE" ]; then
+  mv "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || cp "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || true
+fi
+
 wait_for_port_release 50 || {
   echo "start failed: port ${HOST}:${PORT} is still in use"
   exit 1
@@ -135,19 +180,33 @@ wait_for_port_release 50 || {
 
 : > "$LOG_FILE"
 
-if command -v setsid >/dev/null 2>&1; then
-  nohup setsid python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+if is_truthy "$BRIDGE_WATCHDOG_ENABLED"; then
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null >> "$LOG_FILE" 2>&1 &
+  else
+    nohup sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null >> "$LOG_FILE" 2>&1 &
+  fi
+  echo $! > "$GUARD_PID_FILE"
 else
-  nohup python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+  rm -f "$GUARD_PID_FILE"
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+  else
+    nohup python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+  fi
+  echo $! > "$PID_FILE"
 fi
 
-echo $! > "$PID_FILE"
 sleep 2
-PID=$(cat "$PID_FILE" 2>/dev/null)
+PID=$(wait_for_started_bridge_pid 50 || true)
+GUARD_PID=$(cat "$GUARD_PID_FILE" 2>/dev/null || true)
 API_BASE=$(python3 "$SCRIPT_DIR/bridge_runtime_config.py" 2>/dev/null || printf 'http://%s:%s' "$HOST" "$PORT")
 
 if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
   echo "started (PID: $PID)"
+  if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then
+    echo "watchdog: $GUARD_PID"
+  fi
   echo "api: ${API_BASE}"
   if [ -n "${BRIDGE_TOKEN:-}" ] && [ -n "${BRIDGE_BASIC_AUTH:-}" ]; then
     echo "api auth: token or basic auth enabled"
@@ -161,6 +220,10 @@ if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
   tail -5 "$LOG_FILE"
 else
   echo "start failed"
+  if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then
+    kill "$GUARD_PID" 2>/dev/null || true
+    rm -f "$GUARD_PID_FILE"
+  fi
   cat "$LOG_FILE"
   exit 1
 fi

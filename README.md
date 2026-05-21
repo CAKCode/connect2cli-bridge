@@ -162,6 +162,7 @@ Bridge 运行 `codex` 时：
 
 - 默认 `cwd` 是 `workfile`
 - 纯群共享会话会使用 `roomfile`
+- `sandboxed` 与 `host` 模式都会沿用这套 `cwd` 选择规则，不会强制退回到 `workDir`
 - `TMPDIR` / `TMP` / `TEMP` 会指向当前会话 `chatfile`
 - 登录态继承 bridge 运行用户的 `CODEX_HOME`
 

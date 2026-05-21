@@ -926,8 +926,6 @@ def get_session_workspace_paths(bot: BotState, key: str) -> dict[str, Optional[P
 
 def get_session_runtime_cwd(bot: BotState, key: str) -> Path:
     paths = get_session_workspace_paths(bot, key)
-    if codex_runs_in_sandbox():
-        return paths["workDir"].resolve()
     if paths["workfile"] is not None:
         return paths["workfile"].resolve()
     if paths["roomfile"] is not None:

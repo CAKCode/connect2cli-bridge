@@ -1,6 +1,8 @@
 .pytest_cache/
 .coverage
 .bridge.pid
+.bridge.guard.pid
+.bridge.watchdog.restarts
 .env
 .bots.json
 .bots.json.lock
