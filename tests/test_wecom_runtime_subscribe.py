@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from aiohttp import WSMsgType
+import pytest
 
 from workspace_bridge.config import load_app_config
 from workspace_bridge.models import WeComBotRuntime
@@ -369,11 +370,45 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     assert runtime.resume_candidates == {}
 
 
-async def test_workfile_dir_is_allowed_for_send_file(tmp_path) -> None:
+async def test_workfile_dir_is_rejected_for_send_file_by_default(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.file_send import create_file_send_request
 
     config = make_config(tmp_path)
+    bot = build_bot_from_app_config(config)
+    launch = prepare_session_run(bot, "group-user:room-1:alice")
+    workfile = launch.runtime_context.workfile_dir / "note.txt"
+    workfile.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(PermissionError) as excinfo:
+        create_file_send_request(
+            launch.runtime_context,
+            session_id=launch.session.session_id,
+            chat_key="group-user:room-1:alice",
+            file_path=workfile,
+        )
+
+    assert "outside allowed roots" in str(excinfo.value)
+
+
+async def test_workfile_dir_is_allowed_for_send_file_when_allowlisted(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config, load_app_config
+    from workspace_bridge.file_send import create_file_send_request
+
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "FILE_SEND_ROOTS": str(tmp_path / "runtime" / "workspaces" / "users"),
+        }
+    )
     bot = build_bot_from_app_config(config)
     launch = prepare_session_run(bot, "group-user:room-1:alice")
     workfile = launch.runtime_context.workfile_dir / "note.txt"

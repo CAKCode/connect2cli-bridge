@@ -91,8 +91,7 @@ def test_build_runtime_context_uses_workspace_skill_precedence(tmp_path: Path) -
     assert context.export_dir == context.chatfile_dir
     assert context.workfile_dir == workspace.workfile_dir
     assert context.roomfile_dir == workspace.roomfile_dir
-    assert workspace.workfile_dir.resolve() in context.allowed_file_roots
-    assert workspace.roomfile_dir.resolve() in context.allowed_file_roots
+    assert context.allowed_file_roots == (context.chatfile_dir.resolve(),)
     assert context.effective_skill_names == ("deploy", "lint")
     assert context.env["WECOM_BRIDGE_PROJECT_DIR"] == str(workspace.project_dir)
     assert context.env["WECOM_BRIDGE_WORKFILE_DIR"] == str(workspace.workfile_dir)

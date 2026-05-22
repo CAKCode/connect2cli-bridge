@@ -4,6 +4,7 @@ import asyncio
 from contextlib import suppress
 import json
 import hashlib
+from json import JSONDecodeError
 import uuid
 
 from aiohttp import web
@@ -12,6 +13,7 @@ from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
 from .models import WeComBotRuntime, WeComTextMessage
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
+from .wecom_upload import upload_and_send_file
 from .wecom_runtime import run_wecom_runtime
 
 APP_CONFIG_KEY = web.AppKey("config", object)
@@ -67,17 +69,70 @@ async def api_prepare(request) -> web.Response:
 
 async def api_send_file(request) -> web.Response:
     bot = request.app[APP_BOT_KEY]
-    data = await request.json()
+    runtime = request.app[APP_WECOM_RUNTIME_KEY]
+    try:
+        data = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text="request body must be a JSON object")
+    chat_key = str(data.get("chatKey") or "").strip()
+    file_path = str(data.get("filePath") or "").strip()
+    if not chat_key:
+        raise web.HTTPBadRequest(text="chatKey required")
+    if not file_path:
+        raise web.HTTPBadRequest(text="filePath required")
     from .runtime import prepare_session_run
 
-    launch = prepare_session_run(bot, data["chatKey"])
-    file_request = create_file_send_request(
-        launch.runtime_context,
-        session_id=launch.session.session_id,
-        chat_key=data["chatKey"],
-        file_path=data["filePath"],
+    # This endpoint performs an immediate WeCom upload/send and returns the
+    # final transport result; it is not the queue-based bridge.py endpoint.
+    launch = prepare_session_run(bot, chat_key)
+    try:
+        file_request = create_file_send_request(
+            launch.runtime_context,
+            session_id=launch.session.session_id,
+            chat_key=chat_key,
+            file_path=file_path,
+        )
+    except FileNotFoundError as exc:
+        raise web.HTTPNotFound(text=str(exc)) from exc
+    except PermissionError as exc:
+        text = str(exc)
+        if text.startswith("file too large:"):
+            actual_size = 0
+            try:
+                actual_size = __import__("pathlib").Path(data["filePath"]).expanduser().resolve().stat().st_size
+            except Exception:
+                pass
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=launch.runtime_context.max_upload_size,
+                actual_size=actual_size,
+                text=text,
+            ) from exc
+        raise web.HTTPForbidden(text=text) from exc
+    if runtime.ws is None or not runtime.connected:
+        raise web.HTTPServiceUnavailable(text="bot not connected")
+    try:
+        result = await upload_and_send_file(runtime, file_request)
+    except asyncio.TimeoutError as exc:
+        raise web.HTTPGatewayTimeout(text="file send timed out") from exc
+    except RuntimeError as exc:
+        message = str(exc) or "file send failed"
+        if "not connected" in message:
+            raise web.HTTPServiceUnavailable(text=message) from exc
+        raise web.HTTPBadGateway(text=message) from exc
+    except Exception as exc:
+        message = str(exc) or "file send failed"
+        raise web.HTTPBadGateway(text=message) from exc
+    return web.json_response(
+        {
+            "ok": True,
+            "fileName": file_request.file_name,
+            "workspaceId": file_request.workspace_id,
+            "mediaId": result["mediaId"],
+            "message": f"sent {file_request.file_name}",
+        }
     )
-    return web.json_response({"ok": True, "fileName": file_request.file_name, "workspaceId": file_request.workspace_id})
 
 
 async def api_list_schedules(request) -> web.Response:

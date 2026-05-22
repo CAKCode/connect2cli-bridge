@@ -11,6 +11,9 @@ def validate_file_for_send(runtime_context: WorkspaceRuntimeContext, file_path: 
         raise FileNotFoundError(resolved)
     if not resolved.is_file():
         raise FileNotFoundError(resolved)
+    size = resolved.stat().st_size
+    if size > runtime_context.max_upload_size:
+        raise PermissionError(f"file too large: {size} bytes (max {runtime_context.max_upload_size})")
     allowed = False
     for root in runtime_context.allowed_file_roots:
         try:

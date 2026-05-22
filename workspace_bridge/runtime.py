@@ -35,6 +35,8 @@ def build_bot_config(
     runtime_root: Path | str,
     global_skill_dir: Path | str,
     chatfile_root: Path | str,
+    file_send_roots: tuple[Path, ...] = (),
+    max_upload_size: int = 100 * 1024 * 1024,
 ) -> BotConfig:
     return BotConfig(
         bot_id=str(bot_id).strip(),
@@ -44,6 +46,8 @@ def build_bot_config(
         runtime_root=Path(runtime_root).expanduser().resolve(),
         global_skill_dir=Path(global_skill_dir).expanduser().resolve(),
         chatfile_root=Path(chatfile_root).expanduser().resolve(),
+        file_send_roots=tuple(Path(item).expanduser().resolve() for item in file_send_roots),
+        max_upload_size=max(1, int(max_upload_size)),
     )
 
 
@@ -159,6 +163,8 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             workspace_ref,
             global_skill_dir=bot.global_skill_dir,
             chatfile_root=bot.chatfile_root,
+            file_send_roots=bot.file_send_roots,
+            max_upload_size=bot.max_upload_size,
         )
         session_id = stable_session_id(bot.bot_id, chat_key)
         current = load_session_record(bot.runtime_root, session_id)

@@ -19,6 +19,8 @@ def build_runtime_context(
     *,
     global_skill_dir: Path | str,
     chatfile_root: Path | str,
+    file_send_roots: tuple[Path, ...] = (),
+    max_upload_size: int = 100 * 1024 * 1024,
 ) -> WorkspaceRuntimeContext:
     global_skill_dir = Path(global_skill_dir).expanduser().resolve()
     chatfile_root = Path(chatfile_root).expanduser().resolve()
@@ -49,10 +51,10 @@ def build_runtime_context(
         env["WECOM_BRIDGE_ROOM_ID"] = workspace.owner_room_id
 
     allowed_file_roots = [chatfile_dir.resolve()]
-    if workspace.workfile_dir is not None:
-        allowed_file_roots.append(workspace.workfile_dir.resolve())
-    if workspace.roomfile_dir is not None:
-        allowed_file_roots.append(workspace.roomfile_dir.resolve())
+    for root in file_send_roots:
+        resolved = Path(root).expanduser().resolve()
+        if resolved not in allowed_file_roots:
+            allowed_file_roots.append(resolved)
 
     return WorkspaceRuntimeContext(
         workspace=workspace,
@@ -62,6 +64,7 @@ def build_runtime_context(
         workfile_dir=workspace.workfile_dir,
         roomfile_dir=workspace.roomfile_dir,
         allowed_file_roots=tuple(allowed_file_roots),
+        max_upload_size=max(1, int(max_upload_size)),
         global_skill_dir=global_skill_dir,
         effective_skill_names=tuple(sorted(skill_space.effective_skills)),
         env=env,

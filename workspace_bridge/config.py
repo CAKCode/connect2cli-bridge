@@ -57,6 +57,8 @@ class AppConfig:
     global_skill_dir: Path
     chatfile_root: Path
     codex_output_root: Path
+    file_send_roots: tuple[Path, ...]
+    max_upload_size: int
     wecom_enabled: bool
     schedule_poll_ms: int
     wecom_subscribe_timeout_sec: int
@@ -74,6 +76,12 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
     global_skill_dir = Path(values.get("GLOBAL_SKILL_DIR") or (runtime_root / "skills" / "global")).expanduser().resolve()
     chatfile_root = Path(values.get("CHATFILE_ROOT") or (runtime_root / "chatfiles")).expanduser().resolve()
     codex_output_root = Path(values.get("CODEX_OUTPUT_ROOT") or (runtime_root / "codex-output")).expanduser().resolve()
+    file_send_roots = tuple(
+        Path(item.strip()).expanduser().resolve()
+        for item in str(values.get("FILE_SEND_ROOTS") or "").split(",")
+        if item.strip()
+    )
+    max_upload_size = max(1, int(str(values.get("MAX_UPLOAD_SIZE") or str(100 * 1024 * 1024)).strip()))
     bot_secret_file = Path(require_env(values, "WECOM_BOT_SECRET_FILE")).expanduser().resolve()
     bot_secret = read_secret_file(bot_secret_file)
     return AppConfig(
@@ -84,6 +92,8 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
         codex_output_root=codex_output_root,
+        file_send_roots=file_send_roots,
+        max_upload_size=max_upload_size,
         wecom_enabled=str(values.get("WECOM_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"},
         schedule_poll_ms=max(1000, int(str(values.get("SCHEDULE_POLL_MS") or "5000").strip())),
         wecom_subscribe_timeout_sec=max(5, int(str(values.get("WECOM_SUBSCRIBE_TIMEOUT_SEC") or "30").strip())),
@@ -102,6 +112,8 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=config.runtime_root,
         global_skill_dir=config.global_skill_dir,
         chatfile_root=config.chatfile_root,
+        file_send_roots=config.file_send_roots,
+        max_upload_size=config.max_upload_size,
     )
     return type(bot)(
         bot_id=bot.bot_id,
@@ -111,4 +123,6 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=bot.runtime_root,
         global_skill_dir=bot.global_skill_dir,
         chatfile_root=bot.chatfile_root,
+        file_send_roots=bot.file_send_roots,
+        max_upload_size=bot.max_upload_size,
     )

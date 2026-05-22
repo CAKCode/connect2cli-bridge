@@ -237,6 +237,21 @@ python3 ./send_file.py \
   --file-path "/path/to/file"
 ```
 
+Common send-file API outcomes:
+
+- `400` for invalid JSON or missing `chatKey` / `filePath`
+- `403` for files outside `chatfile` or explicit `FILE_SEND_ROOTS`
+- `404` for missing files
+- `413` for files larger than `MAX_UPLOAD_SIZE`
+- `503` when the bot is not connected
+- `504` when file delivery times out
+- `502` for upload or transport-layer failures
+
+Note:
+
+- The main `bridge.py` service uses a queue-backed `/api/send-file` flow and may return queued-style results.
+- `workspace_bridge.service` uses an immediate upload/send flow for the same path and returns final delivery results such as `mediaId` and `sent ...`.
+
 ### Schedule a one-shot message
 
 ```bash

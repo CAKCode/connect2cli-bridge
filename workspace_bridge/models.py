@@ -24,6 +24,8 @@ class BotConfig:
     runtime_root: Path
     global_skill_dir: Path
     chatfile_root: Path
+    file_send_roots: tuple[Path, ...] = ()
+    max_upload_size: int = 100 * 1024 * 1024
 
 
 @dataclass
@@ -104,6 +106,7 @@ class WorkspaceRuntimeContext:
     workfile_dir: Path | None
     roomfile_dir: Path | None
     allowed_file_roots: tuple[Path, ...]
+    max_upload_size: int
     global_skill_dir: Path
     effective_skill_names: tuple[str, ...]
     env: dict[str, str]
