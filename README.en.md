@@ -237,7 +237,7 @@ python3 ./send_file.py \
   --file-path "/path/to/file"
 ```
 
-Common send-file API outcomes:
+For `workspace_bridge.service`, common send-file API outcomes are:
 
 - `400` for invalid JSON or missing `chatKey` / `filePath`
 - `403` for files outside `chatfile` or explicit `FILE_SEND_ROOTS`
@@ -249,7 +249,7 @@ Common send-file API outcomes:
 
 Note:
 
-- The main `bridge.py` service uses a queue-backed `/api/send-file` flow and may return queued-style results.
+- The main `bridge.py` service uses a queue-backed `/api/send-file` flow and returns queued-style results.
 - `workspace_bridge.service` uses an immediate upload/send flow for the same path and returns final delivery results such as `mediaId` and `sent ...`.
 
 ### Schedule a one-shot message
