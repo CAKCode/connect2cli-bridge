@@ -13,6 +13,7 @@ TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
 LEADING_MENTION_RE = re.compile(r"^\s*@\S+(?:\s+|$)")
 MENTION_DELIMITER_CHARS = ",:;，。：；"
 PROACTIVE_TEXT_MAX_CHARS = max(256, int(os.environ.get("PROACTIVE_TEXT_MAX_CHARS", "1800")))
+STREAM_TEXT_MAX_CHARS = max(256, int(os.environ.get("STREAM_TEXT_MAX_CHARS", "3500")))
 
 
 def uid() -> str:
@@ -71,6 +72,30 @@ def limit_proactive_text(content: str) -> str:
     return text[: max(0, PROACTIVE_TEXT_MAX_CHARS - len(suffix))].rstrip() + suffix
 
 
+def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
+    text = str(content or "").strip()
+    if not text:
+        return [""]
+    chunks: list[str] = []
+    remaining = text
+    limit = max(1, int(max_chars))
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = len(chunk)
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def build_proactive_text_payload(chat_key: str, content: str, mention_user_id: str | None = None) -> dict:
     chat_type, chat_id = chat_key_to_send_target(chat_key)
     resolved_mention_user_id = str(mention_user_id or "").strip()
@@ -88,6 +113,29 @@ def build_proactive_text_payload(chat_key: str, content: str, mention_user_id: s
             },
         },
     }
+
+
+def build_proactive_text_payloads(chat_key: str, content: str, mention_user_id: str | None = None) -> list[dict]:
+    chunks = split_text_chunks(content, max_chars=PROACTIVE_TEXT_MAX_CHARS)
+    payloads: list[dict] = []
+    for chunk in chunks:
+        chat_type, chat_id = chat_key_to_send_target(chat_key)
+        resolved_mention_user_id = str(mention_user_id or "").strip()
+        if not resolved_mention_user_id and chat_key.startswith("group-user:"):
+            resolved_mention_user_id = str(chat_key_to_user_id(chat_key) or "").strip()
+        payloads.append(
+            {
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": uid()},
+                "body": {
+                    "chatid": chat_id,
+                    "chat_type": chat_type,
+                    "msgtype": "markdown",
+                    "markdown": {"content": prepend_group_user_mention(chunk, resolved_mention_user_id)},
+                },
+            }
+        )
+    return payloads
 
 
 def strip_text_mentions(content: str, bot_name: str | None = None) -> str:
@@ -125,6 +173,21 @@ def build_text_response_payload(req_id: str, session_id: str, content: str, *, f
         "headers": {"req_id": req_id},
         "body": {"msgtype": "stream", "stream": {"id": session_id, "finish": final, "content": content}},
     }
+
+
+def build_text_response_payloads(req_id: str, session_id: str, content: str, *, final: bool) -> list[dict]:
+    chunks = split_text_chunks(content, max_chars=STREAM_TEXT_MAX_CHARS)
+    payloads: list[dict] = []
+    for index, chunk in enumerate(chunks):
+        payloads.append(
+            build_text_response_payload(
+                req_id,
+                session_id,
+                chunk,
+                final=final and index == len(chunks) - 1,
+            )
+        )
+    return payloads
 
 
 def parse_text_callback(payload: dict) -> WeComTextMessage | None:

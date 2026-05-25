@@ -80,7 +80,7 @@ DEFAULT_WORK_DIR = os.environ.get("WORK_DIR", "/home/jenkins")
 DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser().resolve()
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "").strip()
 BRIDGE_BASIC_AUTH = os.environ.get("BRIDGE_BASIC_AUTH", "").strip()
-CODEX_EXEC_MODE = (os.environ.get("CODEX_EXEC_MODE", "sandboxed").strip().lower() or "sandboxed")
+CODEX_EXEC_MODE = (os.environ.get("CODEX_EXEC_MODE", "host").strip().lower() or "host")
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 
 MAX_JSON_BODY = int(os.environ.get("MAX_JSON_BODY", 1024 * 1024))
@@ -99,6 +99,7 @@ STATUS_STREAM_INTERVAL_SEC = max(1, int(os.environ.get("STATUS_STREAM_INTERVAL_S
 STATUS_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_TIMEOUT_SEC", 1)))
 STATUS_SEND_LOCK_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_LOCK_TIMEOUT_SEC", 1)))
 PROACTIVE_TEXT_MAX_CHARS = max(256, int(os.environ.get("PROACTIVE_TEXT_MAX_CHARS", 1800)))
+STREAM_TEXT_MAX_CHARS = max(256, int(os.environ.get("STREAM_TEXT_MAX_CHARS", 3500)))
 REPLY_IDLE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_IDLE_FALLBACK_SEC", 240)))
 REPLY_MAX_AGE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_MAX_AGE_FALLBACK_SEC", 540)))
 PROACTIVE_STATUS_INTERVAL_SEC = max(30, int(os.environ.get("PROACTIVE_STATUS_INTERVAL_SEC", 120)))
@@ -2056,6 +2057,30 @@ def limit_proactive_text(content: str) -> str:
     return text[: max(0, PROACTIVE_TEXT_MAX_CHARS - len(suffix))].rstrip() + suffix
 
 
+def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
+    text = str(content or "").strip()
+    if not text:
+        return [""]
+    chunks: list[str] = []
+    remaining = text
+    limit = max(1, int(max_chars))
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = len(chunk)
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def format_group_user_mention(user_id: Optional[str]) -> str:
     text = str(user_id or "").strip()
     if not text:
@@ -2157,6 +2182,21 @@ def build_session_text_payload(key: str, sess: SessionState, req_id: Optional[st
     return build_proactive_chat_payload(key, content)
 
 
+def build_session_text_payloads(
+    key: str, sess: SessionState, req_id: Optional[str], content: str, final: bool
+) -> list[dict[str, Any]]:
+    if req_id:
+        chunks = split_text_chunks(content, max_chars=STREAM_TEXT_MAX_CHARS)
+        payloads: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks):
+            payload = build_session_text_payload(key, sess, req_id, chunk, final and index == len(chunks) - 1)
+            if payload is not None:
+                payloads.append(payload)
+        return payloads
+    payload = build_session_text_payload(key, sess, req_id, content, final)
+    return [payload] if payload is not None else []
+
+
 async def send_transient_session_status(
     bot: BotState,
     key: str,
@@ -2192,31 +2232,32 @@ async def send_session_status(
         if delivered:
             mark_proactive_status_sent(sess, req_id)
         return delivered
-    payload = build_session_text_payload(key, sess, req_id, content, False)
-    if not payload:
+    payloads = build_session_text_payloads(key, sess, req_id, content, False)
+    if not payloads:
         return False
     if bot.ws and not bot.ws.closed:
         try:
-            await send_session_ws_payload(
-                bot,
-                sess,
-                payload,
-                send_timeout_sec=STATUS_SEND_TIMEOUT_SEC,
-                lock_timeout_sec=STATUS_SEND_LOCK_TIMEOUT_SEC,
-            )
+            for payload in payloads:
+                await send_session_ws_payload(
+                    bot,
+                    sess,
+                    payload,
+                    send_timeout_sec=STATUS_SEND_TIMEOUT_SEC,
+                    lock_timeout_sec=STATUS_SEND_LOCK_TIMEOUT_SEC,
+                )
             sess.pending_stream_payload = None
             return True
         except Exception as exc:
-            add_log(bot, f"[{key}] stream status deferred req_id={payload_req_id(payload) or '-'}: {exc}")
+            add_log(bot, f"[{key}] stream status deferred req_id={payload_req_id(payloads[-1]) or '-'}: {exc}")
             add_event_log(
                 bot,
                 "session.status_deferred",
                 chatKey=key,
                 sessionId=sess.session_id,
-                reqId=payload_req_id(payload) or None,
+                reqId=payload_req_id(payloads[-1]) or None,
                 reason=str(exc),
             )
-    sess.pending_stream_payload = dict(payload)
+    sess.pending_stream_payload = dict(payloads[-1])
     return False
 
 

@@ -92,6 +92,8 @@ Modes:
 - `host`
   bridge starts Codex with `--dangerously-bypass-approvals-and-sandbox`
 
+Default: `host`
+
 Important boundary:
 
 - Codex auth is inherited from the runtime user's `CODEX_HOME`

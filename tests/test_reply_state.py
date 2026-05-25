@@ -38,10 +38,13 @@ def test_cache_and_cleanup_reply_state() -> None:
 
     cache_reply_payload(state, {"body": "stream"}, final=False)
     assert state.pending_stream_payload == {"body": "stream"}
+    assert state.pending_stream_payloads == [{"body": "stream"}]
     cache_reply_payload(state, {"body": "final"}, final=True)
     assert state.pending_final_payload == {"body": "final"}
+    assert state.pending_final_payloads == [{"body": "final"}]
     mark_reply_sent(state, final=True)
     assert state.pending_final_payload is None
+    assert state.pending_final_payloads is None
     cleanup_reply_state(runtime, "req-1")
     assert "req-1" not in runtime.reply_states
 

@@ -8,6 +8,7 @@ Chinese docs:
 
 - Main README: [README.md](README.md)
 - Operations manual: [docs/使用手册.md](docs/使用手册.md)
+- Minimal Codex deployment flow: [README.codex-deploy.md](README.codex-deploy.md)
 
 ## What It Does
 
@@ -70,7 +71,7 @@ Minimal example:
 BRIDGE_BIND=127.0.0.1:9299
 WORK_DIR=/home/jenkins
 BRIDGE_BASIC_AUTH=bridge:change-me
-CODEX_EXEC_MODE=sandboxed
+CODEX_EXEC_MODE=host
 
 WECOM_BOT_NAME=default
 WECOM_BOT_ID=YOUR_BOT_ID
@@ -149,6 +150,8 @@ For external integrations, prefer storing and using `chatKey`. `sessionId` shoul
   runs `codex exec --full-auto`
 - `host`
   runs `codex exec --dangerously-bypass-approvals-and-sandbox`
+
+Default: `host`.
 
 `host` mode is intended for trusted internal environments.
 

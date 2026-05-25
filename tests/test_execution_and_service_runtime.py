@@ -284,9 +284,10 @@ async def test_send_or_cache_runtime_payload_uses_proactive_group_markdown_for_f
 
     assert delivered is False
     assert "req-1" in runtime.pending_finals
-    assert runtime.pending_finals["req-1"]["cmd"] == "aibot_send_msg"
-    assert runtime.pending_finals["req-1"]["body"]["markdown"]["content"] == "<@alice>\nfinal"
+    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_finals["req-1"][-1]["body"]["markdown"]["content"] == "<@alice>\nfinal"
     assert runtime.reply_states["req-1"].pending_final_payload is not None
+    assert runtime.reply_states["req-1"].pending_final_payloads is not None
 
 
 async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat_final_fallback(tmp_path: Path) -> None:
@@ -302,9 +303,10 @@ async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat
 
     assert delivered is False
     assert "req-1" in runtime.pending_finals
-    assert runtime.pending_finals["req-1"]["cmd"] == "aibot_send_msg"
-    assert runtime.pending_finals["req-1"]["body"]["markdown"]["content"] == "final"
+    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_finals["req-1"][-1]["body"]["markdown"]["content"] == "final"
     assert runtime.reply_states["req-1"].pending_final_payload is not None
+    assert runtime.reply_states["req-1"].pending_final_payloads is not None
 
 
 async def test_send_or_cache_runtime_payload_does_not_cache_empty_req_id_state(tmp_path: Path) -> None:
@@ -322,7 +324,7 @@ async def test_send_or_cache_runtime_payload_does_not_cache_empty_req_id_state(t
     assert len(runtime.pending_finals or {}) == 1
     cached_req_id = next(iter(runtime.pending_finals))
     assert cached_req_id
-    assert runtime.pending_finals[cached_req_id]["cmd"] == "aibot_send_msg"
+    assert runtime.pending_finals[cached_req_id][-1]["cmd"] == "aibot_send_msg"
     assert runtime.pending_streams == {}
     assert cached_req_id in runtime.reply_states
 
@@ -347,6 +349,56 @@ async def test_send_or_cache_runtime_payload_falls_back_to_cache_on_send_error(t
     assert "req-1" in runtime.pending_finals
     assert runtime.reply_states["req-1"].pending_final_payload is not None
     assert runtime.last_error == "socket closed"
+
+
+async def test_send_or_cache_runtime_payload_sends_stream_chunks_in_order(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    sent: list[dict] = []
+
+    class RecordingWS:
+        async def send_json(self, payload: dict) -> None:
+            sent.append(payload)
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = RecordingWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "x" * 8000, final=True)
+
+    assert delivered is True
+    assert len(sent) == 3
+    assert sent[0]["body"]["stream"]["finish"] is False
+    assert sent[1]["body"]["stream"]["finish"] is False
+    assert sent[2]["body"]["stream"]["finish"] is True
+    assert "".join(item["body"]["stream"]["content"] for item in sent) == "x" * 8000
+
+
+async def test_send_or_cache_runtime_payload_sends_proactive_chunks_in_order(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    sent: list[dict] = []
+
+    class RecordingWS:
+        async def send_json(self, payload: dict) -> None:
+            sent.append(payload)
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = RecordingWS()
+    message = WeComTextMessage(req_id="", chat_key="group-user:room-1:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "x" * 5000, final=True)
+
+    assert delivered is True
+    assert len(sent) >= 2
+    assert all(item["cmd"] == "aibot_send_msg" for item in sent)
+    assert all(item["body"]["markdown"]["content"].startswith("<@alice>\n") for item in sent)
 
 
 def test_extract_codex_stdout_text_prefers_latest_agent_message() -> None:

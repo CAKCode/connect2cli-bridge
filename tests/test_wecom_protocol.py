@@ -3,12 +3,15 @@ from pathlib import Path
 from workspace_bridge.models import BotConfig, SourceConfig
 from workspace_bridge.wecom_protocol import (
     build_proactive_text_payload,
+    build_proactive_text_payloads,
     build_subscribe_payload,
     build_text_response_payload,
+    build_text_response_payloads,
     chat_key_from_message,
     chat_key_to_send_target,
     is_subscribe_ok,
     parse_text_callback,
+    split_text_chunks,
     strip_text_mentions,
 )
 
@@ -123,6 +126,30 @@ def test_build_proactive_text_payload_truncates_long_content() -> None:
 
     assert payload["body"]["markdown"]["content"].startswith("<@alice>\n")
     assert payload["body"]["markdown"]["content"].endswith("...(truncated)")
+
+
+def test_split_text_chunks_prefers_word_boundaries() -> None:
+    chunks = split_text_chunks("alpha beta gamma delta", max_chars=10)
+
+    assert chunks == ["alpha beta", "gamma", "delta"]
+
+
+def test_build_text_response_payloads_splits_long_content() -> None:
+    payloads = build_text_response_payloads("req-1", "session-1", "x" * 8000, final=True)
+
+    assert len(payloads) == 3
+    assert payloads[0]["body"]["stream"]["finish"] is False
+    assert payloads[1]["body"]["stream"]["finish"] is False
+    assert payloads[2]["body"]["stream"]["finish"] is True
+    assert "".join(item["body"]["stream"]["content"] for item in payloads) == "x" * 8000
+
+
+def test_build_proactive_text_payloads_split_long_content() -> None:
+    payloads = build_proactive_text_payloads("group-user:room-1:alice", "x" * 5000)
+
+    assert len(payloads) >= 2
+    assert all(item["body"]["markdown"]["content"].startswith("<@alice>\n") for item in payloads)
+    assert not any(item["body"]["markdown"]["content"].endswith("...(truncated)") for item in payloads)
 
 
 def test_strip_text_mentions_supports_bot_name_with_spaces() -> None:

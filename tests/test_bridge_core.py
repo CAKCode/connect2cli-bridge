@@ -5621,6 +5621,30 @@ async def test_send_session_status_times_out_when_send_lock_is_busy(bridge_modul
 
 
 @pytest.mark.asyncio
+async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sent_payloads = []
+
+    class FakeWS:
+        closed = False
+
+        async def send_json(self, payload):
+            sent_payloads.append(payload)
+
+    bot.ws = FakeWS()
+
+    delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "x" * 8000)
+
+    assert delivered is True
+    assert len(sent_payloads) == 3
+    assert sent_payloads[0]["body"]["stream"]["finish"] is False
+    assert sent_payloads[1]["body"]["stream"]["finish"] is False
+    assert sent_payloads[2]["body"]["stream"]["finish"] is False
+    assert "".join(item["body"]["stream"]["content"] for item in sent_payloads) == "x" * 8000
+
+
+@pytest.mark.asyncio
 async def test_send_ws_payload_with_ack_times_out_stuck_websocket_write(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
 

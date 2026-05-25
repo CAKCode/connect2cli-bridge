@@ -10,7 +10,12 @@ from .prompting import build_prompt
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
 from .runtime import prepare_session_run, update_session_record
-from .wecom_protocol import build_proactive_text_payload, build_text_response_payload
+from .wecom_protocol import (
+    build_proactive_text_payload,
+    build_proactive_text_payloads,
+    build_text_response_payload,
+    build_text_response_payloads,
+)
 from .wecom_upload import ws_send_json
 
 STATUS_STREAM_INTERVAL_SEC = 2
@@ -66,33 +71,37 @@ def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
 
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
-    payload = (
-        build_proactive_text_payload(message.chat_key, content)
+    payloads = (
+        build_proactive_text_payloads(message.chat_key, content)
         if final and not message.req_id
-        else build_text_response_payload(message.req_id, session_id, content, final=final)
+        else build_text_response_payloads(message.req_id, session_id, content, final=final)
     )
+    payload = payloads[-1]
     cache_key = str(message.req_id or ((payload.get("headers") or {}).get("req_id")) or "")
     state = get_or_create_reply_state(runtime, cache_key, session_id, message.chat_key) if cache_key else None
     if runtime.ws is None:
         if final and message.req_id:
-            payload = build_proactive_text_payload(message.chat_key, content)
+            payloads = build_proactive_text_payloads(message.chat_key, content)
+            payload = payloads[-1]
         if state is not None:
-            cache_reply_payload(state, payload, final=final)
+            cache_reply_payload(state, payload, final=final, payloads=payloads)
         target = runtime.pending_finals if final else runtime.pending_streams
         if target is not None and cache_key:
-            target[cache_key] = payload
+            target[cache_key] = [dict(item) for item in payloads]
         return False
     try:
-        await ws_send_json(runtime, payload)
+        for item in payloads:
+            await ws_send_json(runtime, item)
     except Exception as exc:
         runtime.last_error = str(exc)
         if final and message.req_id:
-            payload = build_proactive_text_payload(message.chat_key, content)
+            payloads = build_proactive_text_payloads(message.chat_key, content)
+            payload = payloads[-1]
         if state is not None:
-            cache_reply_payload(state, payload, final=final)
+            cache_reply_payload(state, payload, final=final, payloads=payloads)
         target = runtime.pending_finals if final else runtime.pending_streams
         if target is not None and cache_key:
-            target[cache_key] = payload
+            target[cache_key] = [dict(item) for item in payloads]
         return False
     _clear_cached_runtime_payload(runtime, cache_key, final=final)
     if final and runtime.pending_streams is not None and cache_key:
@@ -107,18 +116,24 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
 async def flush_cached_runtime_payloads(runtime) -> None:
     if runtime.ws is None:
         return
-    for req_id, payload in list((runtime.pending_streams or {}).items()):
-        await ws_send_json(runtime, payload)
+    for req_id, payloads in list((runtime.pending_streams or {}).items()):
+        sequence = payloads if isinstance(payloads, list) else [payloads]
+        for payload in sequence:
+            await ws_send_json(runtime, payload)
         state = runtime.reply_states.get(req_id)
         if state is not None:
             state.pending_stream_payload = None
+            state.pending_stream_payloads = None
     if runtime.pending_streams is not None:
         runtime.pending_streams.clear()
-    for req_id, payload in list((runtime.pending_finals or {}).items()):
-        await ws_send_json(runtime, payload)
+    for req_id, payloads in list((runtime.pending_finals or {}).items()):
+        sequence = payloads if isinstance(payloads, list) else [payloads]
+        for payload in sequence:
+            await ws_send_json(runtime, payload)
         state = runtime.reply_states.get(req_id)
         if state is not None:
             state.pending_final_payload = None
+            state.pending_final_payloads = None
             cleanup_reply_state(runtime, req_id)
     if runtime.pending_finals is not None:
         runtime.pending_finals.clear()

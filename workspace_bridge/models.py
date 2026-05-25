@@ -175,6 +175,8 @@ class ReplyState:
     proactive_notice_sent: bool = False
     pending_stream_payload: dict | None = None
     pending_final_payload: dict | None = None
+    pending_stream_payloads: list[dict] | None = None
+    pending_final_payloads: list[dict] | None = None
     proactive_status_sent_at: float = 0.0
 
 

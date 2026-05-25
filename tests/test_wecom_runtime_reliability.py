@@ -57,6 +57,23 @@ async def test_flush_cached_runtime_payloads_cleans_final_reply_state() -> None:
     assert "req-1" not in runtime.reply_states
 
 
+async def test_flush_cached_runtime_payloads_replays_all_cached_chunks() -> None:
+    runtime = make_runtime()
+    state = get_or_create_reply_state(runtime, "req-1", "session-1", "single:alice")
+    payloads = [
+        {"headers": {"req_id": "req-1"}, "body": {"msgtype": "stream", "stream": {"content": "part-1"}}},
+        {"headers": {"req_id": "req-1"}, "body": {"msgtype": "stream", "stream": {"content": "part-2"}}},
+    ]
+    cache_reply_payload(state, payloads[-1], final=False, payloads=payloads)
+    runtime.pending_streams["req-1"] = payloads
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.ws.sent == payloads
+    assert state.pending_stream_payload is None
+    assert state.pending_stream_payloads is None
+
+
 async def test_reject_pending_requests_sets_future_exception() -> None:
     runtime = make_runtime()
     future = create_request_future(runtime, "req-1")
