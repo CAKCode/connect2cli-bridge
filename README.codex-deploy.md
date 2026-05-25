@@ -69,7 +69,7 @@ sh ./deploy_from_codex.sh \
 ```text
 BRIDGE_BIND=127.0.0.1:9299
 WORK_DIR=<克隆下来的目标仓库目录>
-CODEX_EXEC_MODE=sandboxed
+CODEX_EXEC_MODE=host
 
 WECOM_BOT_CONFIG_ID=<bot-name>
 WECOM_BOT_NAME=<bot-name>

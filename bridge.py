@@ -9,6 +9,7 @@ import os
 import random
 import re
 import shutil
+import shlex
 import signal
 import sys
 import tempfile
@@ -228,6 +229,8 @@ class SessionState:
     reply_mentions_sent: set[str] = field(default_factory=set)
     pending_stream_payload: Optional[dict[str, Any]] = None
     pending_final_payload: Optional[dict[str, Any]] = None
+    pending_stream_payloads: Optional[list[dict[str, Any]]] = None
+    pending_final_payloads: Optional[list[dict[str, Any]]] = None
     run_generation: int = 0
     codex_runtime_status: Optional[str] = None
     active_scheduled_job_file: Optional[str] = None
@@ -272,8 +275,26 @@ def codex_runs_in_sandbox() -> bool:
     return CODEX_EXEC_MODE == "sandboxed"
 
 
+def parse_command_to_argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return [command]
+
+
+def resolve_codex_command() -> list[str]:
+    raw = str(os.environ.get("CODEX_COMMAND") or "").strip()
+    if raw:
+        return parse_command_to_argv(raw)
+
+    resolved = shutil.which("codex")
+    if resolved:
+        return [resolved]
+    return ["codex"]
+
+
 def build_codex_base_args(output_file: Path, image_paths: list[str], resume: bool) -> list[str]:
-    args = ["codex", "exec"]
+    args = [*resolve_codex_command(), "exec"]
     if resume:
         args.append("resume")
     args.extend(["--skip-git-repo-check", "--json", "-o", str(output_file)])
@@ -2246,6 +2267,7 @@ async def send_session_status(
                     lock_timeout_sec=STATUS_SEND_LOCK_TIMEOUT_SEC,
                 )
             sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
             return True
         except Exception as exc:
             add_log(bot, f"[{key}] stream status deferred req_id={payload_req_id(payloads[-1]) or '-'}: {exc}")
@@ -2258,6 +2280,70 @@ async def send_session_status(
                 reason=str(exc),
             )
     sess.pending_stream_payload = dict(payloads[-1])
+    sess.pending_stream_payloads = clone_payload_sequence(payloads)
+    return False
+
+
+async def send_or_store_session_payloads(
+    bot: BotState, key: str, sess: SessionState, payloads: list[dict[str, Any]], final: bool
+) -> bool:
+    if not payloads:
+        return False
+    if len(payloads) == 1:
+        return await send_or_store_session_payload(bot, key, sess, payloads[0], final)
+
+    outgoing_payloads = clone_payload_sequence(payloads)
+    original_reply_req_id = payload_req_id(payloads[0]) if is_reply_payload(payloads[0]) else ""
+    first_payload = outgoing_payloads[0]
+    if first_payload.get("cmd") == "aibot_send_msg":
+        refreshed_req_id = uid()
+        for outgoing_payload in outgoing_payloads:
+            headers = dict((outgoing_payload.get("headers") or {}))
+            headers["req_id"] = refreshed_req_id
+            outgoing_payload["headers"] = headers
+    elif is_reply_payload(first_payload):
+        reply_req_id = payload_req_id(first_payload)
+        if reply_req_id and not final and reply_age_too_long(sess, reply_req_id):
+            await close_reply_stream_for_proactive(bot, key, sess, reply_req_id)
+            sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
+            return False
+        if reply_req_id and final and (reply_idle_too_long(sess, reply_req_id) or reply_should_use_proactive(sess, reply_req_id)):
+            mark_reply_proactive(sess, reply_req_id)
+            proactive_payload = build_proactive_chat_payload(
+                key,
+                "".join(reply_payload_content(payload) for payload in outgoing_payloads),
+                proactive_reply_mention_user_id(key, sess, reply_req_id),
+            )
+            return await send_or_store_session_payload(bot, key, sess, proactive_payload, final)
+    req_id = payload_req_id(outgoing_payloads[-1])
+    payload_kind = "final" if final else "stream"
+    if bot.ws and not bot.ws.closed:
+        try:
+            for outgoing_payload in outgoing_payloads:
+                await send_session_ws_payload(bot, sess, outgoing_payload)
+            if final:
+                sess.pending_final_payload = None
+                sess.pending_final_payloads = None
+                sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
+                cleanup_reply_session(bot, original_reply_req_id, sess)
+            else:
+                sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
+            return True
+        except Exception as exc:
+            add_log(bot, f"[{key}] {payload_kind} send deferred req_id={req_id or '-'}: {exc}")
+
+    if final:
+        sess.pending_final_payload = dict(outgoing_payloads[-1])
+        sess.pending_final_payloads = clone_payload_sequence(outgoing_payloads)
+        sess.pending_stream_payload = None
+        sess.pending_stream_payloads = None
+    else:
+        sess.pending_stream_payload = dict(outgoing_payloads[-1])
+        sess.pending_stream_payloads = clone_payload_sequence(outgoing_payloads)
+    add_log(bot, f"[{key}] cached {payload_kind} reply req_id={req_id or '-'}")
     return False
 
 
@@ -2275,6 +2361,7 @@ async def send_or_store_session_payload(
         if reply_req_id and not final and reply_age_too_long(sess, reply_req_id):
             await close_reply_stream_for_proactive(bot, key, sess, reply_req_id)
             sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
             return False
         if reply_req_id and final and (reply_idle_too_long(sess, reply_req_id) or reply_should_use_proactive(sess, reply_req_id)):
             mark_reply_proactive(sess, reply_req_id)
@@ -2296,19 +2383,25 @@ async def send_or_store_session_payload(
                 await send_session_ws_payload(bot, sess, outgoing_payload)
             if final:
                 sess.pending_final_payload = None
+                sess.pending_final_payloads = None
                 sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
                 cleanup_reply_session(bot, original_reply_req_id, sess)
             else:
                 sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
             return True
         except Exception as exc:
             add_log(bot, f"[{key}] {payload_kind} send deferred req_id={req_id or '-'}: {exc}")
 
     if final:
         sess.pending_final_payload = outgoing_payload
+        sess.pending_final_payloads = [dict(outgoing_payload)]
         sess.pending_stream_payload = None
+        sess.pending_stream_payloads = None
     else:
         sess.pending_stream_payload = outgoing_payload
+        sess.pending_stream_payloads = [dict(outgoing_payload)]
     add_log(bot, f"[{key}] cached {payload_kind} reply req_id={req_id or '-'}")
     return False
 
@@ -2317,16 +2410,16 @@ async def flush_session_pending_payloads(bot: BotState, key: str, sess: SessionS
     if not bot.ws or bot.ws.closed:
         return
     if sess.pending_final_payload:
-        payload = dict(sess.pending_final_payload)
-        if await send_or_store_session_payload(bot, key, sess, payload, True):
-            add_log(bot, f"[{key}] delivered cached final reply req_id={payload_req_id(payload) or '-'}")
+        payloads = clone_payload_sequence(sess.pending_final_payloads or [sess.pending_final_payload])
+        if await send_or_store_session_payloads(bot, key, sess, payloads, True):
+            add_log(bot, f"[{key}] delivered cached final reply req_id={payload_req_id(payloads[-1]) or '-'}")
             if sess.queue and can_continue_session_queue(sess):
                 process_queue(bot, sess, key)
         return
     if sess.pending_stream_payload and sess.running:
-        payload = dict(sess.pending_stream_payload)
-        if await send_or_store_session_payload(bot, key, sess, payload, False):
-            add_log(bot, f"[{key}] delivered cached running status req_id={payload_req_id(payload) or '-'}")
+        payloads = clone_payload_sequence(sess.pending_stream_payloads or [sess.pending_stream_payload])
+        if await send_or_store_session_payloads(bot, key, sess, payloads, False):
+            add_log(bot, f"[{key}] delivered cached running status req_id={payload_req_id(payloads[-1]) or '-'}")
 
 
 async def flush_all_pending_session_payloads(bot: BotState) -> None:
@@ -2958,9 +3051,9 @@ async def run_codex(
         sess.codex_runtime_status = None
         sess.last_active = time.time()
 
-        final_payload = build_session_text_payload(key, sess, req_id, final, True)
-        if final_payload:
-            final_delivery_pending = not await send_or_store_session_payload(bot, key, sess, final_payload, True)
+        final_payloads = build_session_text_payloads(key, sess, req_id, final, True)
+        if final_payloads:
+            final_delivery_pending = not await send_or_store_session_payloads(bot, key, sess, final_payloads, True)
         add_log(bot, f"[{key}] reply completed ({len(final)} chars, exit={return_code})")
         sess.chat.append({"role": "bot", "text": final, "time": int(time.time())})
         if len(sess.chat) > 200:
@@ -3001,7 +3094,9 @@ async def run_codex(
             sess.active_schedule_request_id = None
             sess.codex_runtime_status = None
             sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
             sess.pending_final_payload = None
+            sess.pending_final_payloads = None
             sess.last_active = time.time()
             restore_session_active_media(sess)
             update_session_record(
@@ -3026,13 +3121,16 @@ async def run_codex(
         sess.codex_runtime_status = None
         sess.last_active = time.time()
         sess.pending_stream_payload = None
+        sess.pending_stream_payloads = None
+        sess.pending_final_payload = None
+        sess.pending_final_payloads = None
         restore_session_active_media(sess)
         error_text = f"Error: {'failed to start Codex' if not process_started else 'Codex run failed'}: {exc}"
         add_log(bot, f"[{key}] codex task failed: {exc}")
         try:
-            error_payload = build_session_text_payload(key, sess, req_id, error_text, True)
-            if error_payload:
-                final_delivery_pending = not await send_or_store_session_payload(bot, key, sess, error_payload, True)
+            error_payloads = build_session_text_payloads(key, sess, req_id, error_text, True)
+            if error_payloads:
+                final_delivery_pending = not await send_or_store_session_payloads(bot, key, sess, error_payloads, True)
         except Exception as send_exc:
             add_log(bot, f"[{key}] failed to report codex error: {send_exc}")
         sess.chat.append({"role": "bot", "text": error_text, "time": int(time.time())})
@@ -3067,6 +3165,10 @@ async def run_codex(
         sess.active_schedule_request_id = None
         sess.codex_runtime_status = None
         sess.last_active = time.time()
+        sess.pending_stream_payload = None
+        sess.pending_stream_payloads = None
+        sess.pending_final_payload = None
+        sess.pending_final_payloads = None
         restore_session_active_media(sess)
         update_session_record(
             sess.session_id,
@@ -3099,7 +3201,9 @@ def recycle_session(bot: BotState, sess: SessionState, key: str) -> None:
     recover_session_scheduled_jobs(sess)
     sess.queue.clear()
     sess.pending_stream_payload = None
+    sess.pending_stream_payloads = None
     sess.pending_final_payload = None
+    sess.pending_final_payloads = None
     sess.active_run_media = []
     sess.active_run_media_notes = []
     cleanup_session_reply_contexts(bot, sess)
@@ -3157,7 +3261,9 @@ def interrupt_session(
         sess.pending_media_notes.clear()
         sess.pending_media_downloads = 0
     sess.pending_stream_payload = None
+    sess.pending_stream_payloads = None
     sess.pending_final_payload = None
+    sess.pending_final_payloads = None
     cleanup_session_reply_contexts(bot, sess)
     if clear_thread:
         sess.thread_id = None
@@ -5658,31 +5764,62 @@ def copy_missing_tree_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, destination)
 
 
-def sync_project_shared_skills_to_bridge_global() -> list[str]:
-    source_root = project_shared_skills_root()
-    target_root = get_bridge_global_skills_root()
-    ensure_dir(get_bridge_codex_home_root())
-    ensure_dir(target_root)
-    clear_directory_contents(target_root)
-    if not source_root.exists():
-        return []
-    synced: list[str] = []
-    for child in sorted(source_root.iterdir(), key=lambda item: item.name):
-        skill_file = child / "SKILL.md"
-        if not child.is_dir() or not skill_file.is_file():
-            continue
-        sync_tree_contents(child, target_root / child.name)
-        synced.append(child.name)
-    return synced
+def skill_file_has_yaml_frontmatter(skill_file: Path) -> bool:
+    try:
+        with skill_file.open("r", encoding="utf-8", errors="ignore") as handle:
+            first_line = handle.readline()
+            if first_line.strip() != "---":
+                return False
+            for line in handle:
+                if line.strip() == "---":
+                    return True
+    except OSError:
+        return False
+    return False
 
 
-def merge_source_skills_to_target(source_root: Path, target_root: Path) -> None:
+def iter_compatible_skill_dirs(source_root: Path) -> Any:
     if not source_root.exists():
         return
     for child in sorted(source_root.iterdir(), key=lambda item: item.name):
         skill_file = child / "SKILL.md"
         if not child.is_dir() or not skill_file.is_file():
             continue
+        if not skill_file_has_yaml_frontmatter(skill_file):
+            continue
+        yield child
+
+
+def clone_payload_sequence(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(item) for item in payloads]
+
+
+def sync_project_shared_skills_to_bridge_global() -> list[str]:
+    source_root = project_shared_skills_root()
+    target_root = get_bridge_global_skills_root()
+    ensure_dir(get_bridge_codex_home_root())
+    ensure_dir(target_root)
+    clear_directory_contents(target_root)
+    synced: list[str] = []
+    skipped: list[str] = []
+    if source_root.exists():
+        for child in sorted(source_root.iterdir(), key=lambda item: item.name):
+            skill_file = child / "SKILL.md"
+            if not child.is_dir() or not skill_file.is_file():
+                continue
+            if skill_file_has_yaml_frontmatter(skill_file):
+                continue
+            skipped.append(child.name)
+    for child in iter_compatible_skill_dirs(source_root):
+        sync_tree_contents(child, target_root / child.name)
+        synced.append(child.name)
+    if skipped:
+        print_log(f"[SKILL] skipped incompatible shared skills (missing YAML frontmatter): {', '.join(skipped)}")
+    return synced
+
+
+def merge_source_skills_to_target(source_root: Path, target_root: Path) -> None:
+    for child in iter_compatible_skill_dirs(source_root):
         if (target_root / child.name).exists():
             continue
         sync_tree_contents(child, target_root / child.name)

@@ -34,8 +34,8 @@ class WeComBotRuntime:
     ws: object | None = None
     ws_send_lock: object | None = None
     pending_requests: dict[str, object] | None = None
-    pending_streams: dict[str, dict] | None = None
-    pending_finals: dict[str, dict] | None = None
+    pending_streams: dict[str, dict | list[dict]] | None = None
+    pending_finals: dict[str, dict | list[dict]] | None = None
     connected: bool = False
     reply_states: dict[str, "ReplyState"] = field(default_factory=dict)
     active_processes: dict[str, object] = field(default_factory=dict)

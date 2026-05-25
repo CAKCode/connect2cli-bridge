@@ -11,9 +11,7 @@ from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create
 from .runner import build_runner_invocation, run_invocation
 from .runtime import prepare_session_run, update_session_record
 from .wecom_protocol import (
-    build_proactive_text_payload,
     build_proactive_text_payloads,
-    build_text_response_payload,
     build_text_response_payloads,
 )
 from .wecom_upload import ws_send_json
@@ -80,9 +78,6 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
     cache_key = str(message.req_id or ((payload.get("headers") or {}).get("req_id")) or "")
     state = get_or_create_reply_state(runtime, cache_key, session_id, message.chat_key) if cache_key else None
     if runtime.ws is None:
-        if final and message.req_id:
-            payloads = build_proactive_text_payloads(message.chat_key, content)
-            payload = payloads[-1]
         if state is not None:
             cache_reply_payload(state, payload, final=final, payloads=payloads)
         target = runtime.pending_finals if final else runtime.pending_streams
@@ -94,9 +89,6 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
             await ws_send_json(runtime, item)
     except Exception as exc:
         runtime.last_error = str(exc)
-        if final and message.req_id:
-            payloads = build_proactive_text_payloads(message.chat_key, content)
-            payload = payloads[-1]
         if state is not None:
             cache_reply_payload(state, payload, final=final, payloads=payloads)
         target = runtime.pending_finals if final else runtime.pending_streams

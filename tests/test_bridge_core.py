@@ -5645,6 +5645,21 @@ async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
 
 
 @pytest.mark.asyncio
+async def test_send_or_store_session_payloads_cache_multi_chunk_final_reply(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+
+    delivered = await bridge_module.send_or_store_session_payloads(bot, "single:test-user", sess, payloads, True)
+
+    assert delivered is False
+    assert sess.pending_final_payload is not None
+    assert sess.pending_final_payloads is not None
+    assert len(sess.pending_final_payloads) == 3
+    assert sess.pending_final_payloads[-1]["body"]["stream"]["finish"] is True
+
+
+@pytest.mark.asyncio
 async def test_send_ws_payload_with_ack_times_out_stuck_websocket_write(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
 
@@ -5727,6 +5742,35 @@ async def test_flush_cached_final_reply_resumes_queue(bridge_module, monkeypatch
 
     assert started == [("sent", "final"), ("queue", "single:test-user")]
     assert sess.pending_final_payload is None
+
+
+@pytest.mark.asyncio
+async def test_flush_cached_multi_chunk_final_reply_resumes_queue(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.pending_final_payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+    sess.pending_final_payload = dict(sess.pending_final_payloads[-1])
+    sess.queue.append({"text": "next", "reqId": "req-2"})
+    started = []
+
+    class FakeWS:
+        closed = False
+
+        async def send_json(self, payload):
+            started.append(("sent", payload["body"]["stream"]["finish"], payload["body"]["stream"]["content"]))
+
+    def fake_process_queue(_bot, _sess, key):
+        started.append(("queue", key))
+
+    bot.ws = FakeWS()
+    monkeypatch.setattr(bridge_module, "process_queue", fake_process_queue)
+
+    await bridge_module.flush_session_pending_payloads(bot, "single:test-user", sess)
+
+    assert len([item for item in started if item[0] == "sent"]) == 3
+    assert started[-1] == ("queue", "single:test-user")
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
 
 
 @pytest.mark.asyncio
@@ -6164,18 +6208,45 @@ async def test_run_codex_uses_roomfile_as_cwd_for_group_session_in_sandbox_mode(
 def test_build_codex_home_for_subprocess_preserves_global_skills_and_adds_project_skills(bridge_module):
     global_skill = bridge_module.DEFAULT_CODEX_HOME / "skills" / "global-skill"
     global_skill.mkdir(parents=True, exist_ok=True)
-    (global_skill / "SKILL.md").write_text("global", encoding="utf-8")
+    (global_skill / "SKILL.md").write_text("---\nname: global-skill\n---\nglobal\n", encoding="utf-8")
     extra_state = bridge_module.DEFAULT_CODEX_HOME / "installation_id"
     extra_state.write_text("install-1", encoding="utf-8")
     project_skill = bridge_module.PROJECT_SHARED_SKILLS_ROOT / "project-skill"
     project_skill.mkdir(parents=True, exist_ok=True)
-    (project_skill / "SKILL.md").write_text("project", encoding="utf-8")
+    (project_skill / "SKILL.md").write_text("---\nname: project-skill\n---\nproject\n", encoding="utf-8")
 
     codex_home = bridge_module.build_codex_home_for_subprocess("sess-1")
 
     assert (codex_home / "skills" / "global-skill" / "SKILL.md").is_file()
     assert (codex_home / "skills" / "project-skill" / "SKILL.md").is_file()
     assert (codex_home / "installation_id").read_text(encoding="utf-8") == "install-1"
+
+
+def test_build_codex_home_for_subprocess_skips_project_skills_without_yaml_frontmatter(bridge_module):
+    project_skill = bridge_module.PROJECT_SHARED_SKILLS_ROOT / "legacy-project-skill"
+    project_skill.mkdir(parents=True, exist_ok=True)
+    (project_skill / "SKILL.md").write_text("# Legacy skill\n", encoding="utf-8")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-legacy")
+
+    assert not (codex_home / "skills" / "legacy-project-skill").exists()
+
+
+def test_sync_project_shared_skills_to_bridge_global_logs_skipped_incompatible_skills(bridge_module, monkeypatch):
+    compatible = bridge_module.PROJECT_SHARED_SKILLS_ROOT / "compatible-skill"
+    compatible.mkdir(parents=True, exist_ok=True)
+    (compatible / "SKILL.md").write_text("---\nname: compatible-skill\n---\nbody\n", encoding="utf-8")
+    legacy = bridge_module.PROJECT_SHARED_SKILLS_ROOT / "legacy-skill"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "SKILL.md").write_text("# legacy\n", encoding="utf-8")
+    logs = []
+
+    monkeypatch.setattr(bridge_module, "print_log", lambda message: logs.append(message))
+
+    synced = bridge_module.sync_project_shared_skills_to_bridge_global()
+
+    assert synced == ["compatible-skill"]
+    assert any("legacy-skill" in message for message in logs)
 
 
 def test_build_codex_home_for_subprocess_skips_volatile_tmp_arg0_runtime(bridge_module):
@@ -6189,6 +6260,68 @@ def test_build_codex_home_for_subprocess_skips_volatile_tmp_arg0_runtime(bridge_
     assert (codex_home / "installation_id").read_text(encoding="utf-8") == "install-1"
     assert (codex_home / "tmp").is_dir()
     assert not (codex_home / "tmp" / "arg0").exists()
+
+
+def test_build_codex_base_args_uses_resolved_codex_command(monkeypatch, bridge_module):
+    monkeypatch.setattr(bridge_module.shutil, "which", lambda name: "/usr/local/bin/codex" if name == "codex" else None)
+
+    args = bridge_module.build_codex_base_args(Path("/tmp/out.jsonl"), [], resume=False)
+
+    assert args[:2] == ["/usr/local/bin/codex", "exec"]
+
+
+def test_build_codex_base_args_honors_codex_command_env(monkeypatch, bridge_module):
+    monkeypatch.setenv("CODEX_COMMAND", "/opt/codex/bin/codex --profile automation")
+
+    args = bridge_module.build_codex_base_args(Path("/tmp/out.jsonl"), [], resume=True)
+
+    assert args[:4] == ["/opt/codex/bin/codex", "--profile", "automation", "exec"]
+    assert args[4] == "resume"
+
+
+@pytest.mark.asyncio
+async def test_run_codex_sends_long_final_reply_in_chunks(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    sent = []
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            event = {"type": "item.completed", "item": {"type": "agent_message", "text": "x" * 8000}}
+            self.stdout.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def fake_send_session_status(*args, **kwargs):
+        return True
+
+    async def fake_send_or_store_session_payloads(_bot, _key, _sess, payloads, final):
+        for payload in payloads:
+            sent.append((payload["body"]["stream"]["finish"], payload["body"]["stream"]["content"]))
+        return True
+
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payloads", fake_send_or_store_session_payloads)
+
+    await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
+
+    assert len(sent) == 3
+    assert sent[-1][0] is True
+    assert "".join(chunk for _, chunk in sent) == "x" * 8000
+
 
 @pytest.mark.asyncio
 async def test_run_codex_retries_fresh_exec_when_stdin_prompt_error_variant_appears(bridge_module, monkeypatch):
@@ -6257,8 +6390,10 @@ async def test_run_codex_retries_fresh_exec_when_stdin_prompt_error_variant_appe
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", ["image.png"])
 
     assert len(invocations) == 2
-    assert invocations[0][0:3] == ["codex", "exec", "resume"]
-    assert invocations[1][0:2] == ["codex", "exec"]
+    assert invocations[0][1:3] == ["exec", "resume"]
+    assert invocations[0][0].endswith("codex")
+    assert invocations[1][1:2] == ["exec"]
+    assert invocations[1][0].endswith("codex")
     assert invocations[0][-1] == "-"
     assert "resume" not in invocations[1]
     assert invocations[1][-1] == "-"
@@ -6335,8 +6470,10 @@ async def test_run_codex_retries_fresh_exec_when_prompt_write_broken_pipe_occurs
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
     assert len(invocations) == 2
-    assert invocations[0][0:3] == ["codex", "exec", "resume"]
-    assert invocations[1][0:2] == ["codex", "exec"]
+    assert invocations[0][1:3] == ["exec", "resume"]
+    assert invocations[0][0].endswith("codex")
+    assert invocations[1][1:2] == ["exec"]
+    assert invocations[1][0].endswith("codex")
     assert "resume" not in invocations[1]
     assert sess.thread_id == "thread-from-second-exec"
     assert payloads[-1] == (True, "final answer")
@@ -6437,7 +6574,8 @@ async def test_reset_then_image_then_text_uses_fresh_exec_with_image_and_stdin_p
     assert sess.run_task is not None
     await sess.run_task
 
-    assert captured["args"][0:2] == ["codex", "exec"]
+    assert captured["args"][0].endswith("codex")
+    assert captured["args"][1] == "exec"
     assert "resume" not in captured["args"]
     assert "-i" in captured["args"]
     assert str(image_path) in captured["args"]

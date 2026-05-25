@@ -271,7 +271,7 @@ async def test_send_or_cache_runtime_payload_uses_reply_state_cache_for_req_id(t
     assert runtime.reply_states["req-1"].pending_stream_payload is not None
 
 
-async def test_send_or_cache_runtime_payload_uses_proactive_group_markdown_for_final_fallback(tmp_path: Path) -> None:
+async def test_send_or_cache_runtime_payload_keeps_group_stream_reply_for_final_fallback(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
@@ -284,13 +284,14 @@ async def test_send_or_cache_runtime_payload_uses_proactive_group_markdown_for_f
 
     assert delivered is False
     assert "req-1" in runtime.pending_finals
-    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_send_msg"
-    assert runtime.pending_finals["req-1"][-1]["body"]["markdown"]["content"] == "<@alice>\nfinal"
+    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_respond_msg"
+    assert runtime.pending_finals["req-1"][-1]["body"]["stream"]["content"] == "final"
+    assert runtime.pending_finals["req-1"][-1]["body"]["stream"]["finish"] is True
     assert runtime.reply_states["req-1"].pending_final_payload is not None
     assert runtime.reply_states["req-1"].pending_final_payloads is not None
 
 
-async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat_final_fallback(tmp_path: Path) -> None:
+async def test_send_or_cache_runtime_payload_keeps_single_stream_reply_for_final_fallback(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
@@ -303,8 +304,9 @@ async def test_send_or_cache_runtime_payload_uses_plain_markdown_for_single_chat
 
     assert delivered is False
     assert "req-1" in runtime.pending_finals
-    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_send_msg"
-    assert runtime.pending_finals["req-1"][-1]["body"]["markdown"]["content"] == "final"
+    assert runtime.pending_finals["req-1"][-1]["cmd"] == "aibot_respond_msg"
+    assert runtime.pending_finals["req-1"][-1]["body"]["stream"]["content"] == "final"
+    assert runtime.pending_finals["req-1"][-1]["body"]["stream"]["finish"] is True
     assert runtime.reply_states["req-1"].pending_final_payload is not None
     assert runtime.reply_states["req-1"].pending_final_payloads is not None
 
