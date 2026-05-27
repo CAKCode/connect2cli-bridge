@@ -12,6 +12,7 @@ PID_FILE="$SCRIPT_DIR/.bridge.pid"
 GUARD_PID_FILE="$SCRIPT_DIR/.bridge.guard.pid"
 LOG_FILE="$SCRIPT_DIR/bridge.log"
 PREV_LOG_FILE="$SCRIPT_DIR/bridge.log.prev"
+SHUTDOWN_REASON_FILE="$SCRIPT_DIR/.bridge.shutdown-reason.json"
 STOPPED_PIDS=""
 
 : "${BRIDGE_WATCHDOG_ENABLED:=true}"
@@ -87,11 +88,13 @@ wait_for_port_release() {
 
 stop_pid_from_file() {
   target_file="$1"
+  stop_reason="$2"
   if [ ! -f "$target_file" ]; then
     return
   fi
   target_pid=$(cat "$target_file" 2>/dev/null || true)
   if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
+    printf '{"reason":"%s","at":%s}\n' "$stop_reason" "$(date +%s%3N)" > "$SHUTDOWN_REASON_FILE"
     kill "$target_pid" 2>/dev/null || true
     STOPPED_PIDS="$STOPPED_PIDS $target_pid"
   fi
@@ -156,8 +159,8 @@ stop_existing_bridges() {
   done
 }
 
-stop_pid_from_file "$GUARD_PID_FILE"
-stop_pid_from_file "$PID_FILE"
+stop_pid_from_file "$GUARD_PID_FILE" "start.sh_restart"
+stop_pid_from_file "$PID_FILE" "start.sh_restart"
 
 MORE_GUARD_PIDS=$(stop_existing_watchdogs)
 STOPPED_PIDS="$STOPPED_PIDS $MORE_GUARD_PIDS"

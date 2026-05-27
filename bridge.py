@@ -261,6 +261,10 @@ class BotState:
     active_upload_task: Optional[asyncio.Task] = None
     active_upload_job: Optional[dict[str, Any]] = None
     runtime_lock_handle: Any = None
+    stop_reason: Optional[str] = None
+    last_subscribed_at_ms: Optional[int] = None
+    last_disconnect_at_ms: Optional[int] = None
+    task_restart_counts: dict[str, int] = field(default_factory=dict)
 
 
 def uid() -> str:
@@ -709,6 +713,102 @@ def write_json_atomic(path: Path, data: Any) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
     tmp.replace(path)
+
+
+def get_shutdown_reason_file() -> Path:
+    return BASE_DIR / ".bridge.shutdown-reason.json"
+
+
+def write_shutdown_reason(reason: str, detail: Optional[str] = None) -> None:
+    payload = {"reason": str(reason or "").strip() or "unknown", "at": now_ms()}
+    if detail:
+        payload["detail"] = str(detail)
+    try:
+        write_json_atomic(get_shutdown_reason_file(), payload)
+    except Exception:
+        pass
+
+
+def consume_shutdown_reason() -> Optional[dict[str, Any]]:
+    shutdown_reason_file = get_shutdown_reason_file()
+    payload = read_json_file(shutdown_reason_file, None)
+    try:
+        shutdown_reason_file.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return payload if isinstance(payload, dict) else None
+
+
+def set_shutdown_signal_reason(reason: str, detail: Optional[str] = None) -> None:
+    write_shutdown_reason(reason, detail)
+    SHUTDOWN_EVENT.set()
+
+
+def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
+    runner_done = bool(bot.runner_task and bot.runner_task.done())
+    upload_done = bool(bot.upload_worker_task and bot.upload_worker_task.done())
+    ws_connected = bool(bot.ws and not bot.ws.closed)
+    healthy = (
+        bool(bot.config.get("enabled", True))
+        and bot.status in {"running", "connecting", "standby"}
+        and not runner_done
+        and not upload_done
+        and (bot.status == "standby" or ws_connected or bot.status == "connecting")
+    )
+    return {
+        "botId": bot.config["id"],
+        "name": bot.config["name"],
+        "enabled": bot.config.get("enabled", True),
+        "status": bot.status,
+        "healthy": healthy,
+        "wsConnected": ws_connected,
+        "runnerTaskDone": runner_done,
+        "uploadWorkerDone": upload_done,
+        "taskRestartCounts": dict(bot.task_restart_counts),
+        "sessionCount": len(bot.sessions),
+        "lastSubscribedAt": bot.last_subscribed_at_ms,
+        "lastDisconnectedAt": bot.last_disconnect_at_ms,
+        "stopReason": bot.stop_reason,
+    }
+
+
+def supervise_bot_task(bot: BotState, attr_name: str, task_name: str, factory: Any) -> asyncio.Task:
+    task = asyncio.create_task(factory())
+    setattr(bot, attr_name, task)
+
+    def on_done(done_task: asyncio.Task) -> None:
+        current_task = getattr(bot, attr_name, None)
+        if current_task is not done_task:
+            return
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # pragma: no cover
+            restart_reason = f"inspection_failed:{exc}"
+        else:
+            if exc is None:
+                return
+            restart_reason = f"{task_name}_crashed:{exc}"
+        if not bot.config.get("enabled", True) or SHUTDOWN_EVENT.is_set():
+            return
+        bot.task_restart_counts[task_name] = bot.task_restart_counts.get(task_name, 0) + 1
+        add_log(bot, f"{task_name} exited unexpectedly; restarting ({restart_reason})")
+        add_event_log(
+            bot,
+            "bot.task_restarted",
+            task=task_name,
+            count=bot.task_restart_counts[task_name],
+            reason=restart_reason,
+        )
+        supervise_bot_task(bot, attr_name, task_name, factory)
+
+    task.add_done_callback(on_done)
+    return task
 
 
 def ensure_local_file_send_dirs(target_config_ids: Optional[list[str]] = None) -> None:
@@ -1752,6 +1852,21 @@ def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
             continue
         return cursor[bot_match.end() :].lstrip().strip()
     return text.strip()
+
+
+def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
+    body = message.get("body") or {}
+    msg_type = str(body.get("msgtype") or "").strip()
+    if msg_type == "text":
+        return str(((body.get("text") or {}).get("content") or "")).strip()
+    if msg_type == "image":
+        return str(((body.get("image") or {}).get("url") or "")).strip()
+    if msg_type == "file":
+        file_body = body.get("file") or {}
+        return str(file_body.get("file_id") or file_body.get("fileId") or file_body.get("filename") or "").strip()
+    if msg_type == "mixed":
+        return json.dumps(body.get("mixed") or {}, ensure_ascii=False, sort_keys=True)
+    return ""
 
 
 def chat_key_for_bot(bot: BotState, message: dict[str, Any]) -> str:
@@ -5890,7 +6005,7 @@ async def remove_deleted_bots_from_memory_once() -> None:
         if not bot_instance_is_stale(bot):
             continue
         bot.config["enabled"] = False
-        await stop_bot(bot_id, persist_disable=False)
+        await stop_bot(bot_id, persist_disable=False, reason="deleted_bot_reaper")
         BOTS.pop(bot_id, None)
         PREPARED_PREVIOUS_BOT_CONFIGS.pop(bot_id, None)
 
@@ -6034,11 +6149,19 @@ async def terminate_process(process: Optional[asyncio.subprocess.Process], timeo
         pass
 
 
-async def stop_bot(bot_id: str, persist_disable: bool = True, persist_state: bool = True) -> None:
+async def stop_bot(
+    bot_id: str,
+    persist_disable: bool = True,
+    persist_state: bool = True,
+    reason: str = "internal",
+) -> None:
     bot = BOTS.get(bot_id)
     if not bot:
         return
-    add_log(bot, "stopping")
+    normalized_reason = str(reason or "internal").strip() or "internal"
+    bot.stop_reason = normalized_reason
+    add_log(bot, f"stopping (reason={normalized_reason})")
+    add_event_log(bot, "bot.stopping", reason=normalized_reason)
     if persist_disable:
         bot.config["enabled"] = False
     if bot.ws and not bot.ws.closed:
@@ -6075,7 +6198,7 @@ async def remove_bot(bot_id: str) -> None:
     mark_bot_deleted_globally(bot_id, wecom_bot_id)
     remove_persisted_bot_config(bot_id)
     try:
-        await stop_bot(bot_id, persist_disable=False)
+        await stop_bot(bot_id, persist_disable=False, reason="remove_bot")
         cleanup_bot_schedule_definitions(bot_id)
         cleanup_bot_session_storage(bot_id)
     finally:
@@ -6096,7 +6219,13 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
 
     event_key = (
         (message.get("body") or {}).get("msgid")
-        or f"{((message.get('headers') or {}).get('req_id') or '')}:{((message.get('body') or {}).get('msgtype') or '')}:{chat_key_for_bot(bot, message)}"
+        or (
+            f"{((message.get('headers') or {}).get('req_id') or '')}:"
+            f"{((message.get('body') or {}).get('msgtype') or '')}:"
+            f"{chat_key_for_bot(bot, message)}:"
+            f"{message_sender_userid(message)}:"
+            f"{dedupe_content_fingerprint(message)}"
+        )
     )
     prune_recent_events()
     if event_key in RECENT_EVENTS:
@@ -6237,6 +6366,8 @@ async def bot_runner(bot: BotState) -> None:
                     add_log(bot, f"subscribe response: {json.dumps(response, ensure_ascii=False)}")
                     if response.get("errcode") == 0:
                         bot.status = "running"
+                        bot.last_subscribed_at_ms = now_ms()
+                        bot.stop_reason = None
                         add_log(bot, "subscribed")
                         add_event_log(bot, "wecom.subscribed", reqId=sub_req_id)
                         await flush_all_pending_session_payloads(bot)
@@ -6273,6 +6404,7 @@ async def bot_runner(bot: BotState) -> None:
             release_bot_runtime_lock(bot)
             if bot.config.get("enabled", True):
                 bot.status = "disconnected"
+                bot.last_disconnect_at_ms = now_ms()
                 add_log(bot, "WeCom disconnected")
                 add_event_log(bot, "wecom.disconnected")
 
@@ -6296,12 +6428,13 @@ async def start_bot(config: dict[str, Any]) -> BotState:
     if previous_config and str(previous_config.get("workDir") or "") != normalized["workDir"]:
         invalidate_bot_session_threads(normalized["id"])
     if normalized["id"] in BOTS:
-        await stop_bot(normalized["id"], persist_disable=False)
+        await stop_bot(normalized["id"], persist_disable=False, reason="start_bot_replace")
     bot = BotState(config=normalized)
     BOTS[normalized["id"]] = bot
+    bot.stop_reason = None
     add_log(bot, "starting...")
-    bot.upload_worker_task = asyncio.create_task(upload_worker(bot))
-    bot.runner_task = asyncio.create_task(bot_runner(bot))
+    supervise_bot_task(bot, "upload_worker_task", "upload_worker", lambda: upload_worker(bot))
+    supervise_bot_task(bot, "runner_task", "bot_runner", lambda: bot_runner(bot))
     upsert_persisted_bot_config(bot.config)
     return bot
 
@@ -6348,6 +6481,8 @@ async def enqueue_message(
     if not acquire_session_lease(bot, sess, key):
         if not silent_lease_failure:
             add_log(bot, f"[{key}] lease owned by another process, ignore message")
+            add_event_log(bot, "session.lease_conflict", chatKey=key, sessionId=sess.session_id, action="drop_user_message")
+            await respond_queued_error(bot, req_id, "session is temporarily owned by another bridge instance; please retry")
         return False
     register_reply_session(bot, req_id, sess)
     queue_position = len(sess.queue) + (1 if sess.running else 0) + 1
@@ -6393,6 +6528,8 @@ async def enqueue_media_message(bot: BotState, message: dict[str, Any], kind: st
         return
     if not acquire_session_lease(bot, sess, key):
         add_log(bot, f"[{key}] lease owned by another process, ignore media message")
+        add_event_log(bot, "session.lease_conflict", chatKey=key, sessionId=sess.session_id, action="drop_media_message")
+        await respond_queued_error(bot, req_id, "session is temporarily owned by another bridge instance; please retry sending the attachment")
         return
     register_reply_session(bot, req_id, sess)
     sess.pending_media_downloads += 1
@@ -6423,6 +6560,8 @@ async def enqueue_mixed_message(bot: BotState, message: dict[str, Any]) -> None:
         return
     if not acquire_session_lease(bot, sess, key):
         add_log(bot, f"[{key}] lease owned by another process, ignore mixed message")
+        add_event_log(bot, "session.lease_conflict", chatKey=key, sessionId=sess.session_id, action="drop_mixed_message")
+        await respond_queued_error(bot, req_id, "session is temporarily owned by another bridge instance; please retry")
         return
     register_reply_session(bot, req_id, sess)
 
@@ -6550,14 +6689,14 @@ async def reconcile_bots_once() -> None:
             continue
         desired = desired_by_id.get(bot_id)
         if not desired:
-            await stop_bot(bot_id, persist_disable=False, persist_state=False)
+            await stop_bot(bot_id, persist_disable=False, persist_state=False, reason="config_reconcile_missing")
             BOTS.pop(bot_id, None)
             PREPARED_PREVIOUS_BOT_CONFIGS.pop(bot_id, None)
             continue
         if desired.get("enabled") is False:
             if bot.config.get("enabled", True):
                 bot.config = {**bot.config, **desired, "enabled": False}
-                await stop_bot(bot_id, persist_disable=False)
+                await stop_bot(bot_id, persist_disable=False, reason="config_reconcile_disabled")
             continue
         if bot.config != desired:
             await start_bot(dict(desired))
@@ -6666,6 +6805,7 @@ async def read_json_body(request: web.Request) -> dict[str, Any]:
 
 
 def bot_to_payload(bot: BotState) -> dict[str, Any]:
+    health = bot_health_snapshot(bot)
     sessions = []
     for key, sess in bot.sessions.items():
         sessions.append(
@@ -6689,6 +6829,14 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "groupSessionMode": bot.config.get("groupSessionMode", "per-user"),
         "secretSource": bot_secret_source(bot.config),
         "status": bot.status,
+        "healthy": health["healthy"],
+        "wsConnected": health["wsConnected"],
+        "runnerTaskDone": health["runnerTaskDone"],
+        "uploadWorkerDone": health["uploadWorkerDone"],
+        "taskRestartCounts": health["taskRestartCounts"],
+        "lastSubscribedAt": health["lastSubscribedAt"],
+        "lastDisconnectedAt": health["lastDisconnectedAt"],
+        "stopReason": health["stopReason"],
         "enabled": bot.config["enabled"],
         "logs": list(bot.logs)[-30:],
         "sessions": sessions,
@@ -6704,6 +6852,14 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "groupSessionMode": config.get("groupSessionMode", "per-user"),
         "secretSource": bot_secret_source(config),
         "status": "disabled" if config.get("enabled") is False else "not_loaded",
+        "healthy": False,
+        "wsConnected": False,
+        "runnerTaskDone": None,
+        "uploadWorkerDone": None,
+        "taskRestartCounts": {},
+        "lastSubscribedAt": None,
+        "lastDisconnectedAt": None,
+        "stopReason": None,
         "enabled": config.get("enabled", True) is not False,
         "logs": [],
         "sessions": [],
@@ -6769,9 +6925,11 @@ async def api_restart_bot(request: web.Request) -> web.Response:
         updated = {**current, "enabled": True, "restartToken": uid()}
         upsert_persisted_bot_config(updated)
         if bot_id in BOTS:
+            add_log(BOTS[bot_id], "restart requested via API")
+            add_event_log(BOTS[bot_id], "bot.restart_requested", reason="api")
             BOTS[bot_id].config = dict(updated)
             await start_bot(dict(updated))
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "reason": "api"})
     except BridgeError as exc:
         return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
 
@@ -6789,8 +6947,8 @@ async def api_stop_bot(request: web.Request) -> web.Response:
         upsert_persisted_bot_config(updated)
         if bot_id in BOTS:
             BOTS[bot_id].config = dict(updated)
-            await stop_bot(bot_id, persist_disable=False)
-        return web.json_response({"ok": True})
+            await stop_bot(bot_id, persist_disable=False, reason="api_stop")
+        return web.json_response({"ok": True, "reason": "api_stop"})
     except BridgeError as exc:
         return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
 
@@ -6935,10 +7093,38 @@ async def api_root(_: web.Request) -> web.Response:
     )
 
 
+async def api_healthz(_: web.Request) -> web.Response:
+    bot_snapshots = [bot_health_snapshot(bot) for bot in BOTS.values() if not bot_instance_is_stale(bot)]
+    loaded_bot_ids = {snapshot["botId"] for snapshot in bot_snapshots}
+    missing_enabled_bot_ids = []
+    for config in read_persisted_bot_configs():
+        if config.get("enabled") is False:
+            continue
+        config_id = str(config.get("id") or "").strip()
+        if config_id and config_id not in loaded_bot_ids:
+            missing_enabled_bot_ids.append(config_id)
+    unhealthy = [snapshot for snapshot in bot_snapshots if not snapshot["healthy"]]
+    status = 200 if not unhealthy else 503
+    if missing_enabled_bot_ids:
+        status = 503
+    return web.json_response(
+        {
+            "ok": not unhealthy and not missing_enabled_bot_ids,
+            "name": "WeCom Codex Bridge Python",
+            "instanceId": INSTANCE_ID,
+            "shutdown": SHUTDOWN_EVENT.is_set(),
+            "botCount": len(bot_snapshots),
+            "bots": bot_snapshots,
+            "missingEnabledBotIds": missing_enabled_bot_ids,
+        },
+        status=status,
+    )
+
+
 async def app_cleanup(_: web.Application) -> None:
     SHUTDOWN_EVENT.set()
     for bot_id in list(BOTS.keys()):
-        await stop_bot(bot_id, persist_disable=False)
+        await stop_bot(bot_id, persist_disable=False, reason="app_cleanup")
     if HTTP_SESSION and not HTTP_SESSION.closed:
         await HTTP_SESSION.close()
 
@@ -6946,6 +7132,7 @@ async def app_cleanup(_: web.Application) -> None:
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", api_root)
+    app.router.add_get("/healthz", api_healthz)
     app.router.add_get("/api/bots", api_get_bots)
     app.router.add_post("/api/bots", api_add_bot)
     app.router.add_delete("/api/bots/{bot_id}", api_delete_bot)
@@ -7000,10 +7187,16 @@ async def main() -> None:
     site = web.TCPSite(runner, HOST, PORT)
     await site.start()
 
+    previous_shutdown = consume_shutdown_reason()
+
     print_log(f"WeCom Codex Bridge Python: {BRIDGE_API_BASE}")
     print_log(f"[SECURITY] API access: {api_auth_mode_label()}")
     print_log(f"[CODEX] exec mode: {CODEX_EXEC_MODE}")
     print_log(f"[CODEX] max concurrent runs: {MAX_CONCURRENT_CODEX_RUNS}")
+    if previous_shutdown:
+        print_log(
+            f"[INIT] previous shutdown reason={previous_shutdown.get('reason')} detail={previous_shutdown.get('detail') or '-'} at={previous_shutdown.get('at')}"
+        )
 
     maybe_migrate_legacy_shared_runtime_state()
     maybe_migrate_legacy_instance_runtime_state()
@@ -7028,7 +7221,7 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, SHUTDOWN_EVENT.set)
+            loop.add_signal_handler(sig, lambda current_sig=sig: set_shutdown_signal_reason(f"signal:{current_sig.name.lower()}"))
         except NotImplementedError:
             pass
 

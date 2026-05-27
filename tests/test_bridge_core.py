@@ -254,6 +254,7 @@ def test_watchdog_script_exists_and_uses_health_probe():
     assert "export_bridge_runtime_env" in content
     assert "GET /" not in content
     assert "bridge_health_ok()" in content
+    assert "/healthz" in content
     assert ".bridge.guard.pid" in content
     assert "restart triggered" in content
     assert "bridge recovered before restart; skip restart" in content
@@ -1535,7 +1536,7 @@ def test_start_bot_does_not_stop_existing_bot_when_new_config_is_invalid(bridge_
     existing = make_bot(bridge_module)
     stop_calls = []
 
-    async def fake_stop_bot(bot_id: str, persist_disable: bool = True):
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
         stop_calls.append((bot_id, persist_disable))
         bridge_module.BOTS.pop(bot_id, None)
 
@@ -2564,6 +2565,49 @@ async def test_handle_group_message_preserves_bot_name_mention_in_body_text(brid
 
 
 @pytest.mark.asyncio
+async def test_handle_wecom_message_dedupe_fallback_keeps_different_text_messages(bridge_module):
+    bot = make_bot(bridge_module)
+    captured = []
+
+    async def fake_enqueue_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+
+    payload_a = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "same-req"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "single",
+            "chatid": "user-a",
+            "text": {"content": "first"},
+            "from": {"userid": "user-a"},
+        },
+    }
+    payload_b = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "same-req"},
+        "body": {
+            "msgtype": "text",
+            "chattype": "single",
+            "chatid": "user-a",
+            "text": {"content": "second"},
+            "from": {"userid": "user-a"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload_a)
+    await bridge_module.handle_wecom_message(bot, payload_b)
+
+    assert captured == [
+        ("single:user-a", "first", "same-req"),
+        ("single:user-a", "second", "same-req"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_group_message_does_not_strip_similar_prefix_mention(bridge_module):
     bot = make_bot(bridge_module, name="bot")
     bot.config["groupSessionMode"] = "per-user"
@@ -3280,7 +3324,7 @@ def test_remove_deleted_bots_from_memory_once_stops_tombstoned_bot(bridge_module
     bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
     calls = []
 
-    async def fake_stop_bot(bot_id: str, persist_disable: bool = True):
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
         calls.append((bot_id, persist_disable))
         target = bridge_module.BOTS[bot_id]
         target.status = "stopped"
@@ -3371,7 +3415,7 @@ def test_reconcile_bots_once_stops_bot_when_persisted_disabled(bridge_module):
     )
     calls = []
 
-    async def fake_stop_bot(bot_id: str, persist_disable: bool = True):
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
         calls.append((bot_id, persist_disable))
         bridge_module.BOTS[bot_id].status = "stopped"
 
@@ -3744,6 +3788,7 @@ def test_api_stop_bot_updates_persisted_config_without_local_bot(monkeypatch, br
 
     assert response.status == 200
     assert body["ok"] is True
+    assert body["reason"] == "api_stop"
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     assert stored[0]["enabled"] is False
 
@@ -3771,7 +3816,7 @@ def test_api_stop_bot_does_not_overwrite_newer_persisted_fields(monkeypatch, bri
     async def fake_require_api_access(_request):
         return None
 
-    async def fake_stop_bot(_bot_id: str, persist_disable: bool = True):
+    async def fake_stop_bot(_bot_id: str, persist_disable: bool = True, reason: str = "internal"):
         return None
 
     monkeypatch.setattr(bridge_module, "require_api_access", fake_require_api_access)
@@ -3783,6 +3828,7 @@ def test_api_stop_bot_does_not_overwrite_newer_persisted_fields(monkeypatch, bri
 
     assert response.status == 200
     assert body["ok"] is True
+    assert body["reason"] == "api_stop"
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     assert stored[0]["enabled"] is False
     assert stored[0]["welcome"] == "persisted-new"
@@ -3817,6 +3863,7 @@ def test_api_restart_bot_updates_persisted_restart_token_without_local_bot(monke
 
     assert response.status == 200
     assert body["ok"] is True
+    assert body["reason"] == "api"
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     assert stored[0]["enabled"] is True
     assert stored[0]["restartToken"]
@@ -3886,6 +3933,26 @@ def test_api_get_bots_prefers_runtime_payload_for_loaded_bot(monkeypatch, bridge
     assert body[0]["id"] == bot.config["id"]
     assert body[0]["status"] == "standby"
     assert body[0]["enabled"] is True
+    assert body[0]["healthy"] is True
+
+
+def test_bot_to_payload_includes_health_and_stop_reason(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "disconnected"
+    bot.stop_reason = "api_stop"
+    bot.ws = SimpleNamespace(closed=True)
+    loop = asyncio.new_event_loop()
+    try:
+        bot.runner_task = loop.create_future()
+        bot.upload_worker_task = loop.create_future()
+
+        payload = bridge_module.bot_to_payload(bot)
+
+        assert payload["healthy"] is False
+        assert payload["stopReason"] == "api_stop"
+        assert payload["wsConnected"] is False
+    finally:
+        loop.close()
 
 
 def test_api_get_bots_ignores_stale_runtime_bot(monkeypatch, bridge_module):
@@ -3969,10 +4036,92 @@ def test_api_restart_bot_does_not_overwrite_newer_persisted_fields(monkeypatch, 
 
     assert response.status == 200
     assert body["ok"] is True
+    assert body["reason"] == "api"
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     assert stored[0]["enabled"] is True
     assert stored[0]["welcome"] == "persisted-new"
     assert stored[0]["restartToken"]
+
+
+def test_api_healthz_reports_healthy_running_bot(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    loop = asyncio.new_event_loop()
+    try:
+        bot.runner_task = loop.create_future()
+        bot.upload_worker_task = loop.create_future()
+        bot.last_subscribed_at_ms = bridge_module.now_ms()
+
+        response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
+        body = json.loads(response.text)
+
+        assert response.status == 200
+        assert body["ok"] is True
+        assert body["botCount"] == 1
+        assert body["bots"][0]["healthy"] is True
+        assert body["bots"][0]["status"] == "running"
+        assert body["bots"][0]["wsConnected"] is True
+    finally:
+        loop.close()
+
+
+def test_api_healthz_reports_unhealthy_bot_when_runner_task_done(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    loop = asyncio.new_event_loop()
+    try:
+        done_future = loop.create_future()
+        done_future.set_result(None)
+        bot.runner_task = done_future
+        bot.upload_worker_task = loop.create_future()
+
+        response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
+        body = json.loads(response.text)
+
+        assert response.status == 503
+        assert body["ok"] is False
+        assert body["bots"][0]["healthy"] is False
+        assert body["bots"][0]["runnerTaskDone"] is True
+    finally:
+        loop.close()
+
+
+def test_api_healthz_reports_missing_enabled_persisted_bot(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+
+    response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
+    body = json.loads(response.text)
+
+    assert response.status == 503
+    assert body["ok"] is False
+    assert body["missingEnabledBotIds"] == ["bot-1"]
+
+
+def test_shutdown_reason_file_follows_runtime_base_dir(bridge_module):
+    bridge_module.write_shutdown_reason("api_stop", "detail")
+
+    payload = bridge_module.consume_shutdown_reason()
+
+    assert payload["reason"] == "api_stop"
+    assert payload["detail"] == "detail"
+    assert not (bridge_module.BASE_DIR / ".bridge.shutdown-reason.json").exists()
 
 
 def test_api_restart_bot_rejects_stale_runtime_bot_without_persisted_config(monkeypatch, bridge_module):
@@ -4299,6 +4448,27 @@ async def test_process_local_file_send_queue_reads_namespaced_bot_queue(bridge_m
         worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker
+
+
+@pytest.mark.asyncio
+async def test_supervise_bot_task_restarts_failed_worker(bridge_module):
+    bot = make_bot(bridge_module)
+    calls = []
+    restarted = asyncio.Event()
+
+    async def flaky_worker():
+        calls.append("run")
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        restarted.set()
+
+    task = bridge_module.supervise_bot_task(bot, "upload_worker_task", "upload_worker", flaky_worker)
+    with contextlib.suppress(RuntimeError):
+        await task
+    await asyncio.wait_for(restarted.wait(), 1)
+
+    assert len(calls) >= 2
+    assert bot.task_restart_counts["upload_worker"] == 1
 
 
 @pytest.mark.asyncio
@@ -5475,6 +5645,29 @@ async def test_enqueue_message_sends_queue_status_when_session_busy(bridge_modul
     assert payloads[0]["body"]["stream"]["finish"] is True
     assert payloads[0]["body"]["stream"]["content"] == "运行状态：排队中，前方还有 1 个任务。 任务完成后会主动发送结果。"
     assert "req-1" in sess.reply_proactive_req_ids
+
+
+@pytest.mark.asyncio
+async def test_enqueue_message_reports_lease_conflict_instead_of_silent_drop(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    make_session(bridge_module, bot)
+    responses = []
+
+    class FakeWS:
+        closed = False
+
+        async def send_json(self, payload):
+            responses.append(payload)
+
+    bot.ws = FakeWS()
+    monkeypatch.setattr(bridge_module, "acquire_session_lease", lambda *_args, **_kwargs: False)
+
+    accepted = await bridge_module.enqueue_message(bot, "single:test-user", "hello", "req-1")
+
+    assert accepted is False
+    assert responses
+    assert responses[0]["body"]["stream"]["finish"] is True
+    assert "temporarily owned by another bridge instance" in responses[0]["body"]["stream"]["content"]
 
 
 @pytest.mark.asyncio

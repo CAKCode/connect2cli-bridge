@@ -12,6 +12,7 @@ PID_FILE="$SCRIPT_DIR/.bridge.pid"
 GUARD_PID_FILE="$SCRIPT_DIR/.bridge.guard.pid"
 LOG_FILE="$SCRIPT_DIR/bridge.log"
 RESTART_STATE_FILE="$SCRIPT_DIR/.bridge.watchdog.restarts"
+SHUTDOWN_REASON_FILE="$SCRIPT_DIR/.bridge.shutdown-reason.json"
 
 : "${BRIDGE_WATCHDOG_POLL_SEC:=5}"
 : "${BRIDGE_WATCHDOG_HEALTH_TIMEOUT_SEC:=5}"
@@ -68,7 +69,7 @@ basic_auth = sys.argv[4]
 token = sys.argv[5]
 
 base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-url = f"http://{base_host}:{port}/"
+url = f"http://{base_host}:{port}/healthz"
 headers = {}
 if basic_auth:
     raw = base64.b64encode(basic_auth.encode("utf-8")).decode("ascii")
@@ -103,6 +104,7 @@ stop_bridge_process() {
   if ! pid_is_running "$target_pid"; then
     return 0
   fi
+  printf '{"reason":"%s","at":%s}\n' "watchdog_restart" "$(date +%s%3N)" > "$SHUTDOWN_REASON_FILE"
   kill "$target_pid" 2>/dev/null || true
   wait_for_bridge_exit "$target_pid" 50 || {
     log "bridge pid=$target_pid did not exit after SIGTERM, sending SIGKILL"
