@@ -106,6 +106,8 @@ REPLY_MAX_AGE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_MAX_AGE_FALLBACK_
 PROACTIVE_STATUS_INTERVAL_SEC = max(30, int(os.environ.get("PROACTIVE_STATUS_INTERVAL_SEC", 120)))
 SCHEDULE_PROCESSING_RETRY_MS = max(1000, int(os.environ.get("SCHEDULE_PROCESSING_RETRY_MS", 30000)))
 SCHEDULE_ORPHAN_TTL_MS = max(60000, int(os.environ.get("SCHEDULE_ORPHAN_TTL_MS", 86400000)))
+WECOM_INBOUND_IDLE_TIMEOUT_MS = max(60000, int(os.environ.get("WECOM_INBOUND_IDLE_TIMEOUT_MS", str(10 * 60 * 1000))))
+WECOM_HEARTBEAT_ACK_TIMEOUT_MS = max(30000, int(os.environ.get("WECOM_HEARTBEAT_ACK_TIMEOUT_MS", str(2 * 60 * 1000))))
 
 SESSION_TTL = 30 * 60
 SESSION_LEASE_TTL_MS = int(os.environ.get("SESSION_LEASE_TTL", 30000))
@@ -264,6 +266,8 @@ class BotState:
     stop_reason: Optional[str] = None
     last_subscribed_at_ms: Optional[int] = None
     last_disconnect_at_ms: Optional[int] = None
+    last_inbound_at_ms: Optional[int] = None
+    last_heartbeat_ack_at_ms: Optional[int] = None
     task_restart_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -747,15 +751,36 @@ def set_shutdown_signal_reason(reason: str, detail: Optional[str] = None) -> Non
 
 
 def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
+    now = now_ms()
     runner_done = bool(bot.runner_task and bot.runner_task.done())
     upload_done = bool(bot.upload_worker_task and bot.upload_worker_task.done())
     ws_connected = bool(bot.ws and not bot.ws.closed)
+    inbound_idle_ms = None
+    if bot.last_inbound_at_ms is not None:
+        inbound_idle_ms = max(0, now - bot.last_inbound_at_ms)
+    heartbeat_ack_idle_ms = None
+    if bot.last_heartbeat_ack_at_ms is not None:
+        heartbeat_ack_idle_ms = max(0, now - bot.last_heartbeat_ack_at_ms)
+    inbound_stale = bool(
+        bot.status == "running"
+        and bot.last_subscribed_at_ms is not None
+        and now - bot.last_subscribed_at_ms >= WECOM_INBOUND_IDLE_TIMEOUT_MS
+        and bot.last_inbound_at_ms is None
+    )
+    heartbeat_ack_stale = bool(
+        bot.status == "running"
+        and bot.last_heartbeat_ack_at_ms is not None
+        and heartbeat_ack_idle_ms is not None
+        and heartbeat_ack_idle_ms >= WECOM_HEARTBEAT_ACK_TIMEOUT_MS
+    )
     healthy = (
         bool(bot.config.get("enabled", True))
         and bot.status in {"running", "connecting", "standby"}
         and not runner_done
         and not upload_done
         and (bot.status == "standby" or ws_connected or bot.status == "connecting")
+        and not inbound_stale
+        and not heartbeat_ack_stale
     )
     return {
         "botId": bot.config["id"],
@@ -770,6 +795,12 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
         "sessionCount": len(bot.sessions),
         "lastSubscribedAt": bot.last_subscribed_at_ms,
         "lastDisconnectedAt": bot.last_disconnect_at_ms,
+        "lastInboundAt": bot.last_inbound_at_ms,
+        "lastHeartbeatAckAt": bot.last_heartbeat_ack_at_ms,
+        "inboundIdleMs": inbound_idle_ms,
+        "heartbeatAckIdleMs": heartbeat_ack_idle_ms,
+        "inboundStale": inbound_stale,
+        "heartbeatAckStale": heartbeat_ack_stale,
         "stopReason": bot.stop_reason,
     }
 
@@ -6207,8 +6238,11 @@ async def remove_bot(bot_id: str) -> None:
 
 
 async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
+    bot.last_inbound_at_ms = now_ms()
     req_id = ((message.get("headers") or {}).get("req_id"))
     if req_id and resolve_request_future(bot, req_id, message):
+        if str(message.get("cmd") or "").strip().lower() == "ping":
+            bot.last_heartbeat_ack_at_ms = bot.last_inbound_at_ms
         return
 
     if message.get("errcode") is not None and not message.get("cmd"):
@@ -6836,6 +6870,12 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "taskRestartCounts": health["taskRestartCounts"],
         "lastSubscribedAt": health["lastSubscribedAt"],
         "lastDisconnectedAt": health["lastDisconnectedAt"],
+        "lastInboundAt": health["lastInboundAt"],
+        "lastHeartbeatAckAt": health["lastHeartbeatAckAt"],
+        "inboundIdleMs": health["inboundIdleMs"],
+        "heartbeatAckIdleMs": health["heartbeatAckIdleMs"],
+        "inboundStale": health["inboundStale"],
+        "heartbeatAckStale": health["heartbeatAckStale"],
         "stopReason": health["stopReason"],
         "enabled": bot.config["enabled"],
         "logs": list(bot.logs)[-30:],
@@ -6859,6 +6899,12 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "taskRestartCounts": {},
         "lastSubscribedAt": None,
         "lastDisconnectedAt": None,
+        "lastInboundAt": None,
+        "lastHeartbeatAckAt": None,
+        "inboundIdleMs": None,
+        "heartbeatAckIdleMs": None,
+        "inboundStale": False,
+        "heartbeatAckStale": False,
         "stopReason": None,
         "enabled": config.get("enabled", True) is not False,
         "logs": [],

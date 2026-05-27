@@ -3951,6 +3951,8 @@ def test_bot_to_payload_includes_health_and_stop_reason(bridge_module):
         assert payload["healthy"] is False
         assert payload["stopReason"] == "api_stop"
         assert payload["wsConnected"] is False
+        assert payload["inboundStale"] is False
+        assert payload["heartbeatAckStale"] is False
     finally:
         loop.close()
 
@@ -4051,7 +4053,10 @@ def test_api_healthz_reports_healthy_running_bot(bridge_module):
     try:
         bot.runner_task = loop.create_future()
         bot.upload_worker_task = loop.create_future()
-        bot.last_subscribed_at_ms = bridge_module.now_ms()
+        now_value = bridge_module.now_ms()
+        bot.last_subscribed_at_ms = now_value
+        bot.last_inbound_at_ms = now_value
+        bot.last_heartbeat_ack_at_ms = now_value
 
         response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
         body = json.loads(response.text)
@@ -4062,6 +4067,8 @@ def test_api_healthz_reports_healthy_running_bot(bridge_module):
         assert body["bots"][0]["healthy"] is True
         assert body["bots"][0]["status"] == "running"
         assert body["bots"][0]["wsConnected"] is True
+        assert body["bots"][0]["inboundStale"] is False
+        assert body["bots"][0]["heartbeatAckStale"] is False
     finally:
         loop.close()
 
@@ -4086,6 +4093,97 @@ def test_api_healthz_reports_unhealthy_bot_when_runner_task_done(bridge_module):
         assert body["bots"][0]["runnerTaskDone"] is True
     finally:
         loop.close()
+
+
+def test_api_healthz_reports_unhealthy_when_no_inbound_after_subscribe(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    loop = asyncio.new_event_loop()
+    try:
+        bot.runner_task = loop.create_future()
+        bot.upload_worker_task = loop.create_future()
+        now_value = bridge_module.now_ms()
+        bot.last_subscribed_at_ms = now_value - bridge_module.WECOM_INBOUND_IDLE_TIMEOUT_MS - 1000
+        bot.last_inbound_at_ms = None
+        bot.last_heartbeat_ack_at_ms = now_value
+
+        response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
+        body = json.loads(response.text)
+
+        assert response.status == 503
+        assert body["ok"] is False
+        assert body["bots"][0]["healthy"] is False
+        assert body["bots"][0]["inboundStale"] is True
+    finally:
+        loop.close()
+
+
+def test_api_healthz_reports_unhealthy_when_heartbeat_ack_is_stale(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    loop = asyncio.new_event_loop()
+    try:
+        bot.runner_task = loop.create_future()
+        bot.upload_worker_task = loop.create_future()
+        now_value = bridge_module.now_ms()
+        bot.last_subscribed_at_ms = now_value
+        bot.last_inbound_at_ms = now_value
+        bot.last_heartbeat_ack_at_ms = now_value - bridge_module.WECOM_HEARTBEAT_ACK_TIMEOUT_MS - 1000
+
+        response = asyncio.run(bridge_module.api_healthz(SimpleNamespace()))
+        body = json.loads(response.text)
+
+        assert response.status == 503
+        assert body["ok"] is False
+        assert body["bots"][0]["healthy"] is False
+        assert body["bots"][0]["heartbeatAckStale"] is True
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_message_updates_inbound_and_heartbeat_ack_times(bridge_module):
+    bot = make_bot(bridge_module)
+    first = bridge_module.now_ms()
+    second = first + 1234
+    values = [first, second]
+    bridge_module.now_ms = lambda: values.pop(0) if values else second
+
+    ping_req_id = "ping-1"
+    ping_future = bridge_module.create_request_future(bot, ping_req_id)
+    handled = await bridge_module.handle_wecom_message(
+        bot,
+        {"cmd": "ping", "headers": {"req_id": ping_req_id}, "errcode": 0, "errmsg": "ok"},
+    )
+
+    assert handled is None
+    assert ping_future.done() is True
+    assert bot.last_inbound_at_ms == first
+    assert bot.last_heartbeat_ack_at_ms == first
+
+    async def fake_enqueue_message(_bot, _key, _text, _req_id, **_kwargs):
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "msg-1"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "single",
+                "chatid": "user-a",
+                "text": {"content": "hello"},
+                "from": {"userid": "user-a"},
+            },
+        },
+    )
+
+    assert bot.last_inbound_at_ms == second
+    assert bot.last_heartbeat_ack_at_ms == first
 
 
 def test_api_healthz_reports_missing_enabled_persisted_bot(bridge_module):
