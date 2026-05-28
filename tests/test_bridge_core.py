@@ -2187,6 +2187,32 @@ async def test_send_ws_payload_with_ack_cleans_future_on_send_error(bridge_modul
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_loop_raises_when_ping_ack_times_out(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.config["enabled"] = True
+    bot.ws = SimpleNamespace(closed=False)
+
+    sleeps = 0
+
+    async def fake_sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise AssertionError("heartbeat loop did not stop after ack timeout")
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, timeout_sec, **kwargs):
+        raise bridge_module.BridgeError(504, f"websocket ack timeout ({payload['cmd']}:{timeout_sec})")
+
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    with pytest.raises(bridge_module.BridgeError, match="websocket ack timeout"):
+        await bridge_module.heartbeat_loop(bot)
+
+    assert any("heartbeat failed" in line for line in bot.logs)
+
+
+@pytest.mark.asyncio
 async def test_process_scheduled_messages_moves_due_job_to_processing_without_done(bridge_module):
     bot = make_bot(bridge_module)
     make_session(bridge_module, bot)
@@ -4184,6 +4210,34 @@ async def test_handle_wecom_message_updates_inbound_and_heartbeat_ack_times(brid
 
     assert bot.last_inbound_at_ms == second
     assert bot.last_heartbeat_ack_at_ms == first
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_message_logs_raw_inbound_summary(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.WECOM_RAW_INBOUND_LOG_ENABLED = True
+
+    async def fake_enqueue_message(_bot, _key, _text, _req_id, **_kwargs):
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "msg-raw-1"},
+            "body": {
+                "msgid": "m-1",
+                "msgtype": "text",
+                "chattype": "single",
+                "chatid": "user-a",
+                "text": {"content": "hello"},
+                "from": {"userid": "user-a"},
+            },
+        },
+    )
+
+    assert any("raw inbound:" in line and "reqId=msg-raw-1" in line and "msgid=m-1" in line for line in bot.logs)
 
 
 def test_api_healthz_reports_missing_enabled_persisted_bot(bridge_module):
@@ -6765,6 +6819,77 @@ async def test_run_codex_retries_fresh_exec_when_prompt_write_broken_pipe_occurs
     assert invocations[0][0].endswith("codex")
     assert invocations[1][1:2] == ["exec"]
     assert invocations[1][0].endswith("codex")
+    assert "resume" not in invocations[1]
+    assert sess.thread_id == "thread-from-second-exec"
+    assert payloads[-1] == (True, "final answer")
+
+
+@pytest.mark.asyncio
+async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    sess.thread_id = "019e6e10-fa64-73c2-9be5-4fdf694161ea"
+    payloads = []
+    invocations = []
+
+    class FakeProcess:
+        def __init__(self, *, returncode: int, stdout_events: list[dict[str, object]], stderr_lines: list[str]):
+            self.returncode = None
+            self._planned_returncode = returncode
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            for event in stdout_events:
+                self.stdout.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+            for line in stderr_lines:
+                self.stderr.feed_data((line + "\n").encode("utf-8"))
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        invocations.append(list(args))
+        if len(invocations) == 1:
+            return FakeProcess(
+                returncode=1,
+                stdout_events=[],
+                stderr_lines=[
+                    "2026-05-28T10:15:41.542083Z ERROR codex_core::session: failed to record rollout items: thread 019e6e10-fa64-73c2-9be5-4fdf694161ea not found"
+                ],
+            )
+        return FakeProcess(
+            returncode=0,
+            stdout_events=[
+                {"type": "thread.started", "thread_id": "thread-from-second-exec"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "final answer"}},
+            ],
+            stderr_lines=[],
+        )
+
+    async def fake_send_session_status(_bot, _key, _sess, _req_id, content):
+        payloads.append((False, content))
+        return True
+
+    async def fake_send_or_store_session_payload(_bot, _key, _sess, payload, final):
+        payloads.append((final, payload["body"]["stream"]["content"]))
+        return True
+
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payload", fake_send_or_store_session_payload)
+
+    await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
+
+    assert len(invocations) == 2
+    assert invocations[0][1:3] == ["exec", "resume"]
+    assert invocations[1][1:2] == ["exec"]
     assert "resume" not in invocations[1]
     assert sess.thread_id == "thread-from-second-exec"
     assert payloads[-1] == (True, "final answer")

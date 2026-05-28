@@ -108,6 +108,7 @@ SCHEDULE_PROCESSING_RETRY_MS = max(1000, int(os.environ.get("SCHEDULE_PROCESSING
 SCHEDULE_ORPHAN_TTL_MS = max(60000, int(os.environ.get("SCHEDULE_ORPHAN_TTL_MS", 86400000)))
 WECOM_INBOUND_IDLE_TIMEOUT_MS = max(60000, int(os.environ.get("WECOM_INBOUND_IDLE_TIMEOUT_MS", str(10 * 60 * 1000))))
 WECOM_HEARTBEAT_ACK_TIMEOUT_MS = max(30000, int(os.environ.get("WECOM_HEARTBEAT_ACK_TIMEOUT_MS", str(2 * 60 * 1000))))
+WECOM_RAW_INBOUND_LOG_ENABLED = str(os.environ.get("WECOM_RAW_INBOUND_LOG_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
 
 SESSION_TTL = 30 * 60
 SESSION_LEASE_TTL_MS = int(os.environ.get("SESSION_LEASE_TTL", 30000))
@@ -803,6 +804,24 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
         "heartbeatAckStale": heartbeat_ack_stale,
         "stopReason": bot.stop_reason,
     }
+
+
+def summarize_inbound_payload(payload: dict[str, Any]) -> str:
+    headers = payload.get("headers") or {}
+    body = payload.get("body") or {}
+    event = body.get("event") or {}
+    parts = [
+        f"cmd={str(payload.get('cmd') or '-').strip() or '-'}",
+        f"reqId={str(headers.get('req_id') or '-').strip() or '-'}",
+        f"msgtype={str(body.get('msgtype') or '-').strip() or '-'}",
+        f"chattype={str(body.get('chattype') or '-').strip() or '-'}",
+        f"chatid={str(body.get('chatid') or '-').strip() or '-'}",
+        f"from={message_sender_userid(payload)}",
+        f"msgid={str(body.get('msgid') or '-').strip() or '-'}",
+        f"eventtype={str(event.get('eventtype') or '-').strip() or '-'}",
+        f"errcode={payload.get('errcode') if payload.get('errcode') is not None else '-'}",
+    ]
+    return " ".join(parts)
 
 
 def supervise_bot_task(bot: BotState, attr_name: str, task_name: str, factory: Any) -> asyncio.Task:
@@ -3126,7 +3145,7 @@ async def run_codex(
                     and allow_fresh_fallback
                     and attempted_resume
                     and re.search(
-                        r"no rollout found|no prompt provid\w* via stdin",
+                        r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found",
                         "\n".join(part for part in (stderr_text, str(prompt_write_error or "")) if part),
                         re.I,
                     )
@@ -6239,6 +6258,8 @@ async def remove_bot(bot_id: str) -> None:
 
 async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
     bot.last_inbound_at_ms = now_ms()
+    if WECOM_RAW_INBOUND_LOG_ENABLED:
+        add_log(bot, f"raw inbound: {summarize_inbound_payload(message)}")
     req_id = ((message.get("headers") or {}).get("req_id"))
     if req_id and resolve_request_future(bot, req_id, message):
         if str(message.get("cmd") or "").strip().lower() == "ping":
@@ -6357,7 +6378,15 @@ async def heartbeat_loop(bot: BotState) -> None:
         await asyncio.sleep(30)
         if not bot.ws or bot.ws.closed:
             return
-        await send_ws_payload(bot, {"cmd": "ping", "headers": {"req_id": uid()}})
+        try:
+            await send_ws_payload_with_ack(
+                bot,
+                {"cmd": "ping", "headers": {"req_id": uid()}},
+                max(1, int(WECOM_HEARTBEAT_ACK_TIMEOUT_MS / 1000)),
+            )
+        except BridgeError as exc:
+            add_log(bot, f"WeCom heartbeat failed: {exc.message}")
+            raise
 
 
 async def bot_runner(bot: BotState) -> None:
