@@ -14,7 +14,7 @@ Chinese docs:
 
 - Maintains long-lived WeCom WebSocket connections
 - Manages multiple bot configurations and persistence
-- Starts `codex exec` and `codex exec resume` per session
+- Starts `codex exec` per session and attempts `codex exec resume` only when a runtime thread is still available
 - Supports built-in session control commands:
   `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`
 - Downloads inbound WeCom images and files into local workspaces

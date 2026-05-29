@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from dataclasses import replace
@@ -18,6 +19,10 @@ from .wecom_upload import ws_send_json
 
 STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
+_RESUME_STATE_MISSING_RE = re.compile(
+    r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found",
+    re.I,
+)
 
 
 def extract_codex_stdout_text(stdout: str) -> str:
@@ -46,6 +51,32 @@ def extract_codex_thread_id(stdout: str) -> str | None:
     return None
 
 
+def resume_state_missing(text: str) -> bool:
+    return bool(_RESUME_STATE_MISSING_RE.search(str(text or "")))
+
+
+def _read_execution_reply(output_file: Path, stdout_text: str, stderr_text: str) -> str:
+    if output_file.exists():
+        return output_file.read_text(encoding="utf-8").strip()
+    return extract_codex_stdout_text(stdout_text) or stdout_text.strip() or stderr_text.strip() or "(no output)"
+
+
+def _raise_for_failed_returncode(returncode: int, *, stdout_text: str, stderr_text: str) -> None:
+    if int(returncode) == 0:
+        return
+    detail = str(stderr_text or "").strip() or extract_codex_stdout_text(stdout_text) or str(stdout_text or "").strip()
+    if detail:
+        raise RuntimeError(f"codex exited with status {returncode}: {detail}")
+    raise RuntimeError(f"codex exited with status {returncode}")
+
+
+def _resume_fallback_error_text(stderr_text: str, prompt_error: Exception | None = None) -> str:
+    parts = [str(stderr_text or "").strip()]
+    if prompt_error is not None:
+        parts.append(str(prompt_error).strip())
+    return "\n".join(part for part in parts if part)
+
+
 def _clear_cached_runtime_payload(runtime, req_id: str, *, final: bool) -> None:
     if not req_id:
         return
@@ -66,6 +97,15 @@ def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
     current = _SESSION_RUN_LOCKS.get(session_id)
     if current is lock and not lock.locked():
         _SESSION_RUN_LOCKS.pop(session_id, None)
+
+
+def _resolve_launch_thread_id(bot_or_runtime, launch, message) -> str | None:
+    if hasattr(bot_or_runtime, "session_threads"):
+        thread_id = str(getattr(bot_or_runtime, "session_threads", {}).get(message.chat_key) or "").strip()
+        return thread_id or None
+    launch_thread_id = getattr(launch.session, "thread_id", None)
+    text = str(launch_thread_id or "").strip()
+    return text or None
 
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
@@ -132,137 +172,236 @@ async def flush_cached_runtime_payloads(runtime) -> None:
 
 
 async def run_text_message_once(config, bot, message, **kwargs):
-    launch = prepare_session_run(bot, message.chat_key)
+    launch = await asyncio.to_thread(prepare_session_run, bot, message.chat_key)
     prompt = build_prompt(bot, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     session_lock = _get_session_run_lock(launch.session.session_id)
     try:
         async with session_lock:
+            if hasattr(bot, "active_session_ids"):
+                bot.active_session_ids.add(launch.session.session_id)
             output_file.unlink(missing_ok=True)
             argv_override = kwargs.get("argv_override")
-            launch_thread_id = getattr(launch.session, "thread_id", None)
-            if argv_override is None and launch_thread_id:
-                argv_override = (
-                    "codex",
-                    "exec",
-                    "resume",
-                    "--skip-git-repo-check",
-                    "--json",
-                    "-o",
-                    str(output_file),
-                    launch_thread_id,
-                    "-",
+            launch_thread_id = kwargs.get("launch_thread_id_override")
+            if launch_thread_id is None:
+                launch_thread_id = _resolve_launch_thread_id(bot, launch, message)
+            allow_fresh_fallback = True
+            while True:
+                invocation_override = argv_override
+                attempted_resume = False
+                if invocation_override is None and launch_thread_id:
+                    attempted_resume = True
+                    invocation_override = (
+                        "codex",
+                        "exec",
+                        "resume",
+                        "--skip-git-repo-check",
+                        "--json",
+                        "-o",
+                        str(output_file),
+                        launch_thread_id,
+                        "-",
+                    )
+                invocation = build_runner_invocation(
+                    launch,
+                    prompt=prompt,
+                    output_file=output_file,
+                    argv_override=invocation_override,
                 )
-            invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=argv_override)
-            result = await asyncio.to_thread(run_invocation, invocation)
-            if output_file.exists():
-                reply = output_file.read_text(encoding="utf-8").strip()
-            else:
-                reply = extract_codex_stdout_text(result.stdout) or result.stdout.strip()
-            next_thread_id = extract_codex_thread_id(result.stdout) or launch_thread_id
-            update_session_record(
-                bot.runtime_root,
-                launch.session.session_id,
-                lambda current: replace(
-                    current,
-                    updated_at=int(time.time() * 1000),
-                    thread_id=next_thread_id,
-                    last_run_at=int(time.time() * 1000),
-                ),
-            )
+                result = await asyncio.to_thread(run_invocation, invocation)
+                stdout_text = str(result.stdout or "")
+                stderr_text = str(result.stderr or "")
+                if attempted_resume and allow_fresh_fallback and resume_state_missing(
+                    _resume_fallback_error_text(stderr_text)
+                ):
+                    launch_thread_id = None
+                    allow_fresh_fallback = False
+                    update_session_record(
+                        bot.runtime_root,
+                        launch.session.session_id,
+                        lambda current: replace(
+                            current,
+                            updated_at=int(time.time() * 1000),
+                        ),
+                    )
+                    output_file.unlink(missing_ok=True)
+                    continue
+                _raise_for_failed_returncode(
+                    int(getattr(result, "returncode", 0) or 0),
+                    stdout_text=stdout_text,
+                    stderr_text=stderr_text,
+                )
+                reply = _read_execution_reply(output_file, stdout_text, stderr_text)
+                next_thread_id = extract_codex_thread_id(stdout_text) or launch_thread_id
+                thread_state_sink = kwargs.get("thread_state_sink")
+                if callable(thread_state_sink):
+                    thread_state_sink(message.chat_key, next_thread_id)
+                update_session_record(
+                    bot.runtime_root,
+                    launch.session.session_id,
+                    lambda current: replace(
+                        current,
+                        updated_at=int(time.time() * 1000),
+                        last_run_at=int(time.time() * 1000),
+                    ),
+                )
+                break
     finally:
+        if hasattr(bot, "active_session_ids"):
+            getattr(bot, "active_session_ids").discard(launch.session.session_id)
         _release_session_run_lock(launch.session.session_id, session_lock)
     return launch.session.session_id, reply
 
 
 async def stream_text_message_once(config, runtime, message, **kwargs):
-    launch = prepare_session_run(runtime.config, message.chat_key)
+    launch = await asyncio.to_thread(prepare_session_run, runtime.config, message.chat_key)
     prompt = build_prompt(runtime.config, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     session_lock = _get_session_run_lock(launch.session.session_id)
     try:
         async with session_lock:
+            runtime.active_session_ids.add(launch.session.session_id)
             output_file.unlink(missing_ok=True)
             argv_override = kwargs.get("argv_override")
-            launch_thread_id = getattr(launch.session, "thread_id", None)
-            if argv_override is None and launch_thread_id:
-                argv_override = (
-                    "codex",
-                    "exec",
-                    "resume",
-                    "--skip-git-repo-check",
-                    "--json",
-                    "-o",
-                    str(output_file),
-                    launch_thread_id,
-                    "-",
+            launch_thread_id = _resolve_launch_thread_id(runtime, launch, message)
+            allow_fresh_fallback = True
+            while True:
+                invocation_override = argv_override
+                invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=invocation_override)
+                attempted_resume = False
+                if invocation_override is None and launch_thread_id:
+                    attempted_resume = True
+                    invocation_override = (
+                        "codex",
+                        "exec",
+                        "resume",
+                        "--skip-git-repo-check",
+                        "--json",
+                        "-o",
+                        str(output_file),
+                        launch_thread_id,
+                        "-",
+                    )
+                    invocation = build_runner_invocation(
+                        launch,
+                        prompt=prompt,
+                        output_file=output_file,
+                        argv_override=invocation_override,
+                    )
+                process = await asyncio.create_subprocess_exec(
+                    *invocation.argv,
+                    cwd=invocation.cwd,
+                    env=invocation.env,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-            process = await asyncio.create_subprocess_exec(
-                *(argv_override or ("python", "-c", "print('done')")),
-                cwd=launch.cwd,
-                env=launch.env,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            runtime.active_processes[message.chat_key] = process
-            if process.stdin is not None:
-                process.stdin.write(prompt.encode("utf-8"))
-                await process.stdin.drain()
-                process.stdin.close()
-            await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 0s。", final=False)
+                runtime.active_processes[message.chat_key] = process
+                await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 0s。", final=False)
 
-            async def ticker() -> None:
-                await asyncio.sleep(STATUS_STREAM_INTERVAL_SEC)
-                await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 1s。", final=False)
+                async def ticker() -> None:
+                    await asyncio.sleep(STATUS_STREAM_INTERVAL_SEC)
+                    await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 1s。", final=False)
 
-            ticker_task = asyncio.create_task(ticker())
-            try:
-                if hasattr(process, "communicate"):
-                    stdout_data, _stderr_data = await process.communicate()
-                else:
-                    await process.wait()
-                    stdout_data = await process.stdout.read() if process.stdout is not None else b""
-            finally:
-                if getattr(process, "returncode", None) is None and hasattr(process, "terminate"):
-                    with __import__("contextlib").suppress(Exception):
-                        process.terminate()
-                    wait_method = getattr(process, "wait", None)
-                    if callable(wait_method):
+                ticker_task = asyncio.create_task(ticker())
+                prompt_write_error: Exception | None = None
+                stderr_data = b""
+                try:
+                    if process.stdin is not None:
+                        try:
+                            process.stdin.write(prompt.encode("utf-8"))
+                            await process.stdin.drain()
+                        except Exception as exc:
+                            prompt_write_error = exc
+                        finally:
+                            with __import__("contextlib").suppress(Exception):
+                                process.stdin.close()
+                    if hasattr(process, "communicate"):
+                        stdout_data, stderr_data = await process.communicate()
+                    else:
+                        await process.wait()
+                        stdout_data = await process.stdout.read() if process.stdout is not None else b""
+                        stderr_data = await process.stderr.read() if process.stderr is not None else b""
+                finally:
+                    if getattr(process, "returncode", None) is None and hasattr(process, "terminate"):
                         with __import__("contextlib").suppress(Exception):
-                            await wait_method()
-                runtime.active_processes.pop(message.chat_key, None)
-                if not ticker_task.done():
-                    ticker_task.cancel()
-                    try:
-                        await ticker_task
-                    except asyncio.CancelledError:
-                        pass
-            text = (stdout_data or b"").decode("utf-8", "ignore").strip()
-            reply = extract_codex_stdout_text(text)
-            if output_file.exists():
-                reply = output_file.read_text(encoding="utf-8").strip()
-            reply = reply or text
-            next_thread_id = extract_codex_thread_id(text) or launch_thread_id
-            update_session_record(
-                runtime.config.runtime_root,
-                launch.session.session_id,
-                lambda current: replace(
-                    current,
-                    updated_at=int(time.time() * 1000),
-                    thread_id=next_thread_id,
-                    last_run_at=int(time.time() * 1000),
-                ),
-            )
-            await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, reply, final=True)
+                            process.terminate()
+                        wait_method = getattr(process, "wait", None)
+                        if callable(wait_method):
+                            with __import__("contextlib").suppress(Exception):
+                                await wait_method()
+                    runtime.active_processes.pop(message.chat_key, None)
+                    if not ticker_task.done():
+                        ticker_task.cancel()
+                        try:
+                            await ticker_task
+                        except asyncio.CancelledError:
+                            pass
+                text = (stdout_data or b"").decode("utf-8", "ignore").strip()
+                stderr_text = (stderr_data or b"").decode("utf-8", "ignore").strip()
+                if attempted_resume and allow_fresh_fallback and resume_state_missing(
+                    _resume_fallback_error_text(stderr_text, prompt_write_error)
+                ):
+                    launch_thread_id = None
+                    runtime.session_threads.pop(message.chat_key, None)
+                    allow_fresh_fallback = False
+                    update_session_record(
+                        runtime.config.runtime_root,
+                        launch.session.session_id,
+                        lambda current: replace(
+                            current,
+                            updated_at=int(time.time() * 1000),
+                        ),
+                    )
+                    output_file.unlink(missing_ok=True)
+                    continue
+                if prompt_write_error is not None:
+                    raise prompt_write_error
+                _raise_for_failed_returncode(
+                    int(getattr(process, "returncode", 0) or 0),
+                    stdout_text=text,
+                    stderr_text=stderr_text,
+                )
+                reply = _read_execution_reply(output_file, text, stderr_text)
+                next_thread_id = extract_codex_thread_id(text) or launch_thread_id
+                if next_thread_id:
+                    runtime.session_threads[message.chat_key] = next_thread_id
+                else:
+                    runtime.session_threads.pop(message.chat_key, None)
+                update_session_record(
+                    runtime.config.runtime_root,
+                    launch.session.session_id,
+                    lambda current: replace(
+                        current,
+                        updated_at=int(time.time() * 1000),
+                        last_run_at=int(time.time() * 1000),
+                    ),
+                )
+                await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, reply, final=True)
+                break
     finally:
+        runtime.active_session_ids.discard(launch.session.session_id)
         _release_session_run_lock(launch.session.session_id, session_lock)
     return launch.session.session_id, reply
 
 
 async def execute_and_deliver_message(config, runtime, message, **kwargs):
-    session_id, reply = await run_text_message_once(config, runtime.config, message, **kwargs)
+    def sink(chat_key: str, thread_id: str | None) -> None:
+        text = str(thread_id or "").strip()
+        if text:
+            runtime.session_threads[chat_key] = text
+        else:
+            runtime.session_threads.pop(chat_key, None)
+
+    session_id, reply = await run_text_message_once(
+        config,
+        runtime.config,
+        message,
+        launch_thread_id_override=str(runtime.session_threads.get(message.chat_key) or "").strip() or None,
+        thread_state_sink=sink,
+        **kwargs,
+    )
     await send_or_cache_runtime_payload(runtime, message, session_id, reply, final=True)
     return session_id, reply

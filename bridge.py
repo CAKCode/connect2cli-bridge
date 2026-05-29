@@ -34,6 +34,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
+from workspace_bridge import codex_runtime
 
 
 def resolve_shared_runtime_root(base_dir: Optional[Path] = None) -> Path:
@@ -108,6 +109,7 @@ SCHEDULE_PROCESSING_RETRY_MS = max(1000, int(os.environ.get("SCHEDULE_PROCESSING
 SCHEDULE_ORPHAN_TTL_MS = max(60000, int(os.environ.get("SCHEDULE_ORPHAN_TTL_MS", 86400000)))
 WECOM_INBOUND_IDLE_TIMEOUT_MS = max(60000, int(os.environ.get("WECOM_INBOUND_IDLE_TIMEOUT_MS", str(10 * 60 * 1000))))
 WECOM_HEARTBEAT_ACK_TIMEOUT_MS = max(30000, int(os.environ.get("WECOM_HEARTBEAT_ACK_TIMEOUT_MS", str(2 * 60 * 1000))))
+WECOM_DISCONNECT_GRACE_MS = max(1000, int(os.environ.get("WECOM_DISCONNECT_GRACE_MS", "15000")))
 WECOM_RAW_INBOUND_LOG_ENABLED = str(os.environ.get("WECOM_RAW_INBOUND_LOG_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
 
 SESSION_TTL = 30 * 60
@@ -774,12 +776,22 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
         and heartbeat_ack_idle_ms is not None
         and heartbeat_ack_idle_ms >= WECOM_HEARTBEAT_ACK_TIMEOUT_MS
     )
+    disconnect_grace_active = bool(
+        bot.status == "disconnected"
+        and bot.last_disconnect_at_ms is not None
+        and now - bot.last_disconnect_at_ms < WECOM_DISCONNECT_GRACE_MS
+    )
     healthy = (
         bool(bot.config.get("enabled", True))
-        and bot.status in {"running", "connecting", "standby"}
+        and bot.status in {"running", "connecting", "standby", "disconnected"}
         and not runner_done
         and not upload_done
-        and (bot.status == "standby" or ws_connected or bot.status == "connecting")
+        and (
+            bot.status == "standby"
+            or ws_connected
+            or bot.status == "connecting"
+            or disconnect_grace_active
+        )
         and not inbound_stale
         and not heartbeat_ack_stale
     )
@@ -802,6 +814,7 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
         "heartbeatAckIdleMs": heartbeat_ack_idle_ms,
         "inboundStale": inbound_stale,
         "heartbeatAckStale": heartbeat_ack_stale,
+        "disconnectGraceActive": disconnect_grace_active,
         "stopReason": bot.stop_reason,
     }
 
@@ -950,6 +963,32 @@ def maybe_migrate_legacy_instance_runtime_state() -> None:
 
 def remove_session_codex_home(session_id: str) -> None:
     remove_tree_if_exists(get_session_codex_home_root(session_id))
+
+
+def cleanup_orphan_session_codex_homes() -> int:
+    sessions_root = get_bridge_codex_home_root() / "sessions"
+    if not sessions_root.exists():
+        return 0
+    persisted_session_ids: set[str] = set()
+    registry_root = SESSION_REGISTRY_ROOT / "sessions"
+    if registry_root.exists():
+        for session_file in registry_root.glob("*.json"):
+            record = normalize_session_record(read_json_file(session_file, None))
+            if record:
+                persisted_session_ids.add(str(record["sessionId"]))
+    removed = 0
+    for child in sessions_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name in persisted_session_ids:
+            continue
+        remove_tree_if_exists(child)
+        removed += 1
+    return removed
+
+
+def cleanup_stale_session_codex_homes(current_ms: Optional[int] = None) -> int:
+    return 0
 
 
 def get_registry_key_file(bot_id: str, key: str) -> Path:
@@ -1261,6 +1300,15 @@ def ensure_session_workspace_dirs(bot: BotState, key: str) -> dict[str, Optional
     return paths
 
 
+def ensure_session_workspace_dirs_light(bot: BotState, key: str) -> dict[str, Optional[Path]]:
+    paths = get_session_workspace_paths(bot, key)
+    for path in (paths["chatfile"], paths["workfile"], paths["roomfile"]):
+        if path is not None:
+            ensure_dir(path)
+    ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key)))
+    return paths
+
+
 def get_workspace_codex_skills_dir(workspace_dir: Path) -> Path:
     return (workspace_dir / ".codex" / "skills").resolve()
 
@@ -1447,7 +1495,6 @@ def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[
         "sessionId": session_id,
         "botId": bot_id,
         "chatKey": chat_key,
-        "threadId": str(record.get("threadId") or "").strip() or None,
         "lockFile": lock_file,
         "createdAt": created_at,
         "updatedAt": updated_at,
@@ -1904,6 +1951,14 @@ def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
     return text.strip()
 
 
+def normalize_bridge_command_text(content: str, bot_name: Optional[str] = None) -> str:
+    text = strip_text_mentions(content, bot_name)
+    if text.startswith("/bridge-"):
+        return text
+    fallback = LEADING_MENTION_RE.sub("", content or "", count=1).strip()
+    return fallback if fallback.startswith("/bridge-") else (content or "").strip()
+
+
 def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
     body = message.get("body") or {}
     msg_type = str(body.get("msgtype") or "").strip()
@@ -1951,7 +2006,7 @@ def validate_chat_key(key: Any, *, label: str = "chatKey") -> str:
 
 def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
     chat_type = "group" if chat_key_is_group(key) else "single"
-    workspace_paths = ensure_session_workspace_dirs(bot, key)
+    workspace_paths = ensure_session_workspace_dirs_light(bot, key)
     runtime_cwd = get_session_runtime_cwd(bot, key)
     workspace_codex_skills_dir = get_workspace_codex_skills_dir(runtime_cwd)
     bridge_global_skills_dir = get_session_global_skills_root(sess.session_id)
@@ -2824,7 +2879,7 @@ async def download_incoming_media(
         if len(data) > inbound_limit:
             raise BridgeError(413, f"{kind} too large after decrypt: {len(data)} bytes")
 
-    target_dir = ensure_session_workspace_dirs(bot, key)["chatfile"]
+    target_dir = ensure_session_workspace_dirs_light(bot, key)["chatfile"]
     assert target_dir is not None
     ext = extension_from_url(url) or extension_from_content_type(response.get("contentType", ""), ".jpg" if kind == "image" else ".bin")
     file_name = sanitize_file_name(
@@ -2868,7 +2923,6 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
             session_id=record["sessionId"],
             work_dir=str(get_session_runtime_cwd(bot, key)),
             lock_file=Path(record["lockFile"]),
-            thread_id=record.get("threadId"),
         )
         bot.sessions[key] = sess
         add_log(bot, f"[{key}] new session")
@@ -2876,7 +2930,13 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
     sess = bot.sessions[key]
     sess.work_dir = str(get_session_runtime_cwd(bot, key))
     sess.last_active = time.time()
-    ensure_session_workspace_dirs(bot, key)
+    return sess
+
+
+async def get_or_create_session_ready(bot: BotState, key: str) -> SessionState:
+    sess = get_or_create_session(bot, key)
+    await asyncio.to_thread(ensure_session_workspace_dirs, bot, key)
+    sess.work_dir = str(get_session_runtime_cwd(bot, key))
     return sess
 
 
@@ -3010,8 +3070,8 @@ async def run_codex(
                     args = build_codex_base_args(output_file, image_paths, resume=False)
                     args.append("-")
 
-                workspace_paths = ensure_session_workspace_dirs(bot, key)
-                codex_home = build_codex_home_for_subprocess(sess.session_id)
+                workspace_paths = await asyncio.to_thread(ensure_session_workspace_dirs, bot, key)
+                codex_home = await asyncio.to_thread(build_codex_home_for_subprocess, sess.session_id)
                 env = dict(os.environ)
                 env.update(
                     {
@@ -3039,6 +3099,7 @@ async def run_codex(
                         "TEMP": str(workspace_paths["chatfile"]),
                     }
                 )
+                env = codex_runtime.prepare_codex_subprocess_env(env, command=args[0] if args else None)
 
                 process = await asyncio.create_subprocess_exec(
                     *args,
@@ -3092,7 +3153,6 @@ async def run_codex(
                             continue
                         if event.get("type") == "thread.started" and event.get("thread_id"):
                             sess.thread_id = event["thread_id"]
-                            update_session_record(sess.session_id, lambda record: {**record, "threadId": event["thread_id"]})
                         if event.get("type") == "item.completed" and ((event.get("item") or {}).get("type") == "agent_message"):
                             text = ((event.get("item") or {}).get("text") or "").strip()
                             if text:
@@ -3138,18 +3198,17 @@ async def run_codex(
                             pass
 
                 stderr_text = "\n".join(stderr_parts)
-                if prompt_write_error is not None and return_code == 0:
-                    raise prompt_write_error
-                if (
-                    return_code != 0
-                    and allow_fresh_fallback
+                resume_error_text = "\n".join(part for part in (stderr_text, str(prompt_write_error or "")) if part)
+                resume_state_missing = (
+                    allow_fresh_fallback
                     and attempted_resume
                     and re.search(
                         r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found",
-                        "\n".join(part for part in (stderr_text, str(prompt_write_error or "")) if part),
+                        resume_error_text,
                         re.I,
                     )
-                ):
+                )
+                if resume_state_missing:
                     add_log(bot, f"[{key}] codex resume state missing, fallback to fresh exec")
                     sess.proc = None
                     sess.thread_id = None
@@ -3157,7 +3216,6 @@ async def run_codex(
                         sess.session_id,
                         lambda record: {
                             **record,
-                            "threadId": None,
                             "status": "starting",
                             "activeScheduleId": active_schedule_id,
                         },
@@ -3170,6 +3228,8 @@ async def run_codex(
                     allow_fresh_fallback = False
                     process_started = False
                     continue
+                if prompt_write_error is not None and return_code == 0:
+                    raise prompt_write_error
                 if prompt_write_error is not None:
                     raise prompt_write_error
 
@@ -3227,7 +3287,6 @@ async def run_codex(
             sess.session_id,
             lambda record: {
                 **record,
-                "threadId": sess.thread_id or record.get("threadId"),
                 "status": "idle" if return_code == 0 else "error",
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
@@ -3306,7 +3365,6 @@ async def run_codex(
                 sess.session_id,
                 lambda record: {
                     **record,
-                    "threadId": sess.thread_id or record.get("threadId"),
                     "status": "error",
                     "activeScheduleId": None,
                     "lastRunAt": now_ms(),
@@ -3425,6 +3483,7 @@ def interrupt_session(
         sess.pending_media.clear()
         sess.pending_media_notes.clear()
         sess.pending_media_downloads = 0
+        remove_session_codex_home(sess.session_id)
     sess.pending_stream_payload = None
     sess.pending_stream_payloads = None
     sess.pending_final_payload = None
@@ -3441,7 +3500,6 @@ def interrupt_session(
             sess.session_id,
             lambda record: {
                 **record,
-                "threadId": None if clear_thread else (sess.thread_id or record.get("threadId")),
                 "ownerInstance": INSTANCE_ID,
                 "ownerPid": os.getpid(),
                 "leaseExpiresAt": lease_expires_at or record.get("leaseExpiresAt"),
@@ -3456,7 +3514,6 @@ def interrupt_session(
             sess.session_id,
             lambda record: {
                 **record,
-                "threadId": None if clear_thread else (sess.thread_id or record.get("threadId")),
                 "ownerInstance": None,
                 "ownerPid": None,
                 "leaseExpiresAt": None,
@@ -3545,7 +3602,11 @@ def build_resume_candidates(bot: BotState, key: str) -> list[dict[str, Any]]:
     seen_session_ids: set[str] = set()
     for record in session_records_for_bot(bot.config["id"]):
         session_id = str(record["sessionId"])
-        thread_id = str(record.get("threadId") or "").strip()
+        runtime_session = next(
+            (sess for sess in bot.sessions.values() if sess.session_id == session_id and str(sess.thread_id or "").strip()),
+            None,
+        )
+        thread_id = str(runtime_session.thread_id or "").strip() if runtime_session else ""
         candidate_key = str(record.get("chatKey") or "").strip()
         if not thread_id or not candidate_key or session_id in seen_session_ids:
             continue
@@ -3621,18 +3682,8 @@ def bind_resume_candidate_to_session(
     target_record = read_session_record_by_id(str(candidate["sessionId"]))
     if not target_record:
         raise BridgeError(404, f"session not found: {candidate['sessionId']}")
-    target_thread_id = str(target_record.get("threadId") or "").strip()
-    if not target_thread_id:
-        raise BridgeError(404, "selected session no longer has a resumable thread")
-    sess.thread_id = target_thread_id
-    update_session_record(
-        sess.session_id,
-        lambda record: {
-            **record,
-            "threadId": target_thread_id,
-            "lastRunAt": now_ms(),
-        },
-    )
+    sess.thread_id = thread_id
+    update_session_record(sess.session_id, lambda record: {**record, "lastRunAt": now_ms()})
     clear_resume_selection(sess)
     add_log(
         bot,
@@ -3641,7 +3692,7 @@ def bind_resume_candidate_to_session(
     return {
         "sourceSessionId": target_record["sessionId"],
         "sourceChatKey": target_record["chatKey"],
-        "threadId": target_thread_id,
+        "threadId": thread_id,
     }
 
 
@@ -3701,7 +3752,17 @@ async def resume_session_command(bot: BotState, key: str, req_id: Optional[str],
     candidate = {
         "sessionId": record["sessionId"],
         "chatKey": candidate_key,
-        "threadId": str(record.get("threadId") or "").strip(),
+        "threadId": str(
+            next(
+                (
+                    runtime_sess.thread_id
+                    for runtime_sess in bot.sessions.values()
+                    if runtime_sess.session_id == record["sessionId"] and str(runtime_sess.thread_id or "").strip()
+                ),
+                "",
+            )
+            or ""
+        ).strip(),
         "updatedAt": int(record.get("updatedAt") or record.get("createdAt") or 0),
         "lastRunAt": int(record.get("lastRunAt") or 0),
         "status": str(record.get("status") or "idle"),
@@ -3729,7 +3790,7 @@ async def status_session_command(bot: BotState, key: str, req_id: Optional[str])
             f"queue=0; "
             f"scheduled={scheduled_count}; "
             f"sessionId={record['sessionId']}; "
-            f"threadId={record.get('threadId') or '-'}"
+            f"threadId=-"
         )
     else:
         status_text = f"status=empty; queue=0; scheduled={scheduled_count}; sessionId=-; threadId=-"
@@ -3778,6 +3839,10 @@ def control_session(bot: BotState, key: str, clear_thread: bool, clear_chat: boo
 
     record = read_session_record_by_key(bot.config["id"], key)
     if not record:
+        record = find_session_record_by_bot_and_key(bot.config["id"], key)
+        if record:
+            write_json_atomic(get_registry_key_file(bot.config["id"], key), build_session_key_entry(record))
+    if not record:
         raise BridgeError(404, f"session not found: {key}")
     ensure_session_control_safe(record)
 
@@ -3785,7 +3850,6 @@ def control_session(bot: BotState, key: str, clear_thread: bool, clear_chat: boo
         record["sessionId"],
         lambda current: {
             **current,
-            "threadId": None if clear_thread else current.get("threadId"),
             "ownerInstance": None,
             "ownerPid": None,
             "leaseExpiresAt": None,
@@ -3802,7 +3866,7 @@ def control_session(bot: BotState, key: str, clear_thread: bool, clear_chat: boo
     return {
         "key": key,
         "sessionId": record["sessionId"],
-        "threadId": None if clear_thread else record.get("threadId"),
+        "threadId": None,
         "status": "idle",
         "clearedThread": clear_thread,
         "clearedChat": clear_chat,
@@ -3823,7 +3887,7 @@ def is_path_inside(file_path: Path, root_path: Path) -> bool:
 
 
 def get_allowed_file_roots(bot: BotState, key: str) -> list[Path]:
-    workspace_paths = ensure_session_workspace_dirs(bot, key)
+    workspace_paths = ensure_session_workspace_dirs_light(bot, key)
     roots = [workspace_paths["chatfile"].resolve(), *EXTRA_FILE_ROOTS]
     deduped = []
     for root in roots:
@@ -5995,18 +6059,20 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
     bridge_home = get_session_codex_home_root(session_id)
     ensure_dir(bridge_home)
 
+    allowed_root_files = {"auth.json", "config.toml", "version.json", "installation_id"}
     if base_home.exists():
         for child in sorted(base_home.iterdir(), key=lambda item: item.name):
             # Skip volatile runtime trees. They are recreated per session and may
             # contain short-lived sandbox binaries that disappear while copying.
             if child.name in {"skills", "sessions", "tmp"}:
                 continue
-            destination = bridge_home / child.name
+            if child.is_file() and child.name not in allowed_root_files:
+                continue
             if child.is_dir():
-                shutil.copytree(child, destination, dirs_exist_ok=True)
-            else:
-                ensure_dir_for(destination)
-                shutil.copy2(child, destination)
+                continue
+            destination = bridge_home / child.name
+            ensure_dir_for(destination)
+            shutil.copy2(child, destination)
 
     ensure_dir(bridge_home / "sessions")
     ensure_dir(bridge_home / "tmp")
@@ -6294,22 +6360,23 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
 
     if command == "aibot_msg_callback" and msg_type == "text":
         content = strip_text_mentions(((body.get("text") or {}).get("content") or ""), bot.config.get("name"))
+        command_text = normalize_bridge_command_text(((body.get("text") or {}).get("content") or ""), bot.config.get("name"))
         key = chat_key_for_bot(bot, message)
         add_log(bot, f'recv: "{content}" {key}')
         try:
-            if content == "/bridge-resume":
+            if command_text == "/bridge-resume":
                 await start_resume_selection_command(bot, key, req_id)
                 return
-            if content.startswith("/bridge-resume "):
-                await resume_session_command(bot, key, req_id, content.split(None, 1)[1].strip())
+            if command_text.startswith("/bridge-resume "):
+                await resume_session_command(bot, key, req_id, command_text.split(None, 1)[1].strip())
                 return
-            if content == "/bridge-interrupt":
+            if command_text == "/bridge-interrupt":
                 await interrupt_session_command(bot, key, req_id)
                 return
-            if content == "/bridge-reset":
+            if command_text == "/bridge-reset":
                 await reset_session_command(bot, key, req_id)
                 return
-            if content == "/bridge-status":
+            if command_text == "/bridge-status":
                 await status_session_command(bot, key, req_id)
                 return
             current_sess = bot.sessions.get(key)
@@ -6350,6 +6417,16 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
                 "body": {"msgtype": "text", "text": {"content": welcome}},
             },
         )
+        return
+
+    if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "disconnected_event"):
+        bot.status = "disconnected"
+        bot.last_disconnect_at_ms = now_ms()
+        add_log(bot, "WeCom disconnected event received")
+        add_event_log(bot, "wecom.disconnected_event")
+        if bot.ws and not bot.ws.closed:
+            await bot.ws.close()
+        return
 
 
 async def ws_reader_loop(bot: BotState, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -6535,7 +6612,7 @@ async def enqueue_message(
     schedule_request_id: Optional[str] = None,
 ) -> bool:
     try:
-        sess = get_or_create_session(bot, key)
+        sess = await get_or_create_session_ready(bot, key)
     except Exception as exc:
         if not silent_lease_failure:
             add_log(bot, f"[{key}] init failed: {exc}")
@@ -6584,7 +6661,7 @@ async def enqueue_media_message(bot: BotState, message: dict[str, Any], kind: st
     key = chat_key_for_bot(bot, message)
     req_id = ((message.get("headers") or {}).get("req_id"))
     try:
-        sess = get_or_create_session(bot, key)
+        sess = await get_or_create_session_ready(bot, key)
     except Exception as exc:
         add_log(bot, f"[{key}] media session init failed: {exc}")
         await respond_queued_error(bot, req_id, f"init failed: {exc}")
@@ -6616,7 +6693,7 @@ async def enqueue_mixed_message(bot: BotState, message: dict[str, Any]) -> None:
     key = chat_key_for_bot(bot, message)
     req_id = ((message.get("headers") or {}).get("req_id"))
     try:
-        sess = get_or_create_session(bot, key)
+        sess = await get_or_create_session_ready(bot, key)
     except Exception as exc:
         add_log(bot, f"[{key}] mixed session init failed: {exc}")
         await respond_queued_error(bot, req_id, f"init failed: {exc}")
@@ -6655,6 +6732,7 @@ async def session_recycler_loop() -> None:
         try:
             await asyncio.sleep(60)
             now = time.time()
+            cleanup_stale_session_codex_homes(int(now * 1000))
             for bot in list(BOTS.values()):
                 for key, sess in list(bot.sessions.items()):
                     if not sess.running and now - sess.last_active > SESSION_TTL:
@@ -7277,6 +7355,8 @@ async def main() -> None:
     maybe_migrate_legacy_instance_runtime_state()
     sync_project_shared_skills_to_bridge_global()
     sanitize_all_session_records()
+    cleanup_orphan_session_codex_homes()
+    cleanup_stale_session_codex_homes()
 
     await load_bots()
 

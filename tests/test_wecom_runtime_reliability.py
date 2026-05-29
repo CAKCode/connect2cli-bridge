@@ -24,6 +24,7 @@ def make_runtime() -> WeComBotRuntime:
         runtime_root=__import__("pathlib").Path("."),
         global_skill_dir=__import__("pathlib").Path("."),
         chatfile_root=__import__("pathlib").Path("."),
+        codex_exec_mode="sandboxed",
     )
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
     runtime.ws = FakeWS()

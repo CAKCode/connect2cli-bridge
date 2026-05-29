@@ -59,6 +59,68 @@ async def test_process_due_schedules_once_executes_due_schedule(tmp_path, monkey
     assert len(done_files) == 1
 
 
+async def test_process_due_schedules_once_records_failed_definition_delivery(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    create_one_shot_schedule(
+        config.runtime_root,
+        schedule_id="schedule-1",
+        chat_key="single:alice",
+        message="hello",
+        run_at_ms=0,
+    )
+
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
+        raise RuntimeError("delivery failed")
+
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
+    executed = await process_due_schedules_once(config)
+
+    assert executed == []
+    failed_files = list(schedule_failed_root(config.runtime_root).glob("*.json"))
+    assert len(failed_files) == 1
+    payload = json.loads(failed_files[0].read_text(encoding="utf-8"))
+    assert payload["scheduleId"] == "schedule-1"
+    assert payload["error"] == "delivery failed"
+    from workspace_bridge.schedule import read_schedule_definition
+
+    updated = read_schedule_definition(config.runtime_root, "schedule-1")
+    assert updated is not None
+    assert updated.enabled is True
+    assert updated.next_run_at == 0
+
+
+async def test_process_due_schedules_once_reschedules_failed_cron_delivery(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.schedule import create_schedule_definition, read_schedule_definition
+
+    create_schedule_definition(
+        config.runtime_root,
+        schedule_id="schedule-1",
+        chat_key="single:alice",
+        message="hello",
+        cron="*/5 * * * *",
+        timezone_name="UTC",
+    )
+    definition = read_schedule_definition(config.runtime_root, "schedule-1")
+    assert definition is not None
+    from workspace_bridge.schedule import write_schedule_definition
+
+    write_schedule_definition(config.runtime_root, definition.__class__(**{**definition.__dict__, "next_run_at": 0}))
+
+    async def fake_execute_and_deliver_message(_config, _runtime, _message, **_kwargs):
+        raise RuntimeError("delivery failed")
+
+    monkeypatch.setattr("workspace_bridge.schedule_runtime.execute_and_deliver_message", fake_execute_and_deliver_message)
+    executed = await process_due_schedules_once(config)
+
+    assert executed == []
+    failed_files = list(schedule_failed_root(config.runtime_root).glob("*.json"))
+    assert len(failed_files) == 1
+    updated = read_schedule_definition(config.runtime_root, "schedule-1")
+    assert updated is not None
+    assert updated.next_run_at > 0
+
+
 async def test_process_due_schedules_once_skips_missed_when_policy_demands(tmp_path, monkeypatch) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.schedule import write_schedule_definition, ScheduleDefinition

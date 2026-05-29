@@ -70,6 +70,11 @@ async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
     assert health_payload["pendingFinals"] == 0
     assert health_payload["replyStates"] == 0
 
+    healthz_match = next(route for route in app.router.routes() if route.method == "GET" and route.resource.canonical == "/healthz")
+    healthz_response = await healthz_match.handler(health_request)
+    healthz_payload = json.loads(healthz_response.text)
+    assert healthz_payload["ok"] is True
+
     class JsonRequest:
         def __init__(self, app):
             self.app = app
@@ -130,3 +135,38 @@ def test_load_app_accepts_aiohttp_web_factory_signature(tmp_path: Path) -> None:
     app = load_app([], env_file=env_file)
 
     assert app is not None
+
+
+async def test_service_startup_cleans_orphan_session_codex_homes(tmp_path: Path, monkeypatch) -> None:
+    from workspace_bridge import service as service_module
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+        }
+    )
+    app = create_app(config)
+    calls = {"orphan": [], "stale": []}
+
+    monkeypatch.setattr(service_module, "cleanup_orphan_session_codex_homes", lambda runtime_root: calls["orphan"].append(runtime_root) or 0)
+    monkeypatch.setattr(
+        service_module,
+        "cleanup_stale_session_codex_homes",
+        lambda runtime_root, current_ms, ttl_ms, active_session_ids=None: calls["stale"].append((runtime_root, ttl_ms, active_session_ids)) or 0,
+    )
+
+    for callback in app.on_startup:
+        await callback(app)
+
+    assert calls["orphan"] == [config.runtime_root]
+    assert calls["stale"] == []
+
+    for callback in app.on_cleanup:
+        await callback(app)

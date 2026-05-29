@@ -50,7 +50,7 @@ Important constraint:
 Implemented:
 
 - session persistence with `sessionId`
-- Codex thread resume with `threadId`
+- runtime-scoped Codex thread reuse when a live thread is still available
 - chat queue management
 - session lease model to coordinate work across processes
 
@@ -81,7 +81,7 @@ This allows the bridge to support both collaborative room workflows and isolated
 Implemented:
 
 - `codex exec`
-- `codex exec resume`
+- `codex exec resume` as a runtime-scoped resume attempt
 - execution mode switch through `CODEX_EXEC_MODE`
 - global concurrency limit through `MAX_CONCURRENT_CODEX_RUNS`
 

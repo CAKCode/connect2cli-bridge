@@ -131,6 +131,7 @@ async def test_bridge_status_command_returns_runtime_status(tmp_path) -> None:
 
 async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import prepare_session_run, session_codex_home_root
 
     class FakeProcess:
         def __init__(self) -> None:
@@ -146,6 +147,9 @@ async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
     process = FakeProcess()
     bot.active_processes["single:alice"] = process
     get_or_create_reply_state(bot, "req-running", "session-1", "single:alice")
+    launch = prepare_session_run(bot.config, "single:alice")
+    session_home = session_codex_home_root(bot.config.runtime_root) / launch.session.session_id
+    session_home.mkdir(parents=True, exist_ok=True)
 
     async def fake_handler(*_args, **_kwargs):
         raise AssertionError("handler should not be called for bridge command")
@@ -165,6 +169,7 @@ async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
     assert bot.reply_states == {}
     assert process.terminated is True
     assert ws.sent[0]["body"]["stream"]["content"] == "Session reset."
+    assert session_home.exists() is False
 
 
 async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> None:
@@ -288,10 +293,52 @@ async def test_bridge_interrupt_command_terminates_active_process(tmp_path) -> N
     assert process.terminated is True
 
 
+async def test_bridge_interrupt_command_cancels_active_message_task(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    bot.ws = ws
+    process = FakeProcess()
+    task = asyncio.create_task(asyncio.sleep(3600))
+    bot.active_processes["single:alice"] = process
+    bot.active_message_tasks["single:alice"] = task
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for bridge command")
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-interrupt"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-interrupt"}},
+        },
+        fake_handler,
+    )
+    await asyncio.sleep(0)
+
+    assert process.terminated is True
+    assert task.cancelled() is True
+    assert "single:alice" not in bot.active_message_tasks
+    assert ws.sent[-1]["body"]["stream"]["content"] == "Current task interrupted."
+
+
 async def test_resume_command_lists_candidates(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
-    from workspace_bridge.runtime import prepare_session_run, store_session_record
-    from dataclasses import replace
+    from workspace_bridge.runtime import prepare_session_run
 
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
@@ -299,8 +346,8 @@ async def test_resume_command_lists_candidates(tmp_path) -> None:
     bot.ws = ws
     launch = prepare_session_run(bot.config, "single:alice")
     other = prepare_session_run(bot.config, "single:bob")
-    store_session_record(bot.config.runtime_root, replace(launch.session, thread_id="thread-a", last_run_at=2000))
-    store_session_record(bot.config.runtime_root, replace(other.session, thread_id="thread-b", last_run_at=1000))
+    bot.session_threads["single:alice"] = "thread-a"
+    bot.session_threads["single:bob"] = "thread-b"
 
     async def fake_handler(*_args, **_kwargs):
         raise AssertionError("handler should not be called for resume list")
@@ -326,8 +373,7 @@ async def test_resume_command_lists_candidates(tmp_path) -> None:
 
 async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
-    from workspace_bridge.runtime import load_session_record, prepare_session_run, store_session_record
-    from dataclasses import replace
+    from workspace_bridge.runtime import load_session_record, prepare_session_run
 
     config = make_config(tmp_path)
     runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
@@ -335,7 +381,7 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     runtime.ws = ws
     current = prepare_session_run(runtime.config, "single:alice")
     target = prepare_session_run(runtime.config, "group-user:room-1:alice")
-    store_session_record(runtime.config.runtime_root, replace(target.session, thread_id="thread-target", last_run_at=2000))
+    runtime.session_threads["group-user:room-1:alice"] = "thread-target"
 
     async def fake_handler(*_args, **_kwargs):
         raise AssertionError("handler should not be called for resume selection")
@@ -366,8 +412,47 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     assert any(target.session.session_id in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"])
     updated = load_session_record(runtime.config.runtime_root, current.session.session_id)
     assert updated is not None
-    assert updated.thread_id == "thread-target"
+    assert updated.thread_id is None
+    assert runtime.session_threads["single:alice"] == "thread-target"
     assert runtime.resume_candidates == {}
+
+
+async def test_disconnected_event_closes_active_websocket(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class ClosableWS(FakeWS):
+        def __init__(self):
+            super().__init__([])
+            self.closed = False
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            self.closed = True
+
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = ClosableWS()
+    runtime.ws = ws
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for disconnected event")
+
+    await handle_wecom_payload(
+        config,
+        runtime,
+        ws,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-disconnect"},
+            "body": {"msgtype": "event", "event": {"eventtype": "disconnected_event"}},
+        },
+        fake_handler,
+    )
+
+    assert ws.closed is True
+    assert ws.close_calls == 1
+    assert runtime.last_status == "websocket_disconnected_event"
 
 
 async def test_workfile_dir_is_rejected_for_send_file_by_default(tmp_path) -> None:
@@ -626,3 +711,44 @@ async def test_dispatch_message_rejects_concurrent_same_chat(tmp_path, monkeypat
 
     assert ws.sent
     assert "已有任务在运行" in ws.sent[-1]["body"]["stream"]["content"]
+
+
+async def test_dispatch_message_allows_concurrent_different_chats(tmp_path, monkeypatch) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge import wecom_runtime as runtime_module
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def fake_stream_text_message_once(_config, _runtime, parsed, **_kwargs):
+        calls.append(parsed.chat_key)
+        started.set()
+        await release.wait()
+        return "session-1", "done"
+
+    monkeypatch.setattr(runtime_module, "stream_text_message_once", fake_stream_text_message_once)
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+
+    first_payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "hello"}},
+    }
+    second_payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-2"},
+        "body": {"msgtype": "text", "from": {"userid": "bob"}, "text": {"content": "again"}},
+    }
+
+    await handle_wecom_payload(config, bot, ws, first_payload, runtime_module._dispatch_message)
+    await started.wait()
+    await handle_wecom_payload(config, bot, ws, second_payload, runtime_module._dispatch_message)
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.sleep(0)
+
+    assert sorted(calls) == ["single:alice", "single:bob"]
+    assert ws.sent == []

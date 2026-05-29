@@ -10,6 +10,7 @@ from workspace_bridge.wecom_protocol import (
     chat_key_from_message,
     chat_key_to_send_target,
     is_subscribe_ok,
+    normalize_bridge_command_text,
     parse_text_callback,
     split_text_chunks,
     strip_text_mentions,
@@ -27,6 +28,7 @@ def make_bot(tmp_path: Path) -> BotConfig:
         runtime_root=tmp_path / "runtime",
         global_skill_dir=tmp_path / "global",
         chatfile_root=tmp_path / "chatfiles",
+        codex_exec_mode="sandboxed",
     )
 
 
@@ -158,6 +160,12 @@ def test_strip_text_mentions_supports_bot_name_with_spaces() -> None:
     assert strip_text_mentions("@Alice Bob @Leo C hello", "Leo C") == "hello"
     assert strip_text_mentions("@robot, /bridge-status", "robot") == "/bridge-status"
     assert strip_text_mentions("@bot2 hello", "bot") == "@bot2 hello"
+
+
+def test_normalize_bridge_command_text_allows_leading_mention_fallback_for_bridge_commands() -> None:
+    assert normalize_bridge_command_text("@Leo2 /bridge-interrupt", "Leo") == "/bridge-interrupt"
+    assert normalize_bridge_command_text("@robot, /bridge-status", "robot") == "/bridge-status"
+    assert normalize_bridge_command_text("@someone hello", "robot") == "@someone hello"
 
 
 def test_is_subscribe_ok_accepts_success_payload() -> None:

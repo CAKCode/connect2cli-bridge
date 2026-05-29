@@ -24,6 +24,7 @@ class BotConfig:
     runtime_root: Path
     global_skill_dir: Path
     chatfile_root: Path
+    codex_exec_mode: Literal["sandboxed", "host"] = "host"
     file_send_roots: tuple[Path, ...] = ()
     max_upload_size: int = 100 * 1024 * 1024
 
@@ -39,6 +40,8 @@ class WeComBotRuntime:
     connected: bool = False
     reply_states: dict[str, "ReplyState"] = field(default_factory=dict)
     active_processes: dict[str, object] = field(default_factory=dict)
+    active_session_ids: set[str] = field(default_factory=set)
+    session_threads: dict[str, str] = field(default_factory=dict)
     message_tasks: set[object] = field(default_factory=set)
     active_message_tasks: dict[str, object] = field(default_factory=dict)
     last_error: str | None = None
@@ -108,6 +111,7 @@ class WorkspaceRuntimeContext:
     allowed_file_roots: tuple[Path, ...]
     max_upload_size: int
     global_skill_dir: Path
+    codex_exec_mode: Literal["sandboxed", "host"]
     effective_skill_names: tuple[str, ...]
     env: dict[str, str]
 

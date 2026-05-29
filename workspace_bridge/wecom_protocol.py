@@ -157,6 +157,14 @@ def strip_text_mentions(content: str, bot_name: str | None = None) -> str:
     return text.strip()
 
 
+def normalize_bridge_command_text(content: str, bot_name: str | None = None) -> str:
+    text = strip_text_mentions(content, bot_name)
+    if text.startswith("/bridge-"):
+        return text
+    fallback = LEADING_MENTION_RE.sub("", str(content or ""), count=1).strip()
+    return fallback if fallback.startswith("/bridge-") else str(content or "").strip()
+
+
 def build_subscribe_payload(bot: BotConfig, *, req_id: str | None = None) -> dict:
     if not bot.bot_secret:
         raise ValueError("bot secret is required for subscribe payload")

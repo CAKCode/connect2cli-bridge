@@ -35,6 +35,7 @@ def make_bot_runtime(tmp_path: Path) -> WeComBotRuntime:
         runtime_root=tmp_path / "runtime",
         global_skill_dir=tmp_path / "global",
         chatfile_root=tmp_path / "chatfiles",
+        codex_exec_mode="sandboxed",
     )
     runtime = WeComBotRuntime(config=bot, pending_requests={})
     runtime.ws = FakeWS(runtime)

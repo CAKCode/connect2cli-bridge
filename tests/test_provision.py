@@ -84,7 +84,13 @@ def test_build_runtime_context_uses_workspace_skill_precedence(tmp_path: Path) -
     write_skill(workspace.skill_dir, "deploy", "# workspace")
     write_skill(workspace.skill_dir, "lint", "# workspace lint")
 
-    context = build_runtime_context(workspace, global_skill_dir=global_skill_dir, chatfile_root=chatfile_root)
+    context = build_runtime_context(
+        workspace,
+        runtime_root=runtime_root,
+        session_id="session-1",
+        global_skill_dir=global_skill_dir,
+        chatfile_root=chatfile_root,
+    )
 
     assert context.project_dir == workspace.project_dir
     assert context.chatfile_dir.is_dir()

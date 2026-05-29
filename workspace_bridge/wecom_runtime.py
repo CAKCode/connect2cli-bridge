@@ -10,13 +10,14 @@ from aiohttp import WSMsgType
 
 from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
 from .reply_state import cleanup_reply_state
-from .runtime import list_session_records, prepare_session_run, update_session_record
+from .runtime import list_session_records, prepare_session_run, remove_session_codex_home, update_session_record
 from .wecom_protocol import (
     build_proactive_text_payload,
     build_subscribe_payload,
     build_text_response_payload,
     chat_key_to_user_id,
     is_subscribe_ok,
+    normalize_bridge_command_text,
     parse_text_callback,
     strip_text_mentions,
 )
@@ -24,6 +25,11 @@ from .wecom_upload import reject_pending_requests, resolve_pending_request, ws_s
 
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 RESUME_SELECTION_TTL_MS = 5 * 60 * 1000
+
+
+def _interrupt_error_suppressed(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    return "terminated" in text or "cancelled" in text or "canceled" in text
 
 
 def build_runtime_status_text(runtime, chat_key: str) -> str:
@@ -75,12 +81,13 @@ def _resume_record_is_visible(target_key: str, current_key: str) -> bool:
 def _build_resume_candidates(runtime, chat_key: str) -> list[dict[str, str | int]]:
     candidates: list[dict[str, str | int]] = []
     for record in list_session_records(runtime.config.runtime_root, runtime.config.bot_id):
-        if not record.thread_id or not _resume_record_is_visible(record.chat_key, chat_key):
+        thread_id = str(runtime.session_threads.get(record.chat_key) or "").strip()
+        if not thread_id or not _resume_record_is_visible(record.chat_key, chat_key):
             continue
         candidates.append(
             {
                 "sessionId": record.session_id,
-                "threadId": record.thread_id,
+                "threadId": thread_id,
                 "chatKey": record.chat_key,
                 "updatedAt": record.updated_at,
                 "lastRunAt": int(record.last_run_at or 0),
@@ -139,16 +146,17 @@ def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, str | in
         ),
         None,
     )
-    if record is None or not record.thread_id:
+    thread_id = str(candidate.get("threadId") or "").strip()
+    if record is None or not thread_id:
         raise RuntimeError("selected session is no longer resumable")
     launch = prepare_session_run(runtime.config, chat_key)
+    runtime.session_threads[chat_key] = thread_id
     update_session_record(
         runtime.config.runtime_root,
         launch.session.session_id,
         lambda current: replace(
             current,
             updated_at=int(__import__("time").time() * 1000),
-            thread_id=record.thread_id,
             last_run_at=int(__import__("time").time() * 1000),
         ),
     )
@@ -164,6 +172,8 @@ async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
     except Exception as exc:
         runtime.last_status = "message_failed"
         runtime.last_error = str(exc)
+        if _interrupt_error_suppressed(exc):
+            return
         if runtime.ws is None and ws is not None:
             original_ws = runtime.ws
             runtime.ws = ws
@@ -209,16 +219,25 @@ async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
 async def handle_wecom_payload(config, runtime, ws, payload, handler):
     if resolve_pending_request(runtime, payload):
         return
+    if str(payload.get("cmd") or "").strip() == "aibot_event_callback":
+        event_type = str((((payload.get("body") or {}).get("event") or {}).get("eventtype") or "")).strip()
+        if event_type == "disconnected_event":
+            runtime.last_status = "websocket_disconnected_event"
+            runtime.last_error = "bot disconnected event"
+            if runtime.ws is not None and ws is not None and runtime.ws is ws:
+                await ws.close()
+            return
     parsed = parse_text_callback(payload)
     if parsed is None:
         return
     text = strip_text_mentions(parsed.content, runtime.config.bot_name)
+    command_text = normalize_bridge_command_text(parsed.content, runtime.config.bot_name)
     parsed = type(parsed)(req_id=parsed.req_id, chat_key=parsed.chat_key, content=text, raw_payload=parsed.raw_payload)
-    if text == "/bridge-status":
+    if command_text == "/bridge-status":
         await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", build_runtime_status_text(runtime, parsed.chat_key), final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
-    if text == "/bridge-resume":
+    if command_text == "/bridge-resume":
         candidates = _build_resume_candidates(runtime, parsed.chat_key)
         if not candidates:
             await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "没有可恢复的会话。", final=True))
@@ -229,11 +248,11 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", _build_resume_candidates_text(candidates), final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
-    if text.startswith("/bridge-resume "):
-        candidate = _select_resume_candidate(runtime, parsed.chat_key, text.split(None, 1)[1].strip())
+    if command_text.startswith("/bridge-resume "):
+        candidate = _select_resume_candidate(runtime, parsed.chat_key, command_text.split(None, 1)[1].strip())
         if candidate is None:
             candidates = _build_resume_candidates(runtime, parsed.chat_key)
-            candidate = next((item for item in candidates if item["sessionId"] == text.split(None, 1)[1].strip()), None)
+            candidate = next((item for item in candidates if item["sessionId"] == command_text.split(None, 1)[1].strip()), None)
         if candidate is None:
             await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "未找到可恢复会话。", final=True))
             cleanup_reply_state(runtime, parsed.req_id)
@@ -245,8 +264,11 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         )
         cleanup_reply_state(runtime, parsed.req_id)
         return
-    if text == "/bridge-reset":
+    if command_text == "/bridge-reset":
         _clear_resume_selection(runtime, parsed.chat_key)
+        runtime.session_threads.pop(parsed.chat_key, None)
+        launch = prepare_session_run(runtime.config, parsed.chat_key)
+        remove_session_codex_home(runtime.config.runtime_root, launch.session.session_id)
         process = runtime.active_processes.pop(parsed.chat_key, None)
         if process is not None:
             process.terminate()
@@ -263,11 +285,14 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "Session reset.", final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return
-    if text == "/bridge-interrupt":
+    if command_text == "/bridge-interrupt":
         _clear_resume_selection(runtime, parsed.chat_key)
         process = runtime.active_processes.get(parsed.chat_key)
         if process is not None:
             process.terminate()
+        active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
+        if active_task is not None:
+            active_task.cancel()
         await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "Current task interrupted.", final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return

@@ -57,6 +57,7 @@ class AppConfig:
     global_skill_dir: Path
     chatfile_root: Path
     codex_output_root: Path
+    codex_exec_mode: str
     file_send_roots: tuple[Path, ...]
     max_upload_size: int
     wecom_enabled: bool
@@ -92,6 +93,7 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
         codex_output_root=codex_output_root,
+        codex_exec_mode=(str(values.get("CODEX_EXEC_MODE") or "host").strip().lower() or "host"),
         file_send_roots=file_send_roots,
         max_upload_size=max_upload_size,
         wecom_enabled=str(values.get("WECOM_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"},
@@ -112,6 +114,7 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=config.runtime_root,
         global_skill_dir=config.global_skill_dir,
         chatfile_root=config.chatfile_root,
+        codex_exec_mode=config.codex_exec_mode,
         file_send_roots=config.file_send_roots,
         max_upload_size=config.max_upload_size,
     )
@@ -123,6 +126,7 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=bot.runtime_root,
         global_skill_dir=bot.global_skill_dir,
         chatfile_root=bot.chatfile_root,
+        codex_exec_mode=bot.codex_exec_mode,
         file_send_roots=bot.file_send_roots,
         max_upload_size=bot.max_upload_size,
     )

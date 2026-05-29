@@ -12,6 +12,7 @@ from aiohttp import web
 from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
 from .models import WeComBotRuntime, WeComTextMessage
+from .runtime import cleanup_orphan_session_codex_homes, cleanup_stale_session_codex_homes
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
 from .wecom_upload import upload_and_send_file
 from .wecom_runtime import run_wecom_runtime
@@ -26,24 +27,37 @@ APP_SCHEDULE_TASK_KEY = web.AppKey("schedule_task", object)
 async def api_health(request: web.Request) -> web.Response:
     config = request.app[APP_CONFIG_KEY]
     runtime = request.app[APP_WECOM_RUNTIME_KEY]
+    wecom_task = request.app[APP_WECOM_TASK_KEY]
     schedule_task = request.app[APP_SCHEDULE_TASK_KEY]
+    wecom_task_done = bool(wecom_task.done()) if wecom_task is not None else None
+    schedule_task_done = bool(schedule_task.done()) if schedule_task is not None else None
+    health_ok = True
+    if config.wecom_enabled:
+        health_ok = (
+            wecom_task is not None
+            and not bool(wecom_task_done)
+            and schedule_task is not None
+            and not bool(schedule_task_done)
+            and str(runtime.last_status or "") != "subscribe_failed"
+        )
     return web.json_response(
         {
-            "ok": True,
+            "ok": health_ok,
             "botId": config.bot_id,
             "wecomEnabled": config.wecom_enabled,
             "wecomConnected": bool(runtime.connected),
             "wecomStatus": runtime.last_status,
             "wecomLastError": runtime.last_error,
-            "wecomTaskPresent": request.app[APP_WECOM_TASK_KEY] is not None,
-            "wecomTaskDone": bool(request.app[APP_WECOM_TASK_KEY].done()) if request.app[APP_WECOM_TASK_KEY] is not None else None,
+            "wecomTaskPresent": wecom_task is not None,
+            "wecomTaskDone": wecom_task_done,
             "scheduleTaskPresent": schedule_task is not None,
-            "scheduleTaskDone": bool(schedule_task.done()) if schedule_task is not None else None,
+            "scheduleTaskDone": schedule_task_done,
             "pendingRequests": len(runtime.pending_requests or {}),
             "pendingStreams": len(runtime.pending_streams or {}),
             "pendingFinals": len(runtime.pending_finals or {}),
             "replyStates": len(runtime.reply_states),
-        }
+        },
+        status=200 if health_ok else 503,
     )
 
 
@@ -243,6 +257,7 @@ def create_app(config: AppConfig) -> web.Application:
     app[APP_WECOM_TASK_KEY] = None
     app[APP_SCHEDULE_TASK_KEY] = None
     app.router.add_get("/", api_health)
+    app.router.add_get("/healthz", api_health)
     app.router.add_post("/api/prepare", api_prepare)
     app.router.add_post("/api/send-file", api_send_file)
     app.router.add_get("/api/schedules", api_list_schedules)
@@ -253,6 +268,8 @@ def create_app(config: AppConfig) -> web.Application:
     app.router.add_delete("/api/schedules/{schedule_id}", api_delete_schedule)
 
     async def on_startup(app_: web.Application) -> None:
+        cleanup_orphan_session_codex_homes(config.runtime_root)
+
         async def schedule_loop() -> None:
             while True:
                 runtime = app_[APP_WECOM_RUNTIME_KEY]

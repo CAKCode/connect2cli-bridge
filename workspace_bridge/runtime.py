@@ -35,6 +35,7 @@ def build_bot_config(
     runtime_root: Path | str,
     global_skill_dir: Path | str,
     chatfile_root: Path | str,
+    codex_exec_mode: str = "host",
     file_send_roots: tuple[Path, ...] = (),
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> BotConfig:
@@ -46,6 +47,7 @@ def build_bot_config(
         runtime_root=Path(runtime_root).expanduser().resolve(),
         global_skill_dir=Path(global_skill_dir).expanduser().resolve(),
         chatfile_root=Path(chatfile_root).expanduser().resolve(),
+        codex_exec_mode=(str(codex_exec_mode).strip().lower() or "host"),
         file_send_roots=tuple(Path(item).expanduser().resolve() for item in file_send_roots),
         max_upload_size=max(1, int(max_upload_size)),
     )
@@ -57,6 +59,16 @@ def session_registry_root(runtime_root: Path | str) -> Path:
 
 def session_record_file(runtime_root: Path | str, session_id: str) -> Path:
     return session_registry_root(runtime_root) / f"{session_id}.json"
+
+
+def session_codex_home_root(runtime_root: Path | str) -> Path:
+    return Path(runtime_root).expanduser().resolve() / ".bridge-codex-home" / "sessions"
+
+
+def remove_session_codex_home(runtime_root: Path | str, session_id: str) -> None:
+    root = session_codex_home_root(runtime_root) / session_id
+    if root.exists():
+        __import__("shutil").rmtree(root, ignore_errors=True)
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -91,7 +103,7 @@ def load_session_record(runtime_root: Path | str, session_id: str) -> SessionRec
         roomfile_dir=Path(payload["roomfileDir"]).resolve() if payload.get("roomfileDir") else None,
         created_at=int(payload["createdAt"]),
         updated_at=int(payload["updatedAt"]),
-        thread_id=str(payload.get("threadId") or "").strip() or None,
+        thread_id=None,
         last_run_at=int(payload["lastRunAt"]) if payload.get("lastRunAt") is not None else None,
     )
 
@@ -112,7 +124,6 @@ def store_session_record(runtime_root: Path | str, session: SessionRecord) -> Se
             "roomfileDir": str(session.roomfile_dir) if session.roomfile_dir else None,
             "createdAt": session.created_at,
             "updatedAt": session.updated_at,
-            "threadId": session.thread_id,
             "lastRunAt": session.last_run_at,
         },
     )
@@ -141,6 +152,32 @@ def list_session_records(runtime_root: Path | str, bot_id: str) -> list[SessionR
     return records
 
 
+def cleanup_orphan_session_codex_homes(runtime_root: Path | str) -> int:
+    homes_root = session_codex_home_root(runtime_root)
+    if not homes_root.exists():
+        return 0
+    persisted = {path.stem for path in session_registry_root(runtime_root).glob("*.json")}
+    removed = 0
+    for child in homes_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name in persisted:
+            continue
+        __import__("shutil").rmtree(child, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def cleanup_stale_session_codex_homes(
+    runtime_root: Path | str,
+    *,
+    current_ms: int,
+    ttl_ms: int,
+    active_session_ids: set[str] | None = None,
+) -> int:
+    return 0
+
+
 def update_session_record(
     runtime_root: Path | str,
     session_id: str,
@@ -158,15 +195,18 @@ def update_session_record(
 def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
     workspace_ref = build_workspace_ref(bot.runtime_root, bot.source.source_dir, chat_key)
     with workspace_lock(workspace_ref):
+        session_id = stable_session_id(bot.bot_id, chat_key)
         provisioned = provision_workspace(workspace_ref)
         runtime_context = build_runtime_context(
             workspace_ref,
+            runtime_root=bot.runtime_root,
+            session_id=session_id,
             global_skill_dir=bot.global_skill_dir,
             chatfile_root=bot.chatfile_root,
+            codex_exec_mode=bot.codex_exec_mode,
             file_send_roots=bot.file_send_roots,
             max_upload_size=bot.max_upload_size,
         )
-        session_id = stable_session_id(bot.bot_id, chat_key)
         current = load_session_record(bot.runtime_root, session_id)
         created_at = current.created_at if current else now_ms()
         session = SessionRecord(
@@ -182,7 +222,7 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             roomfile_dir=runtime_context.roomfile_dir,
             created_at=created_at,
             updated_at=now_ms(),
-            thread_id=current.thread_id if current else None,
+            thread_id=None,
             last_run_at=current.last_run_at if current else None,
         )
         store_session_record(bot.runtime_root, session)

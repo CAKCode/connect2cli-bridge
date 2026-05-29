@@ -20,3 +20,6 @@ chatfile/
 .scheduled-messages/
 plugins/
 workspace/
+.workspace-bridge-runtime/
+.runtime/
+.shared-runtime/

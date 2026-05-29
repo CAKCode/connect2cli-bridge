@@ -1,5 +1,7 @@
 import asyncio
+import os
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,6 +197,38 @@ async def test_service_lifecycle_keeps_health_safe_when_wecom_enabled(tmp_path: 
         service_module.run_wecom_runtime = original
 
 
+async def test_service_health_reports_unhealthy_when_wecom_task_done(tmp_path: Path) -> None:
+    from aiohttp.test_utils import make_mocked_request
+    from workspace_bridge import service as service_module
+
+    config = make_config(tmp_path, wecom_enabled=True)
+    app = create_app(config)
+
+    async def fake_run_wecom_runtime(_config, _runtime):
+        return None
+
+    original = service_module.run_wecom_runtime
+    service_module.run_wecom_runtime = fake_run_wecom_runtime
+    try:
+        for callback in app.on_startup:
+            await callback(app)
+        await asyncio.sleep(0)
+
+        request = make_mocked_request("GET", "/", app=app)
+        route = next(route for route in app.router.routes() if route.method == "GET" and route.resource.canonical == "/")
+        response = await route.handler(request)
+        payload = json.loads(response.text)
+
+        assert response.status == 503
+        assert payload["ok"] is False
+        assert payload["wecomTaskPresent"] is True
+        assert payload["wecomTaskDone"] is True
+    finally:
+        for callback in app.on_cleanup:
+            await callback(app)
+        service_module.run_wecom_runtime = original
+
+
 async def test_service_schedule_loop_waits_for_wecom_connection(tmp_path: Path) -> None:
     from workspace_bridge import service as service_module
 
@@ -253,6 +287,42 @@ async def test_execute_and_deliver_message_caches_final_when_ws_missing(tmp_path
     assert "done" in reply
     assert "req-1" in runtime.pending_finals
     assert runtime.reply_states["req-1"].pending_final_payload is not None
+
+
+async def test_execute_and_deliver_message_uses_runtime_thread_state(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    runtime.session_threads[message.chat_key] = "thread-resume"
+    original_run_invocation = execution_module.run_invocation
+    invocations: list[tuple[str, ...]] = []
+
+    def fake_run_invocation(invocation):
+        invocations.append(tuple(invocation.argv))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-new"}, ensure_ascii=False),
+                    json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                ]
+            ),
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        session_id, reply = await execute_and_deliver_message(config, runtime, message)
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    assert session_id.startswith("session-")
+    assert reply == "done"
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert runtime.session_threads[message.chat_key] == "thread-new"
 
 
 async def test_send_or_cache_runtime_payload_uses_reply_state_cache_for_req_id(tmp_path: Path) -> None:
@@ -459,7 +529,7 @@ async def test_run_text_message_once_prefers_output_file_text_over_json_stdout(t
     assert reply == "final from output file"
 
 
-async def test_run_text_message_once_persists_thread_id_from_stdout(tmp_path: Path) -> None:
+async def test_run_text_message_once_does_not_persist_thread_id_from_stdout(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.runtime import load_session_record
@@ -494,7 +564,130 @@ async def test_run_text_message_once_persists_thread_id_from_stdout(tmp_path: Pa
     stored = load_session_record(bot.runtime_root, session_id)
     assert reply == "done"
     assert stored is not None
-    assert stored.thread_id == "thread-123"
+    assert stored.thread_id is None
+
+
+async def test_run_text_message_once_retries_fresh_exec_when_resume_thread_not_found(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+    invocations: list[tuple[str, ...]] = []
+
+    def fake_run_invocation(invocation):
+        invocations.append(tuple(invocation.argv))
+        if len(invocations) == 1:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="2026-05-28T11:17:33.253308Z ERROR codex_core::session: failed to record rollout items: thread 019e6e4d-4d11-78a2-9636-843225e13202 not found",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-456"}, ensure_ascii=False),
+                    json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                ]
+            ),
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        session_id, reply = await run_text_message_once(
+            config,
+            bot,
+            message,
+            launch_thread_id_override="019e6e4d-4d11-78a2-9636-843225e13202",
+        )
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "done"
+    assert len(invocations) == 2
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert invocations[1][0:2] == ("codex", "exec")
+    assert "resume" not in invocations[1]
+    assert stored is not None
+    assert stored.thread_id is None
+
+
+async def test_run_text_message_once_raises_on_nonzero_exit(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+
+    def fake_run_invocation(_invocation):
+        return SimpleNamespace(returncode=7, stdout="", stderr="runner failed")
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        try:
+            await run_text_message_once(
+                config,
+                bot,
+                message,
+                argv_override=("python", "-c", "print('unused')"),
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "codex exited with status 7: runner failed"
+        else:
+            raise AssertionError("expected RuntimeError")
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+
+async def test_run_text_message_once_does_not_retry_when_thread_not_found_only_appears_in_stdout(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+    invocations: list[tuple[str, ...]] = []
+
+    def fake_run_invocation(invocation):
+        invocations.append(tuple(invocation.argv))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "explain why thread 019e6e4d-4d11-78a2-9636-843225e13202 not found can happen"}}, ensure_ascii=False),
+                ]
+            ),
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        launch = execution_module.prepare_session_run(bot, message.chat_key)
+        execution_module.update_session_record(
+            bot.runtime_root,
+            launch.session.session_id,
+            lambda current: replace(current, thread_id="019e6e4d-4d11-78a2-9636-843225e13202"),
+        )
+        session_id, reply = await run_text_message_once(
+            config,
+            bot,
+            message,
+        )
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert len(invocations) == 1
+    assert reply == "explain why thread 019e6e4d-4d11-78a2-9636-843225e13202 not found can happen"
+    assert stored is not None
+    assert stored.thread_id is None
 
 
 async def test_stream_text_message_once_uses_json_stdout_when_output_file_missing(tmp_path: Path) -> None:
@@ -578,6 +771,332 @@ async def test_stream_text_message_once_uses_json_stdout_when_output_file_missin
     assert reply == "Hi. What do you need help with?"
 
 
+async def test_stream_text_message_once_uses_fresh_codex_invocation_without_override(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = None
+
+        async def communicate(self):
+            self.returncode = 0
+            return (
+                (json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "fresh stream"}}, ensure_ascii=False) + "\n").encode("utf-8"),
+                b"",
+            )
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    captured: dict[str, object] = {}
+
+    original_parent_env = os.environ.get("EXEC_PARENT_ENV")
+    os.environ["EXEC_PARENT_ENV"] = "present"
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = tuple(args)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProcess()
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+        if original_parent_env is None:
+            os.environ.pop("EXEC_PARENT_ENV", None)
+        else:
+            os.environ["EXEC_PARENT_ENV"] = original_parent_env
+
+    assert session_id.startswith("session-")
+    assert reply == "fresh stream"
+    assert captured["args"][0:2] == ("codex", "exec")
+    assert captured["args"][-1] == "-"
+    assert captured["env"]["EXEC_PARENT_ENV"] == "present"
+    assert captured["env"]["WECOM_BRIDGE_CHATFILE_DIR"]
+    assert captured["env"]["CODEX_HOME"].startswith(str(config.runtime_root / ".bridge-codex-home" / "sessions"))
+
+
+async def test_stream_text_message_once_retries_fresh_exec_when_resume_thread_not_found(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    invocations: list[tuple[str, ...]] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+    try:
+        launch = execution_module.prepare_session_run(bot, message.chat_key)
+        runtime.session_threads[message.chat_key] = "019e6e4d-4d11-78a2-9636-843225e13202"
+
+        async def fake_create_subprocess_exec(*args, **_kwargs):
+            invocations.append(tuple(args))
+            if len(invocations) == 1:
+                return FakeProcess(
+                    stdout_text="",
+                    stderr_text="2026-05-28T11:17:33.253308Z ERROR codex_core::session: failed to record rollout items: thread 019e6e4d-4d11-78a2-9636-843225e13202 not found",
+                )
+            return FakeProcess(
+                stdout_text="\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "thread-789"}, ensure_ascii=False),
+                        json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "stream ok"}}, ensure_ascii=False),
+                    ]
+                ),
+                stderr_text="",
+            )
+
+        execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        session_id, reply = await stream_text_message_once(
+            config,
+            runtime,
+            message,
+        )
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "stream ok"
+    assert len(invocations) == 2
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert invocations[1][0:2] == ("codex", "exec")
+    assert stored is not None
+    assert stored.thread_id is None
+    assert runtime.session_threads[message.chat_key] == "thread-789"
+
+
+async def test_stream_text_message_once_retries_fresh_exec_when_resume_stdin_breaks(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class BrokenStdin:
+        def write(self, _data: bytes) -> None:
+            raise BrokenPipeError("no prompt provided via stdin")
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdin, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = stdin
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    invocations: list[tuple[str, ...]] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+    try:
+        launch = execution_module.prepare_session_run(bot, message.chat_key)
+        runtime.session_threads[message.chat_key] = "thread-resume"
+
+        async def fake_create_subprocess_exec(*args, **_kwargs):
+            invocations.append(tuple(args))
+            if len(invocations) == 1:
+                return FakeProcess(stdin=BrokenStdin(), stdout_text="", stderr_text="")
+            return FakeProcess(
+                stdin=FakeStdin(),
+                stdout_text="\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "thread-stdin-fallback"}, ensure_ascii=False),
+                        json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "stream ok"}}, ensure_ascii=False),
+                    ]
+                ),
+                stderr_text="",
+            )
+
+        execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "stream ok"
+    assert len(invocations) == 2
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert invocations[1][0:2] == ("codex", "exec")
+    assert stored is not None
+    assert stored.thread_id is None
+    assert runtime.session_threads[message.chat_key] == "thread-stdin-fallback"
+
+
+async def test_stream_text_message_once_does_not_retry_when_thread_not_found_only_appears_in_stdout(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    invocations: list[tuple[str, ...]] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+    try:
+        launch = execution_module.prepare_session_run(bot, message.chat_key)
+        runtime.session_threads[message.chat_key] = "019e6e4d-4d11-78a2-9636-843225e13202"
+
+        async def fake_create_subprocess_exec(*args, **_kwargs):
+            invocations.append(tuple(args))
+            return FakeProcess(
+                stdout_text="\n".join(
+                    [
+                        json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "thread 019e6e4d-4d11-78a2-9636-843225e13202 not found is one possible failure mode"}}, ensure_ascii=False),
+                    ]
+                ),
+                stderr_text="",
+            )
+
+        execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        session_id, reply = await stream_text_message_once(
+            config,
+            runtime,
+            message,
+        )
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert len(invocations) == 1
+    assert reply == "thread 019e6e4d-4d11-78a2-9636-843225e13202 not found is one possible failure mode"
+    assert stored is not None
+    assert stored.thread_id is None
+    assert runtime.session_threads[message.chat_key] == "019e6e4d-4d11-78a2-9636-843225e13202"
+
+
 async def test_stream_text_message_once_uses_communicate_when_available(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
@@ -635,6 +1154,59 @@ async def test_stream_text_message_once_uses_communicate_when_available(tmp_path
 
     assert session_id.startswith("session-")
     assert reply == "from communicate"
+
+
+async def test_stream_text_message_once_returns_stderr_text_on_nonzero_exit(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = None
+
+        async def communicate(self):
+            self.returncode = 3
+            return b"", b"stream failed"
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProcess()
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        try:
+            await stream_text_message_once(config, runtime, message, argv_override=("python", "-c", "print('unused')"))
+        except RuntimeError as exc:
+            assert str(exc) == "codex exited with status 3: stream failed"
+        else:
+            raise AssertionError("expected RuntimeError")
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
 
 
 async def test_stream_text_message_once_streams_latest_message_during_run(tmp_path: Path) -> None:
@@ -797,6 +1369,39 @@ async def test_run_text_message_once_uses_thread_offload_for_blocking_runner(tmp
         execution_module.asyncio.to_thread = original_to_thread
 
     assert marker["value"] is True
+
+
+async def test_run_text_message_once_uses_thread_offload_for_prepare_session_run(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+    original_to_thread = execution_module.asyncio.to_thread
+    calls = []
+
+    def fake_run_invocation(_invocation):
+        return SimpleNamespace(returncode=0, stdout="done\n", stderr="")
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    execution_module.run_invocation = fake_run_invocation
+    execution_module.asyncio.to_thread = fake_to_thread
+    try:
+        await run_text_message_once(
+            config,
+            bot,
+            message,
+            argv_override=("python", "-c", "print('done')"),
+        )
+    finally:
+        execution_module.run_invocation = original_run_invocation
+        execution_module.asyncio.to_thread = original_to_thread
+
+    assert "prepare_session_run" in calls
 
 
 async def test_run_text_message_once_releases_session_lock_after_completion(tmp_path: Path) -> None:

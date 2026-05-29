@@ -38,6 +38,10 @@ def _schedule_marker_path(config, schedule_id: str) -> Path:
     return schedule_processing_root(config.runtime_root) / f"definition-{schedule_id}.json"
 
 
+def _schedule_failed_marker_path(config, schedule_id: str) -> Path:
+    return schedule_failed_root(config.runtime_root) / f"{schedule_id}.json"
+
+
 def _acquire_schedule_processing_marker(config, schedule_id: str) -> Path | None:
     marker_path = _schedule_marker_path(config, schedule_id)
     try:
@@ -46,6 +50,23 @@ def _acquire_schedule_processing_marker(config, schedule_id: str) -> Path | None
     except FileExistsError:
         return None
     return marker_path
+
+
+def _write_schedule_failure_marker(config, definition: ScheduleDefinition, exc: Exception) -> None:
+    _schedule_failed_marker_path(config, definition.schedule_id).write_text(
+        json.dumps(
+            {
+                "scheduleId": definition.schedule_id,
+                "chatKey": definition.chat_key,
+                "message": definition.message,
+                "failedAt": int(time.time() * 1000),
+                "error": str(exc),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _claim_pending_job(config, path: Path) -> Path | None:
@@ -174,7 +195,24 @@ async def process_due_schedules_once(config, runtime: WeComBotRuntime | None = N
                 )
             write_schedule_definition(config.runtime_root, next_definition)
             (schedule_done_root(config.runtime_root) / f"{definition.schedule_id}.json").write_text("{}", encoding="utf-8")
-        except Exception:
+            _schedule_failed_marker_path(config, definition.schedule_id).unlink(missing_ok=True)
+        except Exception as exc:
+            _write_schedule_failure_marker(config, definition, exc)
+            if definition.cron:
+                next_run_at = compute_next_cron_run_on_or_after(
+                    definition.cron,
+                    definition.timezone_name or "UTC",
+                    int(time.time() * 1000) + 1,
+                )
+                write_schedule_definition(
+                    config.runtime_root,
+                    ScheduleDefinition(
+                        **{
+                            **definition.__dict__,
+                            "next_run_at": next_run_at,
+                        }
+                    ),
+                )
             continue
         finally:
             marker_path.unlink(missing_ok=True)
