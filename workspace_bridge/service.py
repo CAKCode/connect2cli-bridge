@@ -67,7 +67,7 @@ async def api_prepare(request) -> web.Response:
     from .runtime import prepare_session_run
     from .prompting import build_prompt
 
-    launch = prepare_session_run(bot, data["chatKey"])
+    launch = await asyncio.to_thread(prepare_session_run, bot, data["chatKey"])
     prompt = build_prompt(bot, launch, data["message"])
     return web.json_response(
         {
@@ -100,7 +100,7 @@ async def api_send_file(request) -> web.Response:
 
     # This endpoint performs an immediate WeCom upload/send and returns the
     # final transport result; it is not the queue-based bridge.py endpoint.
-    launch = prepare_session_run(bot, chat_key)
+    launch = await asyncio.to_thread(prepare_session_run, bot, chat_key)
     try:
         file_request = create_file_send_request(
             launch.runtime_context,

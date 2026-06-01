@@ -111,6 +111,42 @@ async def test_service_send_file_endpoint_requires_connected_runtime(tmp_path: P
     assert excinfo.value.text == "bot not connected"
 
 
+async def test_service_send_file_endpoint_uses_thread_offload_for_prepare_session_run(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.connected = True
+    runtime.ws = type("WS", (), {"send_json": lambda self, payload: None})()
+    file_path = launch.runtime_context.export_dir / "result.txt"
+    file_path.write_text("done", encoding="utf-8")
+    from workspace_bridge import service as service_module
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    async def fake_upload_and_send_file(_runtime, _request):
+        return {"mediaId": "media-1"}
+
+    monkeypatch.setattr(service_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(service_module, "upload_and_send_file", fake_upload_and_send_file)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {"chatKey": "single:alice", "filePath": str(file_path)}
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-file")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert "prepare_session_run" in calls
+
+
 async def test_service_send_file_endpoint_requires_chat_key_and_file_path(tmp_path: Path) -> None:
     config, _bot, _launch = make_runtime(tmp_path)
     app = create_app(config)

@@ -137,7 +137,7 @@ def _select_resume_candidate(runtime, chat_key: str, token: str) -> dict[str, st
     return None
 
 
-def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, str | int]) -> str:
+async def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, str | int]) -> str:
     record = next(
         (
             item
@@ -149,7 +149,7 @@ def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, str | in
     thread_id = str(candidate.get("threadId") or "").strip()
     if record is None or not thread_id:
         raise RuntimeError("selected session is no longer resumable")
-    launch = prepare_session_run(runtime.config, chat_key)
+    launch = await asyncio.to_thread(prepare_session_run, runtime.config, chat_key)
     runtime.session_threads[chat_key] = thread_id
     update_session_record(
         runtime.config.runtime_root,
@@ -257,7 +257,7 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
             await ws_send_json(runtime, build_text_response_payload(parsed.req_id, "session-1", "未找到可恢复会话。", final=True))
             cleanup_reply_state(runtime, parsed.req_id)
             return
-        source_session_id = _bind_resume_candidate(runtime, parsed.chat_key, candidate)
+        source_session_id = await _bind_resume_candidate(runtime, parsed.chat_key, candidate)
         await ws_send_json(
             runtime,
             build_text_response_payload(parsed.req_id, "session-1", f"已选择会话 {source_session_id}，接下来会继续该上下文。", final=True)
@@ -310,7 +310,7 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
             )
             cleanup_reply_state(runtime, parsed.req_id)
             return
-        source_session_id = _bind_resume_candidate(runtime, parsed.chat_key, candidate)
+        source_session_id = await _bind_resume_candidate(runtime, parsed.chat_key, candidate)
         await ws_send_json(
             runtime,
             build_text_response_payload(parsed.req_id, "session-1", f"已选择会话 {source_session_id}，接下来会继续该上下文。", final=True)

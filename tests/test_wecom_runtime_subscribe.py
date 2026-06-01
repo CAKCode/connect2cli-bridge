@@ -374,6 +374,7 @@ async def test_resume_command_lists_candidates(tmp_path) -> None:
 async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.runtime import load_session_record, prepare_session_run
+    from workspace_bridge import wecom_runtime as runtime_module
 
     config = make_config(tmp_path)
     runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
@@ -382,32 +383,42 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     current = prepare_session_run(runtime.config, "single:alice")
     target = prepare_session_run(runtime.config, "group-user:room-1:alice")
     runtime.session_threads["group-user:room-1:alice"] = "thread-target"
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
 
     async def fake_handler(*_args, **_kwargs):
         raise AssertionError("handler should not be called for resume selection")
 
-    await handle_wecom_payload(
-        config,
-        runtime,
-        ws,
-        {
-            "cmd": "aibot_msg_callback",
-            "headers": {"req_id": "req-resume"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-resume"}},
-        },
-        fake_handler,
-    )
-    await handle_wecom_payload(
-        config,
-        runtime,
-        ws,
-        {
-            "cmd": "aibot_msg_callback",
-            "headers": {"req_id": "req-select"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "1"}},
-        },
-        fake_handler,
-    )
+    original_to_thread = runtime_module.asyncio.to_thread
+    runtime_module.asyncio.to_thread = fake_to_thread
+    try:
+        await handle_wecom_payload(
+            config,
+            runtime,
+            ws,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-resume"},
+                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-resume"}},
+            },
+            fake_handler,
+        )
+        await handle_wecom_payload(
+            config,
+            runtime,
+            ws,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-select"},
+                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "1"}},
+            },
+            fake_handler,
+        )
+    finally:
+        runtime_module.asyncio.to_thread = original_to_thread
 
     assert any(target.session.session_id in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"])
     updated = load_session_record(runtime.config.runtime_root, current.session.session_id)
@@ -415,6 +426,7 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     assert updated.thread_id is None
     assert runtime.session_threads["single:alice"] == "thread-target"
     assert runtime.resume_candidates == {}
+    assert "prepare_session_run" in calls
 
 
 async def test_disconnected_event_closes_active_websocket(tmp_path) -> None:

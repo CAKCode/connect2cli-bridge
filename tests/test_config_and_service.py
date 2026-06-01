@@ -93,6 +93,43 @@ async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
     assert prepared_payload["sessionId"].startswith("session-")
 
 
+async def test_service_prepare_uses_thread_offload_for_prepare_session_run(tmp_path: Path, monkeypatch) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+        }
+    )
+    app = create_app(config)
+    from workspace_bridge import service as service_module
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(service_module.asyncio, "to_thread", fake_to_thread)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {"chatKey": "single:alice", "message": "hello"}
+
+    prepare_match = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/prepare")
+    await prepare_match.handler(JsonRequest(app))
+
+    assert "prepare_session_run" in calls
+
+
 def test_build_bot_from_app_config_returns_runtime_bot(tmp_path: Path) -> None:
     secret_file = tmp_path / ".secrets" / "bot.secret"
     source_dir = tmp_path / "repo"

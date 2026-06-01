@@ -4,9 +4,13 @@
 .bridge.guard.pid
 .bridge.watchdog.restarts
 .env
+.env.real-test
 .bots.json
 .bots.json.lock
+.bots.json.*.tmp
+.bridge.shutdown-reason.json.*.tmp
 .secrets/
+secrets/
 bridge.log
 bridge.log.prev
 __pycache__/
@@ -23,3 +27,15 @@ workspace/
 .workspace-bridge-runtime/
 .runtime/
 .shared-runtime/
+
+# Only keep WeCom-related skills in this repository.
+relate-skills/*
+!relate-skills/wecom-bridge-guard/
+!relate-skills/wecom-bridge-guard/**
+!relate-skills/wecom-file-reply/
+!relate-skills/wecom-file-reply/**
+!relate-skills/wecom-schedule-message/
+!relate-skills/wecom-schedule-message/**
+!relate-skills/wecom-session-control/
+!relate-skills/wecom-session-control/**
+relate-skills/**/__pycache__/
