@@ -107,13 +107,14 @@ Implemented:
 - per-room shared workspace
 - per-session `chatfile` exchange directory
 - workspace-local Codex skills
-- project-shared skills under `relate-skills/`
+- user-global Codex skills under `~/.codex/skills/`
 
 Effective runtime layout centers around:
 
 - `workspace/<bot>/users/<user>/workfile`
 - `workspace/<bot>/rooms/<room>/roomfile`
 - `workspace/<bot>/sessions/<chat-key>/chatfile`
+- `project/.codex/skills` for `workspace_bridge`
 
 Behavior:
 

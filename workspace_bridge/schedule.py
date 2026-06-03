@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .layout import parse_chat_key
 from .models import ScheduleDefinition, ScheduledJob
 
 CRON_MONTH_NAMES = {
@@ -32,6 +33,9 @@ CRON_WEEKDAY_NAMES = {
     "FRI": 5,
     "SAT": 6,
 }
+
+VALID_MISFIRE_POLICIES = {"fire_once_now", "skip_missed"}
+VALID_CONCURRENCY_POLICIES = {"skip_if_running"}
 
 
 def _schedule_root(runtime_root: Path | str) -> Path:
@@ -87,6 +91,20 @@ def resolve_schedule_timezone(name: str) -> ZoneInfo:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError as exc:
         raise ValueError(f"invalid timezone: {name}") from exc
+
+
+def validate_schedule_misfire_policy(policy: str) -> str:
+    normalized = str(policy or "").strip() or "fire_once_now"
+    if normalized not in VALID_MISFIRE_POLICIES:
+        raise ValueError(f"invalid misfirePolicy: {normalized}")
+    return normalized
+
+
+def validate_schedule_concurrency_policy(policy: str) -> str:
+    normalized = str(policy or "").strip() or "skip_if_running"
+    if normalized not in VALID_CONCURRENCY_POLICIES:
+        raise ValueError(f"invalid concurrencyPolicy: {normalized}")
+    return normalized
 
 
 def parse_cron_atom(token: str, names: dict[str, int], minimum: int, maximum: int, label: str) -> int:
@@ -234,6 +252,45 @@ def list_schedule_definitions(runtime_root: Path | str) -> list[ScheduleDefiniti
     return items
 
 
+def advance_schedule_definition_after_success(
+    runtime_root: Path | str,
+    schedule_id: str,
+    *,
+    current_ms: int | None = None,
+) -> ScheduleDefinition | None:
+    definition = read_schedule_definition(runtime_root, schedule_id)
+    if definition is None:
+        return None
+    now_ms = int(time.time() * 1000) if current_ms is None else int(current_ms)
+    next_run_count = definition.run_count + 1
+    if definition.max_runs is not None and next_run_count >= definition.max_runs:
+        next_definition = replace(
+            definition,
+            enabled=False,
+            next_run_at=0,
+            run_count=next_run_count,
+        )
+    elif definition.cron:
+        next_run_at = compute_next_cron_run_on_or_after(
+            definition.cron,
+            definition.timezone_name or "UTC",
+            now_ms + 1,
+        )
+        next_definition = replace(
+            definition,
+            next_run_at=next_run_at,
+            run_count=next_run_count,
+        )
+    else:
+        next_definition = replace(
+            definition,
+            enabled=False,
+            next_run_at=0,
+            run_count=next_run_count,
+        )
+    return write_schedule_definition(runtime_root, next_definition)
+
+
 def create_schedule_definition(
     runtime_root: Path | str,
     *,
@@ -242,9 +299,16 @@ def create_schedule_definition(
     message: str,
     cron: str,
     timezone_name: str,
+    max_runs: int | None = None,
     misfire_policy: str = "fire_once_now",
     concurrency_policy: str = "skip_if_running",
 ) -> ScheduleDefinition:
+    parse_chat_key(chat_key)
+    normalized_max_runs = None if max_runs in (None, "") else int(max_runs)
+    if normalized_max_runs is not None and normalized_max_runs <= 0:
+        raise ValueError("maxRuns must be > 0")
+    normalized_misfire_policy = validate_schedule_misfire_policy(misfire_policy)
+    normalized_concurrency_policy = validate_schedule_concurrency_policy(concurrency_policy)
     definition = ScheduleDefinition(
         schedule_id=schedule_id,
         chat_key=chat_key,
@@ -253,10 +317,10 @@ def create_schedule_definition(
         timezone_name=timezone_name,
         next_run_at=compute_next_cron_run_on_or_after(cron, timezone_name, int(time.time() * 1000) + 1),
         enabled=True,
-        max_runs=None,
+        max_runs=normalized_max_runs,
         run_count=0,
-        misfire_policy=misfire_policy,
-        concurrency_policy=concurrency_policy,
+        misfire_policy=normalized_misfire_policy,
+        concurrency_policy=normalized_concurrency_policy,
     )
     return write_schedule_definition(runtime_root, definition)
 
@@ -269,6 +333,7 @@ def create_one_shot_schedule(
     message: str,
     run_at_ms: int,
 ) -> ScheduleDefinition:
+    parse_chat_key(chat_key)
     definition = ScheduleDefinition(
         schedule_id=schedule_id,
         chat_key=chat_key,
@@ -280,7 +345,7 @@ def create_one_shot_schedule(
         max_runs=1,
         run_count=0,
         misfire_policy="fire_once_now",
-        concurrency_policy="enqueue",
+        concurrency_policy="skip_if_running",
         run_at_ms=run_at_ms,
     )
     return write_schedule_definition(runtime_root, definition)
@@ -294,6 +359,12 @@ def pause_schedule_definition(runtime_root: Path | str, schedule_id: str) -> Sch
     definition = read_schedule_definition(runtime_root, schedule_id)
     if definition is None:
         raise FileNotFoundError(schedule_id)
+    for root in (schedule_pending_root(runtime_root), schedule_processing_root(runtime_root)):
+        for path in root.glob("*.json"):
+            payload = _read_json(path)
+            if not payload or str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
+                continue
+            path.replace(schedule_failed_root(runtime_root) / path.name)
     return write_schedule_definition(runtime_root, replace(definition, enabled=False))
 
 
@@ -309,6 +380,19 @@ def resume_schedule_definition(runtime_root: Path | str, schedule_id: str) -> Sc
 
 
 def delete_schedule_definition(runtime_root: Path | str, schedule_id: str) -> None:
+    for root in (
+        schedule_pending_root(runtime_root),
+        schedule_processing_root(runtime_root),
+        schedule_failed_root(runtime_root),
+        schedule_done_root(runtime_root),
+    ):
+        for path in root.glob("*.json"):
+            payload = _read_json(path)
+            if not payload or str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
+                continue
+            path.unlink(missing_ok=True)
+    schedule_failed_root(runtime_root).joinpath(f"{schedule_id}.json").unlink(missing_ok=True)
+    schedule_done_root(runtime_root).joinpath(f"{schedule_id}.json").unlink(missing_ok=True)
     (schedule_definition_root(runtime_root) / f"{schedule_id}.json").unlink(missing_ok=True)
 
 

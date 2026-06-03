@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import workspace_bridge.context as context_module
+import workspace_bridge.models as models_module
 from workspace_bridge.runtime import (
     build_bot_config,
     cleanup_orphan_session_codex_homes,
@@ -19,30 +21,39 @@ def write_skill(root: Path, name: str, body: str) -> None:
 
 
 def test_stable_session_id_is_deterministic() -> None:
-    first = stable_session_id("bot-1", "single:alice")
-    second = stable_session_id("bot-1", "single:alice")
+    first = stable_session_id("bot-1", "single:alice", "/tmp/repo")
+    second = stable_session_id("bot-1", "single:alice", "/tmp/repo")
 
     assert first == second
+
+
+def test_stable_session_id_changes_when_source_dir_changes() -> None:
+    first = stable_session_id("bot-1", "single:alice", "/tmp/repo-a")
+    second = stable_session_id("bot-1", "single:alice", "/tmp/repo-b")
+
+    assert first != second
 
 
 def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
-    write_skill(global_skill_dir, "deploy", "# deploy")
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
+    launch = prepare_session_run(bot, "single:alice")
+    write_skill(launch.workspace.workspace.skill_dir, "deploy", "# deploy")
     launch = prepare_session_run(bot, "single:alice")
 
     assert launch.cwd == launch.runtime_context.project_dir
@@ -67,10 +78,12 @@ def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: P
 def test_prepare_session_run_session_codex_home_copies_only_lightweight_root_state(tmp_path: Path, monkeypatch) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
+    monkeypatch.setattr(models_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
+    monkeypatch.setattr(context_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
     (codex_home / "installation_id").write_text("install-1", encoding="utf-8")
@@ -82,7 +95,6 @@ def test_prepare_session_run_session_codex_home_copies_only_lightweight_root_sta
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
@@ -96,16 +108,17 @@ def test_prepare_session_run_session_codex_home_copies_only_lightweight_root_sta
 def test_prepare_session_run_reuses_stable_session_id_for_same_chat(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
@@ -117,20 +130,20 @@ def test_prepare_session_run_reuses_stable_session_id_for_same_chat(tmp_path: Pa
     assert first.cwd == second.cwd
 
 
-def test_prepare_session_run_uses_workspace_skills_over_global(tmp_path: Path) -> None:
+def test_prepare_session_run_uses_workspace_skills(tmp_path: Path, monkeypatch) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
-    write_skill(global_skill_dir, "deploy", "# global deploy")
+    monkeypatch.setattr(models_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
+    monkeypatch.setattr(context_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
@@ -141,23 +154,25 @@ def test_prepare_session_run_uses_workspace_skills_over_global(tmp_path: Path) -
     assert "deploy" in second_launch.runtime_context.effective_skill_names
 
 
-def test_prepare_session_run_rebuilds_session_skill_dir_without_stale_entries(tmp_path: Path) -> None:
+def test_prepare_session_run_rebuilds_session_skill_dir_without_stale_entries(tmp_path: Path, monkeypatch) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
-    write_skill(global_skill_dir, "deploy", "# global deploy")
+    monkeypatch.setattr(models_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
+    monkeypatch.setattr(context_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
+    first_launch = prepare_session_run(bot, "single:alice")
+    write_skill(first_launch.workspace.workspace.skill_dir, "deploy", "# workspace deploy")
     first_launch = prepare_session_run(bot, "single:alice")
     session_home = Path(first_launch.env["CODEX_HOME"])
     stale_skill = session_home / "skills" / "stale-skill"
@@ -172,16 +187,17 @@ def test_prepare_session_run_rebuilds_session_skill_dir_without_stale_entries(tm
 def test_list_session_records_returns_latest_first_without_restoring_thread_info(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
 
@@ -201,16 +217,17 @@ def test_list_session_records_returns_latest_first_without_restoring_thread_info
 def test_prepare_session_run_preserves_host_exec_mode(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
     global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
         codex_exec_mode="host",
     )
@@ -261,8 +278,8 @@ def test_cleanup_stale_session_codex_homes_removes_only_expired_dirs(tmp_path: P
 
     removed = cleanup_stale_session_codex_homes(runtime_root, current_ms=now_ms, ttl_ms=30 * 60 * 1000)
 
-    assert removed == 0
-    assert stale.exists() is True
+    assert removed == 1
+    assert stale.exists() is False
     assert fresh.exists() is True
 
 

@@ -5,6 +5,9 @@ import sys
 from pathlib import Path
 
 import workspace_bridge.codex_runtime as codex_runtime
+import workspace_bridge.context as context_module
+import workspace_bridge.models as models_module
+import workspace_bridge.prompting as prompting_module
 from workspace_bridge.prompting import build_bridge_context, build_prompt
 from workspace_bridge.runner import build_runner_invocation, run_invocation
 from workspace_bridge.runtime import build_bot_config, prepare_session_run
@@ -19,20 +22,24 @@ def write_skill(root: Path, name: str, body: str) -> None:
 def prepare_launch(tmp_path: Path):
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
     source_dir.mkdir()
-    global_skill_dir.mkdir()
+    global_skill_dir.mkdir(exist_ok=True)
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    prompting_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    write_skill(global_skill_dir, "global-only", "# global")
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
-    write_skill(global_skill_dir, "deploy", "# deploy")
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
     )
+    launch = prepare_session_run(bot, "group-user:room-1:alice")
+    write_skill(launch.workspace.workspace.skill_dir, "deploy", "# deploy")
     return bot, prepare_session_run(bot, "group-user:room-1:alice")
 
 
@@ -64,10 +71,9 @@ def test_build_bridge_context_mentions_project_dir_and_skills(tmp_path: Path) ->
     assert "PROJECT_DIR:" in context
     assert "SOURCE_DIR:" in context
     assert "WORKSPACE_SKILL_DIR:" in context
-    assert "WORKFILE_DIR:" in context
-    assert "ROOMFILE_DIR:" in context
+    assert "HOME_CODEX_SKILLS_DIR:" in context
     assert "effectiveSkills: deploy" in context
-    assert "cwd=PROJECT_DIR" in context
+    assert "Run in PROJECT_DIR." in context
 
 
 def test_build_prompt_wraps_context_and_user_request(tmp_path: Path) -> None:
@@ -129,16 +135,13 @@ def test_build_runner_invocation_respects_code_command_override(tmp_path: Path, 
 def test_build_runner_invocation_uses_host_exec_mode_when_configured(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
     source_dir.mkdir()
-    global_skill_dir.mkdir()
     bot = build_bot_config(
         bot_id="bot-1",
         bot_name="codex",
         source_dir=source_dir,
         runtime_root=runtime_root,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
         codex_exec_mode="host",
     )
@@ -200,11 +203,10 @@ def test_run_invocation_executes_override_process(tmp_path: Path) -> None:
 def test_run_codex_session_cli_dry_run_outputs_launch_payload(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
-    global_skill_dir = tmp_path / "global-skills"
     chatfile_root = tmp_path / "chatfiles"
     output_file = tmp_path / "out.jsonl"
     source_dir.mkdir()
-    global_skill_dir.mkdir()
+    workspace_skill_dir = runtime_root / "workspaces" / "users" / "alice" / "src_6f8d00c7fc11" / "project" / ".codex" / "skills" # placeholder not used
     script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
 
     result = subprocess.run(
@@ -219,8 +221,6 @@ def test_run_codex_session_cli_dry_run_outputs_launch_payload(tmp_path: Path) ->
             str(runtime_root),
             "--source-dir",
             str(source_dir),
-            "--global-skills-root",
-            str(global_skill_dir),
             "--chatfile-root",
             str(chatfile_root),
             "--chat-key",

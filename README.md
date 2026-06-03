@@ -148,8 +148,8 @@ curl -s http://127.0.0.1:9299/
   - `.bridge-codex-home/sessions/<session-id>/`
     当前会话隔离出来的 `CODEX_HOME`
 
-- `relate-skills/<skill>/SKILL.md`
-  项目级共享 skills
+- `~/.codex/skills/<skill>/SKILL.md`
+  用户级全局 skills
 - `<workfile 或 roomfile>/.codex/skills/<skill>/SKILL.md`
   当前 workspace 私有 skills
 
@@ -170,18 +170,16 @@ Bridge 运行 `codex` 时：
 
 ### Skill 分层
 
-Skill 目前分成两层：
+Skill 目前固定分成两层：
 
-- 全局共享层
-  `relate-skills/<skill>/SKILL.md`
+- 用户全局层
+  `~/.codex/skills/<skill>/SKILL.md`
 - 个人/工作区私有层
-  `<workfile 或 roomfile>/.codex/skills/<skill>/SKILL.md`
+  `<project>/.codex/skills/<skill>/SKILL.md`
 
-规则：
-
-- 工作区私有 skill 与全局同名时，优先使用私有层
-- 每个成员自己的 `workfile/.codex/skills` 彼此隔离，不会串到其他成员会话
-- 群共享模式下可使用 `roomfile/.codex/skills` 作为群级共享 skill 空间
+- 工作区私有 skill 与用户全局同名时，优先使用私有层
+- 每个 workspace 自己的 `project/.codex/skills` 彼此隔离，不会串到其他会话
+- 群共享与单用户 workspace 都使用各自 `project/.codex/skills` 作为私有 skill 空间
 
 ### Session 模式
 

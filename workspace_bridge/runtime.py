@@ -16,8 +16,9 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def stable_session_id(bot_id: str, chat_key: str) -> str:
-    digest = hashlib.sha1(f"{bot_id}\n{chat_key}".encode("utf-8")).hexdigest()[:16]
+def stable_session_id(bot_id: str, chat_key: str, source_dir: Path | str) -> str:
+    source = Path(source_dir).expanduser().resolve()
+    digest = hashlib.sha1(f"{bot_id}\n{chat_key}\n{source}".encode("utf-8")).hexdigest()[:16]
     return f"session-{digest}"
 
 
@@ -33,7 +34,6 @@ def build_bot_config(
     bot_name: str,
     source_dir: Path | str,
     runtime_root: Path | str,
-    global_skill_dir: Path | str,
     chatfile_root: Path | str,
     codex_exec_mode: str = "host",
     file_send_roots: tuple[Path, ...] = (),
@@ -45,7 +45,6 @@ def build_bot_config(
         bot_secret=None,
         source=make_source_config(source_dir),
         runtime_root=Path(runtime_root).expanduser().resolve(),
-        global_skill_dir=Path(global_skill_dir).expanduser().resolve(),
         chatfile_root=Path(chatfile_root).expanduser().resolve(),
         codex_exec_mode=(str(codex_exec_mode).strip().lower() or "host"),
         file_send_roots=tuple(Path(item).expanduser().resolve() for item in file_send_roots),
@@ -175,7 +174,25 @@ def cleanup_stale_session_codex_homes(
     ttl_ms: int,
     active_session_ids: set[str] | None = None,
 ) -> int:
-    return 0
+    homes_root = session_codex_home_root(runtime_root)
+    if not homes_root.exists():
+        return 0
+    active = set(active_session_ids or set())
+    removed = 0
+    for child in homes_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name in active:
+            continue
+        record = load_session_record(runtime_root, child.name)
+        if record is None:
+            continue
+        last_seen_ms = int(record.last_run_at or record.updated_at or record.created_at)
+        if (int(current_ms) - last_seen_ms) <= int(ttl_ms):
+            continue
+        __import__("shutil").rmtree(child, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def update_session_record(
@@ -195,13 +212,12 @@ def update_session_record(
 def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
     workspace_ref = build_workspace_ref(bot.runtime_root, bot.source.source_dir, chat_key)
     with workspace_lock(workspace_ref):
-        session_id = stable_session_id(bot.bot_id, chat_key)
+        session_id = stable_session_id(bot.bot_id, chat_key, bot.source.source_dir)
         provisioned = provision_workspace(workspace_ref)
         runtime_context = build_runtime_context(
             workspace_ref,
             runtime_root=bot.runtime_root,
             session_id=session_id,
-            global_skill_dir=bot.global_skill_dir,
             chatfile_root=bot.chatfile_root,
             codex_exec_mode=bot.codex_exec_mode,
             file_send_roots=bot.file_send_roots,

@@ -122,14 +122,14 @@ async def test_service_send_file_endpoint_uses_thread_offload_for_prepare_sessio
     from workspace_bridge import service as service_module
     calls = []
 
-    async def fake_to_thread(func, *args, **kwargs):
+    async def fake_run_blocking(func, *args, **kwargs):
         calls.append(func.__name__)
         return func(*args, **kwargs)
 
     async def fake_upload_and_send_file(_runtime, _request):
         return {"mediaId": "media-1"}
 
-    monkeypatch.setattr(service_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(service_module, "run_blocking", fake_run_blocking)
     monkeypatch.setattr(service_module, "upload_and_send_file", fake_upload_and_send_file)
 
     class JsonRequest:
@@ -169,6 +169,11 @@ async def test_service_send_file_endpoint_requires_chat_key_and_file_path(tmp_pa
         await route.handler(JsonRequest(app, {"chatKey": "single:alice"}))
     assert excinfo.value.status == 400
     assert excinfo.value.text == "filePath required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {"chatKey": "invalid", "filePath": "/tmp/x"}))
+    assert excinfo.value.status == 400
+    assert "invalid chat key" in excinfo.value.text
 
 
 async def test_service_send_file_endpoint_rejects_invalid_json_body(tmp_path: Path) -> None:
@@ -272,6 +277,8 @@ async def test_service_send_file_endpoint_uploads_workspace_file(tmp_path: Path,
     response = await route.handler(JsonRequest(app))
     payload = json.loads(response.text)
     assert payload["ok"] is True
+    assert payload["sessionId"] == launch.session.session_id
+    assert payload["chatKey"] == launch.session.chat_key
     assert payload["fileName"] == "result.txt"
     assert payload["mediaId"] == "media-1"
     assert payload["message"] == "sent result.txt"

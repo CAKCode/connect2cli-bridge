@@ -7,6 +7,7 @@ from typing import Literal
 
 WorkspaceScope = Literal["user", "room"]
 SkillLayerName = Literal["global", "workspace"]
+DEFAULT_GLOBAL_SKILL_DIR = (Path.home() / ".codex" / "skills").expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,6 @@ class BotConfig:
     bot_secret: str | None
     source: SourceConfig
     runtime_root: Path
-    global_skill_dir: Path
     chatfile_root: Path
     codex_exec_mode: Literal["sandboxed", "host"] = "host"
     file_send_roots: tuple[Path, ...] = ()
@@ -44,6 +44,13 @@ class WeComBotRuntime:
     session_threads: dict[str, str] = field(default_factory=dict)
     message_tasks: set[object] = field(default_factory=set)
     active_message_tasks: dict[str, object] = field(default_factory=dict)
+    active_schedule_tasks: dict[str, object] = field(default_factory=dict)
+    active_schedule_runs: dict[str, tuple[str, str]] = field(default_factory=dict)
+    suppressed_schedule_cancels: set[tuple[str, str]] = field(default_factory=set)
+    terminal_schedule_cancels: set[tuple[str, str]] = field(default_factory=set)
+    suppressed_failure_tasks: set[object] = field(default_factory=set)
+    wecom_last_error: str | None = None
+    wecom_status: str | None = None
     last_error: str | None = None
     last_status: str | None = None
     resume_candidates: dict[str, list[dict[str, str | int]]] = field(default_factory=dict)
@@ -110,7 +117,6 @@ class WorkspaceRuntimeContext:
     roomfile_dir: Path | None
     allowed_file_roots: tuple[Path, ...]
     max_upload_size: int
-    global_skill_dir: Path
     codex_exec_mode: Literal["sandboxed", "host"]
     effective_skill_names: tuple[str, ...]
     env: dict[str, str]
@@ -175,13 +181,10 @@ class ReplyState:
     chat_key: str
     started_at: float
     last_sent_at: float
-    proactive: bool = False
-    proactive_notice_sent: bool = False
     pending_stream_payload: dict | None = None
     pending_final_payload: dict | None = None
     pending_stream_payloads: list[dict] | None = None
     pending_final_payloads: list[dict] | None = None
-    proactive_status_sent_at: float = 0.0
 
 
 @dataclass(frozen=True)

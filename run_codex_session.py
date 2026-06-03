@@ -16,7 +16,6 @@ def main() -> int:
     parser.add_argument("--bot-name", required=True)
     parser.add_argument("--runtime-root", required=True)
     parser.add_argument("--source-dir", required=True)
-    parser.add_argument("--global-skills-root", required=True)
     parser.add_argument("--chatfile-root", required=True)
     parser.add_argument("--chat-key", required=True)
     parser.add_argument("--message", required=True)
@@ -29,7 +28,6 @@ def main() -> int:
         bot_name=args.bot_name,
         source_dir=args.source_dir,
         runtime_root=args.runtime_root,
-        global_skill_dir=args.global_skills_root,
         chatfile_root=args.chatfile_root,
     )
     launch = prepare_session_run(bot, args.chat_key)

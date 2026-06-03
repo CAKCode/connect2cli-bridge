@@ -118,8 +118,8 @@ Important runtime paths:
   shared room workspace
 - `workspace/<bot>/sessions/<chat-key>/chatfile`
   session-level file exchange area
-- `relate-skills/<skill>/SKILL.md`
-  project-shared skills
+- `~/.codex/skills/<skill>/SKILL.md`
+  user-global skills
 - `<workfile or roomfile>/.codex/skills/<skill>/SKILL.md`
   workspace-local skills
 
@@ -253,7 +253,7 @@ For `workspace_bridge.service`, common send-file API outcomes are:
 Note:
 
 - The main `bridge.py` service uses a queue-backed `/api/send-file` flow and returns queued-style results.
-- `workspace_bridge.service` uses an immediate upload/send flow for the same path and returns final delivery results such as `mediaId` and `sent ...`.
+- `workspace_bridge.service` uses an immediate upload/send flow for the same path and returns final delivery results including `sessionId`, `chatKey`, `mediaId`, and `sent ...`.
 
 ### Schedule a one-shot message
 

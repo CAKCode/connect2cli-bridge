@@ -9,19 +9,80 @@ import uuid
 
 from aiohttp import web
 
+from .async_utils import run_blocking
 from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
+from .layout import build_workspace_ref
 from .models import WeComBotRuntime, WeComTextMessage
-from .runtime import cleanup_orphan_session_codex_homes, cleanup_stale_session_codex_homes
+from .reply_state import cleanup_reply_state
+from .runtime import cleanup_orphan_session_codex_homes, cleanup_stale_session_codex_homes, stable_session_id
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
 from .wecom_upload import upload_and_send_file
 from .wecom_runtime import run_wecom_runtime
+from .wecom_upload import reject_pending_requests
 
 APP_CONFIG_KEY = web.AppKey("config", object)
 APP_BOT_KEY = web.AppKey("bot", object)
 APP_WECOM_RUNTIME_KEY = web.AppKey("wecom_runtime", object)
 APP_WECOM_TASK_KEY = web.AppKey("wecom_task", object)
 APP_SCHEDULE_TASK_KEY = web.AppKey("schedule_task", object)
+SESSION_HOME_TTL_MS = 30 * 60 * 1000
+
+
+def _clear_deferred_schedule_cache(runtime: WeComBotRuntime, runtime_root, schedule_id: str) -> None:
+    from .schedule import schedule_pending_root, schedule_processing_root
+
+    request_ids: set[str] = set()
+    for root in (schedule_pending_root(runtime_root), schedule_processing_root(runtime_root)):
+        for path in root.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
+                continue
+            request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+            if request_id:
+                request_ids.add(request_id)
+    for request_id in request_ids:
+        cache_key = f"job:{request_id}"
+        if runtime.pending_finals is not None:
+            runtime.pending_finals.pop(cache_key, None)
+        if runtime.pending_streams is not None:
+            runtime.pending_streams.pop(cache_key, None)
+        cleanup_reply_state(runtime, cache_key)
+
+
+async def _interrupt_active_schedule_run(runtime: WeComBotRuntime, schedule_id: str, chat_key: str) -> None:
+    active = runtime.active_schedule_runs.get(chat_key)
+    if active is None or active[0] != schedule_id:
+        return
+    request_id = active[1]
+    runtime.suppressed_schedule_cancels.add((chat_key, request_id))
+    runtime.terminal_schedule_cancels.add((chat_key, request_id))
+    schedule_task = runtime.active_schedule_tasks.pop(chat_key, None)
+    process = runtime.active_processes.get(chat_key)
+    if schedule_task is not None:
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            schedule_task.cancel()
+            await asyncio.wait_for(schedule_task, timeout=1.0)
+    if process is not None:
+        process.terminate()
+    if process is not None:
+        wait_method = getattr(process, "wait", None)
+        if callable(wait_method):
+            with suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(wait_method(), timeout=1.0)
+        runtime.active_processes.pop(chat_key, None)
+    runtime.active_schedule_runs.pop(chat_key, None)
+    cache_key = f"job:{request_id}"
+    if runtime.pending_finals is not None:
+        runtime.pending_finals.pop(cache_key, None)
+    if runtime.pending_streams is not None:
+        runtime.pending_streams.pop(cache_key, None)
+    cleanup_reply_state(runtime, cache_key)
+    runtime.suppressed_schedule_cancels.discard((chat_key, request_id))
+    runtime.terminal_schedule_cancels.discard((chat_key, request_id))
 
 
 async def api_health(request: web.Request) -> web.Response:
@@ -33,12 +94,15 @@ async def api_health(request: web.Request) -> web.Response:
     schedule_task_done = bool(schedule_task.done()) if schedule_task is not None else None
     health_ok = True
     if config.wecom_enabled:
+        wecom_status = str(runtime.wecom_status or "").strip()
         health_ok = (
             wecom_task is not None
             and not bool(wecom_task_done)
             and schedule_task is not None
             and not bool(schedule_task_done)
-            and str(runtime.last_status or "") != "subscribe_failed"
+            and wecom_status not in {"subscribe_failed", "connect_failed", "websocket_closed", "websocket_error", "websocket_disconnected_event"}
+            and runtime.last_status != "schedule_failed"
+            and (bool(runtime.connected) or wecom_status in {"", "subscribe_ok"})
         )
     return web.json_response(
         {
@@ -46,8 +110,10 @@ async def api_health(request: web.Request) -> web.Response:
             "botId": config.bot_id,
             "wecomEnabled": config.wecom_enabled,
             "wecomConnected": bool(runtime.connected),
-            "wecomStatus": runtime.last_status,
-            "wecomLastError": runtime.last_error,
+            "wecomStatus": runtime.wecom_status,
+            "wecomLastError": runtime.wecom_last_error,
+            "runtimeStatus": runtime.last_status,
+            "runtimeLastError": runtime.last_error,
             "wecomTaskPresent": wecom_task is not None,
             "wecomTaskDone": wecom_task_done,
             "scheduleTaskPresent": schedule_task is not None,
@@ -63,18 +129,36 @@ async def api_health(request: web.Request) -> web.Response:
 
 async def api_prepare(request) -> web.Response:
     bot = request.app[APP_BOT_KEY]
-    data = await request.json()
+    try:
+        data = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text="request body must be a JSON object")
+    chat_key = str(data.get("chatKey") or "").strip()
+    message = str(data.get("message") or "").strip()
+    if not chat_key:
+        raise web.HTTPBadRequest(text="chatKey required")
+    if not message:
+        raise web.HTTPBadRequest(text="message required")
     from .runtime import prepare_session_run
     from .prompting import build_prompt
 
-    launch = await asyncio.to_thread(prepare_session_run, bot, data["chatKey"])
-    prompt = build_prompt(bot, launch, data["message"])
+    try:
+        launch = await run_blocking(prepare_session_run, bot, chat_key)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    prompt = build_prompt(bot, launch, message)
     return web.json_response(
         {
             "ok": True,
             "workspaceId": launch.session.workspace_id,
+            "workspaceScope": launch.session.workspace_scope,
             "cwd": str(launch.cwd),
             "workfileDir": str(launch.runtime_context.workfile_dir) if launch.runtime_context.workfile_dir else None,
+            "roomfileDir": str(launch.runtime_context.roomfile_dir) if launch.runtime_context.roomfile_dir else None,
+            "ownerUserId": launch.workspace.workspace.owner_user_id,
+            "ownerRoomId": launch.workspace.workspace.owner_room_id,
             "prompt": prompt,
             "sessionId": launch.session.session_id,
         }
@@ -100,7 +184,10 @@ async def api_send_file(request) -> web.Response:
 
     # This endpoint performs an immediate WeCom upload/send and returns the
     # final transport result; it is not the queue-based bridge.py endpoint.
-    launch = await asyncio.to_thread(prepare_session_run, bot, chat_key)
+    try:
+        launch = await run_blocking(prepare_session_run, bot, chat_key)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
     try:
         file_request = create_file_send_request(
             launch.runtime_context,
@@ -141,6 +228,8 @@ async def api_send_file(request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
+            "sessionId": file_request.session_id,
+            "chatKey": file_request.chat_key,
             "fileName": file_request.file_name,
             "workspaceId": file_request.workspace_id,
             "mediaId": result["mediaId"],
@@ -153,16 +242,24 @@ async def api_list_schedules(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
     from .schedule import list_schedule_definitions
+    bot_id = request.app[APP_CONFIG_KEY].bot_id
+    source_dir = request.app[APP_CONFIG_KEY].source_dir
 
     definitions = [
         {
             "scheduleId": item.schedule_id,
             "chatKey": item.chat_key,
+            "sessionId": stable_session_id(bot_id, item.chat_key, request.app[APP_CONFIG_KEY].source_dir),
+            "workspaceId": build_workspace_ref(request.app[APP_CONFIG_KEY].runtime_root, source_dir, item.chat_key).workspace_id,
             "message": item.message,
             "cron": item.cron,
             "timezone": item.timezone_name,
             "nextRunAt": item.next_run_at,
             "enabled": item.enabled,
+            "maxRuns": item.max_runs,
+            "runCount": item.run_count,
+            "misfirePolicy": item.misfire_policy,
+            "concurrencyPolicy": item.concurrency_policy,
         }
         for item in list_schedule_definitions(request.app[APP_CONFIG_KEY].runtime_root)
     ]
@@ -174,18 +271,67 @@ async def api_create_schedule(request) -> web.Response:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
     from .schedule import create_schedule_definition
 
-    data = await request.json()
-    schedule_seed = "\n".join((str(data["chatKey"]), str(data["message"]), str(data["cron"])))
+    try:
+        data = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text="request body must be a JSON object")
+    chat_key = str(data.get("chatKey") or "").strip()
+    message = str(data.get("message") or "").strip()
+    cron = str(data.get("cron") or "").strip()
+    timezone_name = str(data.get("timezone") or "UTC").strip() or "UTC"
+    misfire_policy = str(data.get("misfirePolicy") or data.get("misfire_policy") or "fire_once_now").strip() or "fire_once_now"
+    concurrency_policy = str(data.get("concurrencyPolicy") or data.get("concurrency_policy") or "skip_if_running").strip() or "skip_if_running"
+    max_runs = data.get("maxRuns") or data.get("max_runs")
+    if not chat_key:
+        raise web.HTTPBadRequest(text="chatKey required")
+    if not message:
+        raise web.HTTPBadRequest(text="message required")
+    if not cron:
+        raise web.HTTPBadRequest(text="cron required")
+    schedule_seed = "\n".join((chat_key, message, cron, timezone_name, str(max_runs or ""), misfire_policy, concurrency_policy))
     schedule_id = f"schedule-{hashlib.sha1(schedule_seed.encode('utf-8')).hexdigest()[:8]}-{uuid.uuid4().hex[:8]}"
-    definition = create_schedule_definition(
-        request.app[APP_CONFIG_KEY].runtime_root,
-        schedule_id=schedule_id,
-        chat_key=data["chatKey"],
-        message=data["message"],
-        cron=data["cron"],
-        timezone_name="UTC",
+    try:
+        definition = create_schedule_definition(
+            request.app[APP_CONFIG_KEY].runtime_root,
+            schedule_id=schedule_id,
+            chat_key=chat_key,
+            message=message,
+            cron=cron,
+            timezone_name=timezone_name,
+            max_runs=max_runs,
+            misfire_policy=misfire_policy,
+            concurrency_policy=concurrency_policy,
+        )
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    return web.json_response(
+        {
+            "ok": True,
+            "scheduleId": definition.schedule_id,
+            "chatKey": definition.chat_key,
+            "sessionId": stable_session_id(
+                request.app[APP_CONFIG_KEY].bot_id,
+                definition.chat_key,
+                request.app[APP_CONFIG_KEY].source_dir,
+            ),
+            "workspaceId": build_workspace_ref(
+                request.app[APP_CONFIG_KEY].runtime_root,
+                request.app[APP_CONFIG_KEY].source_dir,
+                definition.chat_key,
+            ).workspace_id,
+            "message": definition.message,
+            "cron": definition.cron,
+            "timezone": definition.timezone_name,
+            "nextRunAt": definition.next_run_at,
+            "enabled": definition.enabled,
+            "maxRuns": definition.max_runs,
+            "runCount": definition.run_count,
+            "misfirePolicy": definition.misfire_policy,
+            "concurrencyPolicy": definition.concurrency_policy,
+        }
     )
-    return web.json_response({"ok": True, "scheduleId": definition.schedule_id})
 
 
 async def api_get_schedule(request) -> web.Response:
@@ -200,11 +346,25 @@ async def api_get_schedule(request) -> web.Response:
         {
             "scheduleId": definition.schedule_id,
             "chatKey": definition.chat_key,
+            "sessionId": stable_session_id(
+                request.app[APP_CONFIG_KEY].bot_id,
+                definition.chat_key,
+                request.app[APP_CONFIG_KEY].source_dir,
+            ),
+            "workspaceId": build_workspace_ref(
+                request.app[APP_CONFIG_KEY].runtime_root,
+                request.app[APP_CONFIG_KEY].source_dir,
+                definition.chat_key,
+            ).workspace_id,
             "message": definition.message,
             "cron": definition.cron,
             "timezone": definition.timezone_name,
             "nextRunAt": definition.next_run_at,
             "enabled": definition.enabled,
+            "maxRuns": definition.max_runs,
+            "runCount": definition.run_count,
+            "misfirePolicy": definition.misfire_policy,
+            "concurrencyPolicy": definition.concurrency_policy,
         }
     )
 
@@ -212,10 +372,24 @@ async def api_get_schedule(request) -> web.Response:
 async def api_pause_schedule(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
-    from .schedule import pause_schedule_definition
+    from .schedule import pause_schedule_definition, read_schedule_definition
 
+    schedule_id = request.match_info["schedule_id"]
+    definition = read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
+    if definition is None:
+        raise web.HTTPNotFound(text="schedule not found")
+    await _interrupt_active_schedule_run(
+        request.app[APP_WECOM_RUNTIME_KEY],
+        schedule_id,
+        definition.chat_key,
+    )
+    _clear_deferred_schedule_cache(
+        request.app[APP_WECOM_RUNTIME_KEY],
+        request.app[APP_CONFIG_KEY].runtime_root,
+        schedule_id,
+    )
     try:
-        definition = pause_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, request.match_info["schedule_id"])
+        definition = pause_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(text="schedule not found") from exc
     return web.json_response({"scheduleId": definition.schedule_id, "enabled": definition.enabled})
@@ -241,8 +415,19 @@ async def api_delete_schedule(request) -> web.Response:
     schedule_id = request.match_info["schedule_id"]
     from .schedule import read_schedule_definition
 
-    if read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id) is None:
+    definition = read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
+    if definition is None:
         raise web.HTTPNotFound(text="schedule not found")
+    await _interrupt_active_schedule_run(
+        request.app[APP_WECOM_RUNTIME_KEY],
+        schedule_id,
+        definition.chat_key,
+    )
+    _clear_deferred_schedule_cache(
+        request.app[APP_WECOM_RUNTIME_KEY],
+        request.app[APP_CONFIG_KEY].runtime_root,
+        schedule_id,
+    )
     delete_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
     return web.json_response({"ok": True})
 
@@ -269,13 +454,37 @@ def create_app(config: AppConfig) -> web.Application:
 
     async def on_startup(app_: web.Application) -> None:
         cleanup_orphan_session_codex_homes(config.runtime_root)
+        cleanup_stale_session_codex_homes(
+            config.runtime_root,
+            current_ms=int(__import__("time").time() * 1000),
+            ttl_ms=SESSION_HOME_TTL_MS,
+            active_session_ids=set(app_[APP_WECOM_RUNTIME_KEY].active_session_ids),
+        )
 
         async def schedule_loop() -> None:
             while True:
                 runtime = app_[APP_WECOM_RUNTIME_KEY]
-                if not config.wecom_enabled or runtime.connected:
-                    await process_due_schedules_once(config, runtime)
-                    await process_scheduled_jobs_once(config, runtime)
+                if runtime.connected:
+                    schedule_failed = False
+                    try:
+                        await process_due_schedules_once(config, runtime)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        schedule_failed = True
+                        runtime.last_status = "schedule_failed"
+                        runtime.last_error = str(exc)
+                    try:
+                        await process_scheduled_jobs_once(config, runtime)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        schedule_failed = True
+                        runtime.last_status = "schedule_failed"
+                        runtime.last_error = str(exc)
+                    if not schedule_failed and runtime.last_status == "schedule_failed":
+                        runtime.last_status = None
+                        runtime.last_error = None
                 await asyncio.sleep(config.schedule_poll_ms / 1000)
 
         if config.wecom_enabled:
@@ -301,10 +510,39 @@ def create_app(config: AppConfig) -> web.Application:
         for process in list(runtime_.active_processes.values()):
             with suppress(Exception):
                 process.terminate()
+        for chat_key, active in list(runtime_.active_schedule_runs.items()):
+            if isinstance(active, tuple) and len(active) == 2:
+                runtime_.suppressed_schedule_cancels.add((chat_key, active[1]))
+        for schedule_task_ in list(runtime_.active_schedule_tasks.values()):
+            schedule_task_.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await schedule_task_
         for message_task in list(runtime_.message_tasks):
             message_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await message_task
+        runtime_.connected = False
+        runtime_.ws = None
+        runtime_.wecom_status = None
+        runtime_.wecom_last_error = None
+        runtime_.last_status = None
+        runtime_.last_error = None
+        reject_pending_requests(runtime_, "service shutting down")
+        runtime_.pending_streams = {}
+        runtime_.pending_finals = {}
+        runtime_.reply_states = {}
+        runtime_.active_processes = {}
+        runtime_.active_message_tasks = {}
+        runtime_.message_tasks = set()
+        runtime_.active_session_ids = set()
+        runtime_.session_threads = {}
+        runtime_.active_schedule_tasks = {}
+        runtime_.active_schedule_runs = {}
+        runtime_.suppressed_schedule_cancels = set()
+        runtime_.terminal_schedule_cancels = set()
+        runtime_.suppressed_failure_tasks = set()
+        runtime_.resume_candidates = {}
+        runtime_.resume_selection_expires_at = {}
         app_[APP_WECOM_TASK_KEY] = None
 
     app.on_startup.append(on_startup)

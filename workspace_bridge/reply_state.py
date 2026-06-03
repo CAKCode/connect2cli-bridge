@@ -35,15 +35,3 @@ def mark_reply_sent(state: ReplyState, *, final: bool) -> None:
 
 def cleanup_reply_state(runtime: WeComBotRuntime, req_id: str) -> None:
     runtime.reply_states.pop(req_id, None)
-
-
-def mark_reply_proactive(state: ReplyState) -> None:
-    state.proactive = True
-
-
-def reply_should_use_proactive(state: ReplyState) -> bool:
-    return state.proactive
-
-
-def proactive_status_due(state: ReplyState) -> bool:
-    return (time.time() - state.proactive_status_sent_at) >= 0

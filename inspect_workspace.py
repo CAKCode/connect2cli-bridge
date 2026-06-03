@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
 from workspace_bridge.layout import build_workspace_ref, ensure_workspace_dirs
+from workspace_bridge.models import DEFAULT_GLOBAL_SKILL_DIR
 from workspace_bridge.skills import resolve_skill_space
 
 
@@ -14,14 +14,13 @@ def main() -> int:
     parser.add_argument("--runtime-root", required=True)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--chat-key", required=True)
-    parser.add_argument("--global-skills-root", required=True)
     parser.add_argument("--ensure-dirs", action="store_true")
     args = parser.parse_args()
 
     workspace = build_workspace_ref(args.runtime_root, args.source_dir, args.chat_key)
     if args.ensure_dirs:
         ensure_workspace_dirs(workspace)
-    skill_space = resolve_skill_space(args.global_skills_root, workspace.skill_dir)
+    skill_space = resolve_skill_space(DEFAULT_GLOBAL_SKILL_DIR, workspace.skill_dir)
 
     payload = {
         "workspaceId": workspace.workspace_id,

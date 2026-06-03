@@ -34,6 +34,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
+from workspace_bridge.async_utils import run_blocking
 from workspace_bridge import codex_runtime
 
 
@@ -128,8 +129,6 @@ SESSION_REGISTRY_ROOT = SHARED_RUNTIME_ROOT / ".session-registry"
 CHATFILE_ROOT = INSTANCE_RUNTIME_ROOT / "chatfile"
 WORKSPACE_ROOT = INSTANCE_RUNTIME_ROOT / "workspace"
 BRIDGE_CODEX_HOME_ROOT = INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
-BRIDGE_GLOBAL_SKILLS_ROOT = BRIDGE_CODEX_HOME_ROOT / "skills"
-PROJECT_SHARED_SKILLS_ROOT = BASE_DIR / "relate-skills"
 USER_ALIAS_ROOT = SHARED_RUNTIME_ROOT / ".user-aliases"
 LOCAL_FILE_SEND_COMMAND = BASE_DIR / "send_file.py"
 LOCAL_SCHEDULE_MESSAGE_COMMAND = BASE_DIR / "schedule_message.py"
@@ -767,8 +766,16 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
     inbound_stale = bool(
         bot.status == "running"
         and bot.last_subscribed_at_ms is not None
-        and now - bot.last_subscribed_at_ms >= WECOM_INBOUND_IDLE_TIMEOUT_MS
-        and bot.last_inbound_at_ms is None
+        and (
+            (
+                bot.last_inbound_at_ms is None
+                and now - bot.last_subscribed_at_ms >= WECOM_INBOUND_IDLE_TIMEOUT_MS
+            )
+            or (
+                inbound_idle_ms is not None
+                and inbound_idle_ms >= WECOM_INBOUND_IDLE_TIMEOUT_MS
+            )
+        )
     )
     heartbeat_ack_stale = bool(
         bot.status == "running"
@@ -796,7 +803,8 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
         and not heartbeat_ack_stale
     )
     return {
-        "botId": bot.config["id"],
+        "botConfigId": bot.config["id"],
+        "botId": bot.config["botId"],
         "name": bot.config["name"],
         "enabled": bot.config.get("enabled", True),
         "status": bot.status,
@@ -988,7 +996,30 @@ def cleanup_orphan_session_codex_homes() -> int:
 
 
 def cleanup_stale_session_codex_homes(current_ms: Optional[int] = None) -> int:
-    return 0
+    now = now_ms() if current_ms is None else int(current_ms)
+    sessions_root = SESSION_REGISTRY_ROOT / "sessions"
+    if not sessions_root.exists():
+        return 0
+    removed = 0
+    for session_file in sessions_root.glob("*.json"):
+        record = normalize_session_record(read_json_file(session_file, None))
+        if not record:
+            continue
+        lease_expires_at = int(record.get("leaseExpiresAt") or 0)
+        if lease_expires_at > now:
+            continue
+        last_seen_ms = int(record.get("lastRunAt") or record.get("updatedAt") or record.get("createdAt") or 0)
+        if (now - last_seen_ms) <= SESSION_TTL * 1000:
+            continue
+        session_id = str(record.get("sessionId") or "").strip()
+        if not session_id:
+            continue
+        home_dir = get_session_codex_home_root(session_id)
+        if not home_dir.exists():
+            continue
+        remove_tree_if_exists(home_dir)
+        removed += 1
+    return removed
 
 
 def get_registry_key_file(bot_id: str, key: str) -> Path:
@@ -1317,20 +1348,8 @@ def get_bridge_codex_home_root() -> Path:
     return BRIDGE_CODEX_HOME_ROOT.resolve()
 
 
-def get_bridge_global_skills_root() -> Path:
-    return BRIDGE_GLOBAL_SKILLS_ROOT.resolve()
-
-
 def get_session_codex_home_root(session_id: str) -> Path:
     return (get_bridge_codex_home_root() / "sessions" / workspace_slug(session_id)).resolve()
-
-
-def get_session_global_skills_root(session_id: str) -> Path:
-    return (get_session_codex_home_root(session_id) / "skills").resolve()
-
-
-def project_shared_skills_root() -> Path:
-    return PROJECT_SHARED_SKILLS_ROOT.resolve()
 
 
 def get_user_alias_dir(bot_id: str) -> Path:
@@ -2009,7 +2028,6 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
     workspace_paths = ensure_session_workspace_dirs_light(bot, key)
     runtime_cwd = get_session_runtime_cwd(bot, key)
     workspace_codex_skills_dir = get_workspace_codex_skills_dir(runtime_cwd)
-    bridge_global_skills_dir = get_session_global_skills_root(sess.session_id)
     allowed_file_roots = ", ".join(str(root) for root in get_allowed_file_roots(bot, key))
     user_id = chat_key_to_user_id(key) or "-"
     room_id = chat_key_to_room_id(key) or "-"
@@ -2030,17 +2048,12 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             f"roomId: {room_id}",
             f"sessionId: {sess.session_id}",
             f"executionMode: {CODEX_EXEC_MODE}",
-            f"bridgeApiBase: {BRIDGE_API_BASE}",
-            f"WORKDIR_DIR: {workspace_paths['workDir']}",
             f"CWD_DIR: {runtime_cwd}",
             f"CHATFILE_DIR: {workspace_paths['chatfile']}",
-            f"EXPORT_DIR: {workspace_paths['chatfile']}",
             f"WORKFILE_DIR: {workspace_paths['workfile'] or '-'}",
             f"ROOMFILE_DIR: {workspace_paths['roomfile'] or '-'}",
             f"WORKSPACE_CODEX_SKILLS_DIR: {workspace_codex_skills_dir}",
-            f"GLOBAL_CODEX_SKILLS_DIR: {bridge_global_skills_dir}",
-            f"sendFileEndpoint: {BRIDGE_API_BASE}/api/send-file",
-            f"scheduleMessageEndpoint: {BRIDGE_API_BASE}/api/schedule-message",
+            "HOME_CODEX_SKILLS_DIR: ~/.codex/skills",
             (
                 "localSendFileCommand: "
                 f"python3 {LOCAL_FILE_SEND_COMMAND} --chat-key '{key}' --bot-config-id '{bot.config['id']}' --bot-name '{bot.config['name']}' --file-path ABSOLUTE_FILE_PATH "
@@ -2053,24 +2066,13 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
                 "--run-at RFC3339_OR_EPOCH_MS --message MESSAGE "
                 'or --cron "0 9 * * *" --timezone TZ --message MESSAGE'
             ),
-            f"localFileSendQueueRoot: {LOCAL_FILE_SEND_QUEUE_ROOT}",
             f"allowedFileSendRoots: {allowed_file_roots}",
             execution_mode_note,
-            "When you need to send a file back, use the localSendFileCommand instead of HTTP.",
-            "CHATFILE_DIR is the session exchange area for files received from and sent back to WeCom.",
-            "EXPORT_DIR is the default directory for user-visible exported files in this session.",
-            "WORKFILE_DIR is the user's long-lived private workspace when this chat has a user scope.",
-            "ROOMFILE_DIR is the room-level shared workspace for group chats.",
-            "WORKDIR_DIR is the shared project root for code context and is not automatically allowed for file send-back.",
-            "CWD_DIR is the actual Codex working directory for this session.",
-            "Create final exported files under EXPORT_DIR or CHATFILE_DIR, not under /tmp or other temp paths.",
-            "Bridge sets TMPDIR/TMP/TEMP to CHATFILE_DIR for the Codex subprocess so temporary exports default there.",
-            "Only files under allowedFileSendRoots can be sent back. Export files to CHATFILE_DIR first when needed.",
-            "When you need to schedule a follow-up message in this chat, prefer the localScheduleMessageCommand instead of HTTP.",
-            "If you need to send a file back to the user, prefer current chatKey; use sessionId only as a fallback. Never switch from group to single chat on your own.",
+            "Use localSendFileCommand for file replies.",
+            "Use localScheduleMessageCommand for follow-up messages.",
+            "Export send-back files under CHATFILE_DIR.",
+            "User-global Codex skills should live in ~/.codex/skills.",
             "Personal Codex skills should live in CWD_DIR/.codex/skills.",
-            "Project shared skills are injected into GLOBAL_CODEX_SKILLS_DIR by the bridge.",
-            "Bridge runs Codex with cwd=CWD_DIR and a bridge-managed CODEX_HOME overlay.",
             "[/BridgeContext]",
         ]
     )
@@ -2935,7 +2937,7 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
 
 async def get_or_create_session_ready(bot: BotState, key: str) -> SessionState:
     sess = get_or_create_session(bot, key)
-    await asyncio.to_thread(ensure_session_workspace_dirs, bot, key)
+    await run_blocking(ensure_session_workspace_dirs, bot, key)
     sess.work_dir = str(get_session_runtime_cwd(bot, key))
     return sess
 
@@ -3070,8 +3072,8 @@ async def run_codex(
                     args = build_codex_base_args(output_file, image_paths, resume=False)
                     args.append("-")
 
-                workspace_paths = await asyncio.to_thread(ensure_session_workspace_dirs, bot, key)
-                codex_home = await asyncio.to_thread(build_codex_home_for_subprocess, sess.session_id)
+                workspace_paths = await run_blocking(ensure_session_workspace_dirs, bot, key)
+                codex_home = await run_blocking(build_codex_home_for_subprocess, sess.session_id)
                 env = dict(os.environ)
                 env.update(
                     {
@@ -3086,7 +3088,6 @@ async def run_codex(
                         "WECOM_BRIDGE_CHAT_KEY": key,
                         "WECOM_BRIDGE_WORKDIR_DIR": str(workspace_paths["workDir"]),
                         "WECOM_BRIDGE_CWD_DIR": str(sess.work_dir),
-                        "WECOM_BRIDGE_GLOBAL_SKILL_DIR": str(get_session_global_skills_root(sess.session_id)),
                         "WECOM_BRIDGE_WORKSPACE_SKILL_DIR": str(get_workspace_codex_skills_dir(Path(sess.work_dir))),
                         "WECOM_BRIDGE_CHATFILE_DIR": str(workspace_paths["chatfile"]),
                         "WECOM_BRIDGE_EXPORT_DIR": str(workspace_paths["chatfile"]),
@@ -4144,6 +4145,7 @@ def normalize_schedule_definition(record: Optional[dict[str, Any]]) -> Optional[
     return {
         "scheduleId": str(record["scheduleId"]),
         "botId": str(record["botId"]),
+        "botConfigId": str(record.get("botConfigId") or record["botId"]),
         "botName": str(record.get("botName") or "").strip() or None,
         "sessionId": str(record.get("sessionId") or "").strip() or None,
         "chatKey": str(record["chatKey"]),
@@ -4511,6 +4513,7 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
         {
             "scheduleId": data.get("scheduleId") or uid(),
             "botId": target["botId"],
+            "botConfigId": target["botId"],
             "botName": target.get("botName"),
             "sessionId": target.get("sessionId"),
             "chatKey": target["chatKey"],
@@ -4562,6 +4565,7 @@ def resolve_schedule_message_request(data: dict[str, Any]) -> dict[str, Any]:
         "requestId": definition["scheduleId"],
         "scheduleId": definition["scheduleId"],
         "botId": definition["botId"],
+        "botConfigId": definition["botId"],
         "botName": definition.get("botName"),
         "sessionId": definition.get("sessionId"),
         "chatKey": definition["chatKey"],
@@ -4589,6 +4593,10 @@ def submit_schedule_message_request(data: dict[str, Any], source: str = "api") -
         "ok": True,
         "requestId": stored["scheduleId"],
         "scheduleId": stored["scheduleId"],
+        "botId": stored["botId"],
+        "botConfigId": stored["botId"],
+        "botName": stored.get("botName"),
+        "sessionId": stored.get("sessionId"),
         "requestedRunAt": requested_run_at,
         "runAt": stored["nextRunAt"],
         "chatKey": stored["chatKey"],
@@ -4610,7 +4618,7 @@ def submit_schedule_definition_request(data: dict[str, Any], source: str = "api"
                 f"scheduleId={stored['scheduleId']} mode={stored['mode']} nextRunAt={stored['nextRunAt']}"
             ),
         )
-    return {"ok": True, **stored}
+    return {"ok": True, **stored, "botConfigId": stored["botId"]}
 
 
 def finalize_scheduled_message_job(pending_file: Path, ok: bool) -> None:
@@ -5926,23 +5934,63 @@ def get_authoritative_bot_config(bot_id: str) -> Optional[dict[str, Any]]:
 
 def invalidate_bot_session_threads(bot_id: str) -> int:
     invalidated = 0
-    sessions_root = SESSION_REGISTRY_ROOT / "sessions"
-    ensure_dir(sessions_root)
-    for session_file in sessions_root.glob("*.json"):
-        record = read_json_file(session_file, None)
-        if not isinstance(record, dict):
-            continue
-        if str(record.get("botId") or "") != bot_id:
-            continue
-        if record.get("threadId") is None:
-            continue
-        write_json_atomic(session_file, {**record, "threadId": None})
-        invalidated += 1
     bot = BOTS.get(bot_id)
     if bot:
         for sess in bot.sessions.values():
+            if sess.thread_id is None:
+                continue
             sess.thread_id = None
+            invalidated += 1
     return invalidated
+
+
+def reset_bot_session_runtime_state(bot_id: str) -> int:
+    bot = BOTS.get(bot_id)
+    if not bot:
+        return 0
+    cleared = 0
+    for sess in bot.sessions.values():
+        had_state = bool(
+            sess.thread_id
+            or sess.chat
+            or sess.queue
+            or sess.pending_media
+            or sess.pending_media_notes
+            or sess.active_run_media
+            or sess.active_run_media_notes
+            or sess.pending_stream_payload
+            or sess.pending_final_payload
+            or sess.reply_started_at
+            or sess.reply_last_sent_at
+            or sess.reply_proactive_req_ids
+            or sess.proactive_status_sent_at
+            or sess.reply_mentions_sent
+        )
+        sess.thread_id = None
+        sess.chat = []
+        sess.queue = []
+        sess.pending_media = []
+        sess.pending_media_notes = []
+        sess.pending_media_downloads = 0
+        sess.active_run_media = []
+        sess.active_run_media_notes = []
+        sess.pending_stream_payload = None
+        sess.pending_final_payload = None
+        sess.pending_stream_payloads = None
+        sess.pending_final_payloads = None
+        sess.reply_started_at = {}
+        sess.reply_last_sent_at = {}
+        sess.reply_proactive_req_ids = set()
+        sess.proactive_status_sent_at = {}
+        sess.reply_mentions_sent = set()
+        sess.active_schedule_id = None
+        sess.active_scheduled_job_file = None
+        sess.active_schedule_request_id = None
+        if had_state:
+            cleared += 1
+    if bot.reply_sessions:
+        bot.reply_sessions = {}
+    return cleared
 
 
 def remove_path_if_exists(path: Path) -> None:
@@ -5993,65 +6041,8 @@ def copy_missing_tree_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, destination)
 
 
-def skill_file_has_yaml_frontmatter(skill_file: Path) -> bool:
-    try:
-        with skill_file.open("r", encoding="utf-8", errors="ignore") as handle:
-            first_line = handle.readline()
-            if first_line.strip() != "---":
-                return False
-            for line in handle:
-                if line.strip() == "---":
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def iter_compatible_skill_dirs(source_root: Path) -> Any:
-    if not source_root.exists():
-        return
-    for child in sorted(source_root.iterdir(), key=lambda item: item.name):
-        skill_file = child / "SKILL.md"
-        if not child.is_dir() or not skill_file.is_file():
-            continue
-        if not skill_file_has_yaml_frontmatter(skill_file):
-            continue
-        yield child
-
-
 def clone_payload_sequence(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(item) for item in payloads]
-
-
-def sync_project_shared_skills_to_bridge_global() -> list[str]:
-    source_root = project_shared_skills_root()
-    target_root = get_bridge_global_skills_root()
-    ensure_dir(get_bridge_codex_home_root())
-    ensure_dir(target_root)
-    clear_directory_contents(target_root)
-    synced: list[str] = []
-    skipped: list[str] = []
-    if source_root.exists():
-        for child in sorted(source_root.iterdir(), key=lambda item: item.name):
-            skill_file = child / "SKILL.md"
-            if not child.is_dir() or not skill_file.is_file():
-                continue
-            if skill_file_has_yaml_frontmatter(skill_file):
-                continue
-            skipped.append(child.name)
-    for child in iter_compatible_skill_dirs(source_root):
-        sync_tree_contents(child, target_root / child.name)
-        synced.append(child.name)
-    if skipped:
-        print_log(f"[SKILL] skipped incompatible shared skills (missing YAML frontmatter): {', '.join(skipped)}")
-    return synced
-
-
-def merge_source_skills_to_target(source_root: Path, target_root: Path) -> None:
-    for child in iter_compatible_skill_dirs(source_root):
-        if (target_root / child.name).exists():
-            continue
-        sync_tree_contents(child, target_root / child.name)
 
 
 def build_codex_home_for_subprocess(session_id: str) -> Path:
@@ -6076,10 +6067,16 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
 
     ensure_dir(bridge_home / "sessions")
     ensure_dir(bridge_home / "tmp")
-    ensure_dir(get_session_global_skills_root(session_id))
-    clear_directory_contents(get_session_global_skills_root(session_id))
-    merge_source_skills_to_target(base_home / "skills", get_session_global_skills_root(session_id))
-    merge_source_skills_to_target(project_shared_skills_root(), get_session_global_skills_root(session_id))
+    skills_link = bridge_home / "skills"
+    if skills_link.exists() or skills_link.is_symlink():
+        if skills_link.is_symlink() or skills_link.is_file():
+            remove_path_if_exists(skills_link)
+        else:
+            remove_tree_if_exists(skills_link)
+    if (base_home / "skills").exists():
+        os.symlink((base_home / "skills"), skills_link, target_is_directory=True)
+    else:
+        ensure_dir(skills_link)
     return bridge_home
 
 
@@ -6566,7 +6563,7 @@ async def start_bot(config: dict[str, Any]) -> BotState:
     if previous_config is None:
         previous_config = read_persisted_bot_config(normalized["id"])
     if previous_config and str(previous_config.get("workDir") or "") != normalized["workDir"]:
-        invalidate_bot_session_threads(normalized["id"])
+        reset_bot_session_runtime_state(normalized["id"])
     if normalized["id"] in BOTS:
         await stop_bot(normalized["id"], persist_disable=False, reason="start_bot_replace")
     bot = BotState(config=normalized)
@@ -6949,14 +6946,15 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
     health = bot_health_snapshot(bot)
     sessions = []
     for key, sess in bot.sessions.items():
+        session_status = "running" if sess.running else ("queued" if sess.queue else "idle")
         sessions.append(
             {
                 "key": key,
                 "sessionId": sess.session_id,
                 "threadId": sess.thread_id,
-                "status": "running" if sess.running else "idle",
-                "alive": sess.running,
-                "busy": sess.running,
+                "status": session_status,
+                "alive": True,
+                "busy": bool(sess.running or sess.queue),
                 "queueLen": len(sess.queue),
                 "lastActive": int(sess.last_active * 1000),
                 "chatLen": len(sess.chat),
@@ -6983,6 +6981,7 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "heartbeatAckIdleMs": health["heartbeatAckIdleMs"],
         "inboundStale": health["inboundStale"],
         "heartbeatAckStale": health["heartbeatAckStale"],
+        "disconnectGraceActive": health["disconnectGraceActive"],
         "stopReason": health["stopReason"],
         "enabled": bot.config["enabled"],
         "logs": list(bot.logs)[-30:],
@@ -7012,6 +7011,7 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "heartbeatAckIdleMs": None,
         "inboundStale": False,
         "heartbeatAckStale": False,
+        "disconnectGraceActive": False,
         "stopReason": None,
         "enabled": config.get("enabled", True) is not False,
         "logs": [],
@@ -7111,9 +7111,13 @@ async def api_get_chat(request: web.Request) -> web.Response:
     if denied:
         return denied
     bot = BOTS.get(request.match_info["bot_id"])
+    if not bot:
+        return web.json_response({"ok": False, "error": "bot not found"}, status=404)
     key = unquote(request.match_info["chat_key"])
-    sess = bot.sessions.get(key) if bot else None
-    return web.json_response(sess.chat if sess else [])
+    sess = bot.sessions.get(key)
+    if not sess:
+        return web.json_response({"ok": False, "error": "session not found"}, status=404)
+    return web.json_response(sess.chat)
 
 
 async def api_interrupt_session(request: web.Request) -> web.Response:
@@ -7164,7 +7168,8 @@ async def api_get_schedules(request: web.Request) -> web.Response:
     denied = await require_api_access(request)
     if denied:
         return denied
-    return web.json_response(list_schedule_definitions())
+    schedules = [{**item, "botConfigId": item["botId"]} for item in list_schedule_definitions()]
+    return web.json_response(schedules)
 
 
 async def api_add_schedule(request: web.Request) -> web.Response:
@@ -7185,7 +7190,7 @@ async def api_get_schedule(request: web.Request) -> web.Response:
     schedule = read_schedule_definition(request.match_info["schedule_id"])
     if not schedule:
         return web.json_response({"ok": False, "error": "schedule not found"}, status=404)
-    return web.json_response(schedule)
+    return web.json_response({**schedule, "botConfigId": schedule["botId"]})
 
 
 async def api_pause_schedule(request: web.Request) -> web.Response:
@@ -7248,14 +7253,16 @@ async def api_root(_: web.Request) -> web.Response:
 
 async def api_healthz(_: web.Request) -> web.Response:
     bot_snapshots = [bot_health_snapshot(bot) for bot in BOTS.values() if not bot_instance_is_stale(bot)]
-    loaded_bot_ids = {snapshot["botId"] for snapshot in bot_snapshots}
+    loaded_bot_ids = {snapshot["botConfigId"] for snapshot in bot_snapshots}
     missing_enabled_bot_ids = []
+    missing_enabled_bots = []
     for config in read_persisted_bot_configs():
         if config.get("enabled") is False:
             continue
         config_id = str(config.get("id") or "").strip()
         if config_id and config_id not in loaded_bot_ids:
             missing_enabled_bot_ids.append(config_id)
+            missing_enabled_bots.append(persisted_bot_to_payload(config))
     unhealthy = [snapshot for snapshot in bot_snapshots if not snapshot["healthy"]]
     status = 200 if not unhealthy else 503
     if missing_enabled_bot_ids:
@@ -7269,6 +7276,7 @@ async def api_healthz(_: web.Request) -> web.Response:
             "botCount": len(bot_snapshots),
             "bots": bot_snapshots,
             "missingEnabledBotIds": missing_enabled_bot_ids,
+            "missingEnabledBots": missing_enabled_bots,
         },
         status=status,
     )
@@ -7327,7 +7335,6 @@ async def main() -> None:
     ensure_dir(WORKSPACE_ROOT)
     ensure_dir(USER_ALIAS_ROOT)
     ensure_dir(get_bridge_codex_home_root())
-    ensure_dir(get_bridge_global_skills_root())
     if not DATA_FILE.exists():
         write_json_atomic(DATA_FILE, [])
 
@@ -7353,7 +7360,6 @@ async def main() -> None:
 
     maybe_migrate_legacy_shared_runtime_state()
     maybe_migrate_legacy_instance_runtime_state()
-    sync_project_shared_skills_to_bridge_global()
     sanitize_all_session_records()
     cleanup_orphan_session_codex_homes()
     cleanup_stale_session_codex_homes()

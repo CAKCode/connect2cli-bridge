@@ -33,11 +33,10 @@ def resolve_skill_space(global_root: Path | str, workspace_root: Path | str) -> 
     global_skills = discover_skills(global_root, layer_name="global")
     workspace_skills = discover_skills(workspace_root, layer_name="workspace")
 
-    effective = dict(global_skills)
-    effective.update(workspace_skills)
-
     layers = (
         SkillLayer(name="global", root_dir=global_root, skills=global_skills),
         SkillLayer(name="workspace", root_dir=workspace_root, skills=workspace_skills),
     )
+    effective = dict(global_skills)
+    effective.update(workspace_skills)
     return ResolvedSkillSpace(layers=layers, effective_skills=effective)

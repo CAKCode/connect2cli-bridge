@@ -49,6 +49,7 @@ def test_single_and_group_user_share_same_user_workspace(tmp_path: Path) -> None
     assert single_workspace.root_dir == group_user_workspace.root_dir
     assert single_workspace.project_dir == group_user_workspace.project_dir
     assert single_workspace.workfile_dir == group_user_workspace.workfile_dir
+    assert single_workspace.skill_dir == single_workspace.project_dir / ".codex" / "skills"
     assert group_user_workspace.roomfile_dir is not None
     assert group_user_workspace.owner_room_id == "room-1"
 
@@ -65,6 +66,7 @@ def test_group_chat_uses_room_workspace(tmp_path: Path) -> None:
     assert workspace.owner_room_id == "room-1"
     assert workspace.workfile_dir is None
     assert workspace.roomfile_dir == workspace.root_dir / "roomfile"
+    assert workspace.skill_dir == workspace.project_dir / ".codex" / "skills"
     assert workspace.root_dir == runtime_root / "workspaces" / "rooms" / "room-1" / workspace.source_key
 
 
@@ -82,3 +84,4 @@ def test_ensure_workspace_dirs_creates_expected_directories(tmp_path: Path) -> N
     assert workspace.state_dir.is_dir()
     assert workspace.workfile_dir.is_dir()
     assert workspace.lock_file.parent.is_dir()
+    assert (workspace.project_dir / ".codex").is_dir()

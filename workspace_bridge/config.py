@@ -54,7 +54,6 @@ class AppConfig:
     bind_port: int
     runtime_root: Path
     source_dir: Path
-    global_skill_dir: Path
     chatfile_root: Path
     codex_output_root: Path
     codex_exec_mode: str
@@ -74,7 +73,6 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
     bind_host, bind_port = resolve_bind(values.get("BRIDGE_BIND", "127.0.0.1:6288"))
     runtime_root = Path(values.get("RUNTIME_ROOT") or ".workspace-bridge-runtime").expanduser().resolve()
     source_dir = Path(require_env(values, "WECOM_BOT_SOURCE_DIR")).expanduser().resolve()
-    global_skill_dir = Path(values.get("GLOBAL_SKILL_DIR") or (runtime_root / "skills" / "global")).expanduser().resolve()
     chatfile_root = Path(values.get("CHATFILE_ROOT") or (runtime_root / "chatfiles")).expanduser().resolve()
     codex_output_root = Path(values.get("CODEX_OUTPUT_ROOT") or (runtime_root / "codex-output")).expanduser().resolve()
     file_send_roots = tuple(
@@ -90,7 +88,6 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         bind_port=bind_port,
         runtime_root=runtime_root,
         source_dir=source_dir,
-        global_skill_dir=global_skill_dir,
         chatfile_root=chatfile_root,
         codex_output_root=codex_output_root,
         codex_exec_mode=(str(values.get("CODEX_EXEC_MODE") or "host").strip().lower() or "host"),
@@ -112,7 +109,6 @@ def build_bot_from_app_config(config: AppConfig):
         bot_name=config.bot_name,
         source_dir=config.source_dir,
         runtime_root=config.runtime_root,
-        global_skill_dir=config.global_skill_dir,
         chatfile_root=config.chatfile_root,
         codex_exec_mode=config.codex_exec_mode,
         file_send_roots=config.file_send_roots,
@@ -124,7 +120,6 @@ def build_bot_from_app_config(config: AppConfig):
         bot_secret=config.bot_secret,
         source=bot.source,
         runtime_root=bot.runtime_root,
-        global_skill_dir=bot.global_skill_dir,
         chatfile_root=bot.chatfile_root,
         codex_exec_mode=bot.codex_exec_mode,
         file_send_roots=bot.file_send_roots,

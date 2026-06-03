@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -33,20 +32,68 @@ def detect_source_mode(source_dir: Path) -> str:
     return "git" if (source_dir / ".git").exists() else "copy"
 
 
+def resolve_git_dir(source_dir: Path) -> Path | None:
+    git_marker = source_dir / ".git"
+    if git_marker.is_dir():
+        return git_marker
+    if not git_marker.is_file():
+        return None
+    try:
+        text = git_marker.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    prefix = "gitdir:"
+    if not text.lower().startswith(prefix):
+        return None
+    raw_path = text[len(prefix) :].strip()
+    if not raw_path:
+        return None
+    git_dir = Path(raw_path)
+    if not git_dir.is_absolute():
+        git_dir = (source_dir / git_dir).resolve()
+    return git_dir if git_dir.exists() else None
+
+
+def read_packed_ref(git_dir: Path, ref_name: str) -> str | None:
+    packed_refs = git_dir / "packed-refs"
+    if not packed_refs.is_file():
+        return None
+    try:
+        for raw_line in packed_refs.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", "^")):
+                continue
+            value, _, name = line.partition(" ")
+            if name == ref_name:
+                return value.strip() or None
+    except Exception:
+        return None
+    return None
+
+
 def detect_source_revision(source_dir: Path) -> str | None:
     if detect_source_mode(source_dir) != "git":
         return None
+    git_dir = resolve_git_dir(source_dir)
+    if git_dir is None:
+        return None
+    head_file = git_dir / "HEAD"
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        head_text = head_file.read_text(encoding="utf-8").strip()
     except Exception:
         return None
-    return result.stdout.strip() or None if result.returncode == 0 else None
+    if head_text.startswith("ref:"):
+        ref_name = head_text.split(":", 1)[1].strip()
+        if not ref_name:
+            return None
+        ref_path = git_dir / ref_name
+        if ref_path.is_file():
+            try:
+                return ref_path.read_text(encoding="utf-8").strip() or None
+            except Exception:
+                return None
+        return read_packed_ref(git_dir, ref_name)
+    return head_text or None
 
 
 def load_workspace_metadata(workspace: WorkspaceRef) -> dict | None:
@@ -65,7 +112,8 @@ def should_skip_source_child(workspace: WorkspaceRef, child: Path) -> bool:
 
 
 def bootstrap_project_dir(workspace: WorkspaceRef) -> None:
-    if any(workspace.project_dir.iterdir()):
+    non_codex_entries = [child for child in workspace.project_dir.iterdir() if child.name != ".codex"]
+    if non_codex_entries:
         return
     for child in workspace.source_dir.iterdir():
         if should_skip_source_child(workspace, child):

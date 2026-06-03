@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from workspace_bridge.models import DEFAULT_GLOBAL_SKILL_DIR
 from workspace_bridge.skills import discover_skills, resolve_skill_space
 
 
@@ -16,10 +17,10 @@ def test_discover_skills_only_includes_directories_with_skill_md(tmp_path: Path)
     (root / "notes").mkdir()
     (root / "README.md").write_text("ignore", encoding="utf-8")
 
-    skills = discover_skills(root, layer_name="global")
+    skills = discover_skills(root, layer_name="workspace")
 
     assert list(skills) == ["deploy"]
-    assert skills["deploy"].layer == "global"
+    assert skills["deploy"].layer == "workspace"
 
 
 def test_workspace_skill_overrides_global_skill_of_same_name(tmp_path: Path) -> None:
@@ -31,12 +32,14 @@ def test_workspace_skill_overrides_global_skill_of_same_name(tmp_path: Path) -> 
     write_skill(global_root, "deploy", "# global deploy")
     write_skill(global_root, "lint", "# global lint")
     write_skill(workspace_root, "deploy", "# workspace deploy")
+    write_skill(workspace_root, "workspace-only", "# workspace only")
 
     resolved = resolve_skill_space(global_root, workspace_root)
 
-    assert set(resolved.effective_skills) == {"deploy", "lint"}
+    assert len(resolved.layers) == 2
     assert resolved.effective_skills["deploy"].layer == "workspace"
     assert resolved.effective_skills["lint"].layer == "global"
+    assert resolved.effective_skills["workspace-only"].layer == "workspace"
 
 
 def test_resolve_skill_space_handles_missing_roots(tmp_path: Path) -> None:

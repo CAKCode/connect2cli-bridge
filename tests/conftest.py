@@ -54,8 +54,6 @@ def bridge_module(tmp_path, monkeypatch):
     module.CHATFILE_ROOT = module.INSTANCE_RUNTIME_ROOT / "chatfile"
     module.WORKSPACE_ROOT = module.INSTANCE_RUNTIME_ROOT / "workspace"
     module.BRIDGE_CODEX_HOME_ROOT = module.INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
-    module.BRIDGE_GLOBAL_SKILLS_ROOT = module.BRIDGE_CODEX_HOME_ROOT / "skills"
-    module.PROJECT_SHARED_SKILLS_ROOT = tmp_path / "relate-skills"
     module.DEFAULT_CODEX_HOME = tmp_path / ".real-codex-home"
     module.LOCAL_FILE_SEND_QUEUE_ROOT = tmp_path / "local-file-send"
     module.LOCAL_FILE_SEND_PENDING_ROOT = module.LOCAL_FILE_SEND_QUEUE_ROOT / "pending"
@@ -91,7 +89,6 @@ def bridge_module(tmp_path, monkeypatch):
     module.ensure_dir(module.CHATFILE_ROOT)
     module.ensure_dir(module.WORKSPACE_ROOT)
     module.ensure_dir(module.DEFAULT_CODEX_HOME)
-    module.ensure_dir(module.PROJECT_SHARED_SKILLS_ROOT)
     module.ensure_dir(module.USER_ALIAS_ROOT)
     module.write_json_atomic(module.DATA_FILE, [])
     return module
