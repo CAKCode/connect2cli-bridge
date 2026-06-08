@@ -287,6 +287,45 @@ async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
     assert session_home.exists() is False
 
 
+async def test_template_card_event_is_not_dispatched_to_text_handler(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    called = {"value": False}
+
+    async def fake_handler(*_args, **_kwargs):
+        called["value"] = True
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-evt-1"},
+            "body": {
+                "msgtype": "event",
+                "chatid": "room-1",
+                "chattype": "group",
+                "from": {"userid": "alice"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "button_interaction",
+                        "event_key": "approve",
+                        "task_id": "task-1",
+                    },
+                },
+            },
+        },
+        fake_handler,
+    )
+
+    assert called["value"] is False
+
+
 async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
 

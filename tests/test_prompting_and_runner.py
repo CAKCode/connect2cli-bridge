@@ -68,12 +68,40 @@ def test_build_bridge_context_mentions_project_dir_and_skills(tmp_path: Path) ->
 
     context = build_bridge_context(bot, launch)
 
+    assert "executionMode: host" in context
     assert "PROJECT_DIR:" in context
+    assert "CWD_DIR:" in context
     assert "SOURCE_DIR:" in context
     assert "WORKSPACE_SKILL_DIR:" in context
     assert "HOME_CODEX_SKILLS_DIR:" in context
     assert "effectiveSkills: deploy" in context
+    assert "localSendFileCommand:" in context
+    assert "localSendMessageCommand:" in context
+    assert "localScheduleMessageCommand:" in context
+    assert "allowedFileSendRoots:" in context
     assert "Run in PROJECT_DIR." in context
+    assert "Use localSendFileCommand for file replies." in context
+
+
+def test_build_bridge_context_mentions_sandbox_constraints(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        codex_exec_mode="sandboxed",
+    )
+    launch = prepare_session_run(bot, "single:alice")
+
+    context = build_bridge_context(bot, launch)
+
+    assert "executionMode: sandboxed" in context
+    assert "Local network access is blocked inside the Codex sandbox for this bridge." in context
 
 
 def test_build_prompt_wraps_context_and_user_request(tmp_path: Path) -> None:

@@ -6,7 +6,15 @@ import re
 import time
 from dataclasses import replace
 
-from .models import BotConfig, WeComTextMessage
+from .models import (
+    BotConfig,
+    OutboundMessage,
+    TemplateCardUpdateRequest,
+    WeComTemplateCardEvent,
+    WeComTemplateCardSelection,
+    WeComTextMessage,
+)
+from .template_card_validation import enrich_template_card_for_delivery
 
 _UID_COUNTER = itertools.count()
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
@@ -97,43 +105,110 @@ def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
 
 
 def build_proactive_text_payload(chat_key: str, content: str, mention_user_id: str | None = None) -> dict:
-    chat_type, chat_id = chat_key_to_send_target(chat_key)
-    resolved_mention_user_id = str(mention_user_id or "").strip()
-    if not resolved_mention_user_id and chat_key.startswith("group-user:"):
-        resolved_mention_user_id = str(chat_key_to_user_id(chat_key) or "").strip()
+    return build_proactive_message_payload(
+        OutboundMessage(
+            chat_key=chat_key,
+            msgtype="markdown",
+            content=content,
+            mention_user_id=mention_user_id,
+        )
+    )
+
+
+def _resolve_message_body(message: OutboundMessage) -> dict:
+    return _resolve_message_body_with_options(message, truncate_markdown=True)
+
+
+def _resolve_message_body_with_options(message: OutboundMessage, *, truncate_markdown: bool) -> dict:
+    msgtype = str(message.msgtype or "").strip()
+    if msgtype == "markdown":
+        resolved_mention_user_id = str(message.mention_user_id or "").strip()
+        if not resolved_mention_user_id and message.chat_key.startswith("group-user:"):
+            resolved_mention_user_id = str(chat_key_to_user_id(message.chat_key) or "").strip()
+        markdown_content = prepend_group_user_mention(str(message.content or ""), resolved_mention_user_id)
+        if truncate_markdown:
+            markdown_content = limit_proactive_text(markdown_content)
+        markdown = {
+            "content": markdown_content
+        }
+        if message.feedback_id:
+            markdown["feedback"] = {"id": str(message.feedback_id)}
+        return {
+            "msgtype": "markdown",
+            "markdown": markdown,
+        }
+    if msgtype == "template_card":
+        card = enrich_template_card_for_delivery(
+            message.chat_key,
+            dict(message.template_card or {}),
+            unique_token=uid(),
+        )
+        if message.feedback_id:
+            card_feedback = dict(card.get("feedback") or {})
+            card_feedback["id"] = str(message.feedback_id)
+            card["feedback"] = card_feedback
+        return {"msgtype": "template_card", "template_card": card}
+    if msgtype in {"file", "image", "voice"}:
+        if not message.media_id:
+            raise ValueError(f"{msgtype} message requires media_id")
+        return {"msgtype": msgtype, msgtype: {"media_id": message.media_id}}
+    if msgtype == "video":
+        video = dict(message.template_card or {})
+        if message.media_id:
+            video["media_id"] = message.media_id
+        if not video.get("media_id"):
+            raise ValueError("video message requires media_id")
+        return {"msgtype": "video", "video": video}
+    raise ValueError(f"unsupported proactive message type: {msgtype}")
+
+
+def build_proactive_message_payload(message: OutboundMessage) -> dict:
+    return build_proactive_message_payload_with_options(message, truncate_markdown=True)
+
+
+def build_proactive_message_payload_with_options(message: OutboundMessage, *, truncate_markdown: bool) -> dict:
+    chat_type, chat_id = chat_key_to_send_target(message.chat_key)
     return {
         "cmd": "aibot_send_msg",
         "headers": {"req_id": uid()},
         "body": {
             "chatid": chat_id,
             "chat_type": chat_type,
-            "msgtype": "markdown",
-            "markdown": {
-                "content": limit_proactive_text(prepend_group_user_mention(content, resolved_mention_user_id))
-            },
+            **_resolve_message_body_with_options(message, truncate_markdown=truncate_markdown),
         },
     }
 
 
 def build_proactive_text_payloads(chat_key: str, content: str, mention_user_id: str | None = None) -> list[dict]:
+    return build_proactive_message_payloads(
+        OutboundMessage(
+            chat_key=chat_key,
+            msgtype="markdown",
+            content=content,
+            mention_user_id=mention_user_id,
+        )
+    )
+
+
+def build_proactive_message_payloads(message: OutboundMessage) -> list[dict]:
+    if str(message.msgtype or "").strip() != "markdown":
+        return [build_proactive_message_payload(message)]
+    content = str(message.content or "")
+    mention_user_id = message.mention_user_id
     chunks = split_text_chunks(content, max_chars=PROACTIVE_TEXT_MAX_CHARS)
     payloads: list[dict] = []
     for chunk in chunks:
-        chat_type, chat_id = chat_key_to_send_target(chat_key)
-        resolved_mention_user_id = str(mention_user_id or "").strip()
-        if not resolved_mention_user_id and chat_key.startswith("group-user:"):
-            resolved_mention_user_id = str(chat_key_to_user_id(chat_key) or "").strip()
         payloads.append(
-            {
-                "cmd": "aibot_send_msg",
-                "headers": {"req_id": uid()},
-                "body": {
-                    "chatid": chat_id,
-                    "chat_type": chat_type,
-                    "msgtype": "markdown",
-                    "markdown": {"content": prepend_group_user_mention(chunk, resolved_mention_user_id)},
-                },
-            }
+            build_proactive_message_payload_with_options(
+                OutboundMessage(
+                    chat_key=message.chat_key,
+                    msgtype="markdown",
+                    content=chunk,
+                    mention_user_id=mention_user_id,
+                    feedback_id=message.feedback_id,
+                ),
+                truncate_markdown=False,
+            )
         )
     return payloads
 
@@ -183,6 +258,17 @@ def build_text_response_payload(req_id: str, session_id: str, content: str, *, f
     }
 
 
+def build_template_card_update_payload(request: TemplateCardUpdateRequest) -> dict:
+    return {
+        "cmd": "aibot_respond_update_msg",
+        "headers": {"req_id": request.req_id},
+        "body": {
+            "response_type": "update_template_card",
+            "template_card": dict(request.template_card or {}),
+        },
+    }
+
+
 def build_text_response_payloads(req_id: str, session_id: str, content: str, *, final: bool) -> list[dict]:
     chunks = split_text_chunks(content, max_chars=STREAM_TEXT_MAX_CHARS)
     payloads: list[dict] = []
@@ -208,6 +294,36 @@ def parse_text_callback(payload: dict) -> WeComTextMessage | None:
         req_id=str((payload.get("headers") or {}).get("req_id") or ""),
         chat_key=chat_key_from_message(payload),
         content=str(((body.get("text") or {}).get("content")) or ""),
+        raw_payload=payload,
+    )
+
+
+def parse_template_card_event(payload: dict) -> WeComTemplateCardEvent | None:
+    if payload.get("cmd") != "aibot_event_callback":
+        return None
+    body = payload.get("body") or {}
+    if body.get("msgtype") != "event":
+        return None
+    event = body.get("event") or {}
+    if event.get("eventtype") != "template_card_event":
+        return None
+    card_event = event.get("template_card_event") or {}
+    selected_items = []
+    for item in ((card_event.get("selected_items") or {}).get("selected_item") or []):
+        option_ids = tuple(str(option_id) for option_id in (((item.get("option_ids") or {}).get("option_id")) or []) if str(option_id))
+        selected_items.append(
+            WeComTemplateCardSelection(
+                question_key=str(item.get("question_key") or ""),
+                option_ids=option_ids,
+            )
+        )
+    return WeComTemplateCardEvent(
+        req_id=str((payload.get("headers") or {}).get("req_id") or ""),
+        chat_key=chat_key_from_message(payload),
+        card_type=str(card_event.get("card_type") or ""),
+        event_key=str(card_event.get("event_key") or ""),
+        task_id=str(card_event.get("task_id") or "") or None,
+        selected_items=tuple(selected_items),
         raw_payload=payload,
     )
 

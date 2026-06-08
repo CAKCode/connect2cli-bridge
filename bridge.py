@@ -36,6 +36,12 @@ if str(BASE_DIR) not in sys.path:
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
 from workspace_bridge.async_utils import run_blocking
 from workspace_bridge import codex_runtime
+from workspace_bridge.template_card_validation import (
+    enrich_template_card_for_delivery,
+    extract_template_card_owner_user_id,
+    validate_feedback_id,
+    validate_template_card_payload,
+)
 
 
 def resolve_shared_runtime_root(base_dir: Optional[Path] = None) -> Path:
@@ -131,6 +137,7 @@ WORKSPACE_ROOT = INSTANCE_RUNTIME_ROOT / "workspace"
 BRIDGE_CODEX_HOME_ROOT = INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
 USER_ALIAS_ROOT = SHARED_RUNTIME_ROOT / ".user-aliases"
 LOCAL_FILE_SEND_COMMAND = BASE_DIR / "send_file.py"
+LOCAL_SEND_MESSAGE_COMMAND = BASE_DIR / "send_message.py"
 LOCAL_SCHEDULE_MESSAGE_COMMAND = BASE_DIR / "schedule_message.py"
 LOCAL_FILE_SEND_QUEUE_ROOT = resolve_local_file_send_queue_root()
 LOCAL_FILE_SEND_PENDING_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "pending"
@@ -141,6 +148,18 @@ LOCAL_FILE_SEND_FAILED_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "failed"
 LOCAL_FILE_SEND_POLL_MS = int(os.environ.get("LOCAL_FILE_SEND_POLL_MS", 1000))
 LOCAL_FILE_SEND_DEFAULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_TIMEOUT_MS", "120000")))
 LOCAL_FILE_SEND_RESULT_RETENTION_MS = max(60000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_RETENTION_MS", str(86400000))))
+LOCAL_SEND_MESSAGE_QUEUE_ROOT = (
+    Path(os.environ.get("LOCAL_SEND_MESSAGE_QUEUE_ROOT", str(INSTANCE_RUNTIME_ROOT / ".local-send-message-queue")))
+    .expanduser()
+    .resolve()
+)
+LOCAL_SEND_MESSAGE_PENDING_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "pending"
+LOCAL_SEND_MESSAGE_PROCESSING_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "processing"
+LOCAL_SEND_MESSAGE_RESULT_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "results"
+LOCAL_SEND_MESSAGE_DONE_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "done"
+LOCAL_SEND_MESSAGE_FAILED_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "failed"
+LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS", "120000")))
+LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS = max(60000, int(os.environ.get("LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS", str(86400000))))
 SCHEDULE_ROOT = SHARED_RUNTIME_ROOT / ".scheduled-messages"
 SCHEDULE_PENDING_ROOT = SCHEDULE_ROOT / "pending"
 SCHEDULE_PROCESSING_ROOT = SCHEDULE_ROOT / "processing"
@@ -187,6 +206,7 @@ CRON_WEEKDAY_NAMES = {
     "FRI": 5,
     "SAT": 6,
 }
+TASK_ID_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_@-]+$")
 INSTANCE_ID = f"{os.getpid()}-{random.randint(1000, 9999)}-{int(time.time())}"
 
 BOTS: dict[str, "BotState"] = {}
@@ -264,6 +284,9 @@ class BotState:
     cancelled_local_file_request_ids: set[str] = field(default_factory=set)
     active_upload_task: Optional[asyncio.Task] = None
     active_upload_job: Optional[dict[str, Any]] = None
+    template_card_button_texts: dict[str, dict[str, str]] = field(default_factory=dict)
+    template_card_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    consumed_template_card_actions: set[str] = field(default_factory=set)
     runtime_lock_handle: Any = None
     stop_reason: Optional[str] = None
     last_subscribed_at_ms: Optional[int] = None
@@ -440,6 +463,96 @@ def get_local_file_send_queue_paths_for_job_file(job_file: Path) -> dict[str, Pa
 def get_local_file_send_queue_paths_for_request(data: dict[str, Any]) -> dict[str, Path]:
     target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
     return get_local_file_send_queue_paths(target_config_id)
+
+
+def build_local_send_message_queue_paths(root: Path) -> dict[str, Path]:
+    return {
+        "root": root,
+        "pending": root / "pending",
+        "processing": root / "processing",
+        "results": root / "results",
+        "done": root / "done",
+        "failed": root / "failed",
+    }
+
+
+def get_local_send_message_queue_paths(target_config_id: Optional[str] = None) -> dict[str, Path]:
+    namespace = local_file_send_namespace(target_config_id)
+    if namespace:
+        return build_local_send_message_queue_paths(LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets" / namespace)
+    return build_local_send_message_queue_paths(LOCAL_SEND_MESSAGE_QUEUE_ROOT)
+
+
+def get_local_send_message_target_config_id_for_root(root: Path) -> Optional[str]:
+    resolved = root.resolve()
+    default_root = LOCAL_SEND_MESSAGE_QUEUE_ROOT.resolve()
+    if resolved == default_root:
+        return None
+    targets_root = (LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets").resolve()
+    if resolved.parent != targets_root:
+        return None
+    return unquote(resolved.name)
+
+
+def list_local_send_message_queue_path_groups() -> list[dict[str, Path]]:
+    queue_path_groups = [get_local_send_message_queue_paths()]
+    seen_roots = {str(queue_path_groups[0]["root"])}
+    targets_root = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets"
+    if targets_root.exists():
+        for root in sorted(targets_root.iterdir()):
+            if not root.is_dir():
+                continue
+            root_str = str(root.resolve())
+            if root_str in seen_roots:
+                continue
+            target_config_id = get_local_send_message_target_config_id_for_root(root)
+            if target_config_id and not should_process_local_file_send_target_config(target_config_id):
+                continue
+            queue_path_groups.append(build_local_send_message_queue_paths(root.resolve()))
+            seen_roots.add(root_str)
+    for bot_id in sorted(BOTS.keys()):
+        if not should_process_local_file_send_target_config(bot_id):
+            continue
+        target_paths = get_local_send_message_queue_paths(bot_id)
+        target_root = str(target_paths["root"])
+        if target_root in seen_roots:
+            continue
+        queue_path_groups.append(target_paths)
+        seen_roots.add(target_root)
+    return queue_path_groups
+
+
+def ensure_local_send_message_dirs(target_config_ids: Optional[list[str]] = None) -> None:
+    for path_group in [get_local_send_message_queue_paths(), *(get_local_send_message_queue_paths(item) for item in (target_config_ids or []))]:
+        for path in path_group.values():
+            ensure_dir(path)
+
+
+def write_local_send_message_result(request_id: str, payload: dict[str, Any], queue_paths: Optional[dict[str, Path]] = None) -> None:
+    queue_paths = queue_paths or get_local_send_message_queue_paths()
+    ensure_dir(queue_paths["results"])
+    retain_until = normalize_optional_int(payload.get("retainUntil") or payload.get("retain_until"))
+    write_json_atomic(
+        queue_paths["results"] / f"{request_id}.json",
+        {
+            **payload,
+            "processedAt": now_ms(),
+            "retainUntil": retain_until,
+        },
+    )
+
+
+def finalize_local_send_message_job(processing_file: Path, ok: bool) -> None:
+    queue_paths = build_local_send_message_queue_paths(processing_file.parent.parent.resolve())
+    target_dir = queue_paths["done"] if ok else queue_paths["failed"]
+    ensure_dir(target_dir)
+    try:
+        processing_file.replace(target_dir / processing_file.name)
+    except Exception:
+        try:
+            processing_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def should_process_local_file_send_target_config(target_config_id: Optional[str]) -> bool:
@@ -2060,6 +2173,11 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
                 f"(fallback: --session-id {sess.session_id})"
             ),
             (
+                "localSendMessageCommand: "
+                f"python3 {LOCAL_SEND_MESSAGE_COMMAND} --chat-key '{key}' --bot-config-id '{bot.config['id']}' --bot-name '{bot.config['name']}' "
+                f"(fallback: --session-id {sess.session_id}) --msgtype template_card --template-card-file ABSOLUTE_JSON_FILE"
+            ),
+            (
                 "localScheduleMessageCommand: "
                 f"python3 {LOCAL_SCHEDULE_MESSAGE_COMMAND} --chat-key '{key}' --bot-config-id '{bot.config['id']}' --bot-name '{bot.config['name']}' "
                 f"(fallback: --session-id {sess.session_id}) "
@@ -2069,6 +2187,7 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             f"allowedFileSendRoots: {allowed_file_roots}",
             execution_mode_note,
             "Use localSendFileCommand for file replies.",
+            "Use localSendMessageCommand for proactive template-card sends.",
             "Use localScheduleMessageCommand for follow-up messages.",
             "Export send-back files under CHATFILE_DIR.",
             "User-global Codex skills should live in ~/.codex/skills.",
@@ -2385,6 +2504,25 @@ def build_proactive_chat_payload(key: str, content: str, mention_user_id: Option
     }
 
 
+def attach_message_feedback(message_body: dict[str, Any], feedback_id: Optional[str]) -> dict[str, Any]:
+    resolved_feedback_id = str(feedback_id or "").strip()
+    body = dict(message_body or {})
+    if not resolved_feedback_id:
+        return body
+    resolved_feedback_id = validate_feedback_id(resolved_feedback_id)
+    if body.get("msgtype") == "markdown":
+        markdown = dict(body.get("markdown") or {})
+        markdown["feedback"] = {"id": resolved_feedback_id}
+        body["markdown"] = markdown
+    elif body.get("msgtype") == "template_card":
+        template_card = dict(body.get("template_card") or {})
+        feedback = dict(template_card.get("feedback") or {})
+        feedback["id"] = resolved_feedback_id
+        template_card["feedback"] = feedback
+        body["template_card"] = template_card
+    return body
+
+
 async def send_ws_payload_with_ack(
     bot: BotState, payload: dict[str, Any], timeout_sec: int, *, send_timeout_sec: Optional[int] = None
 ) -> dict[str, Any]:
@@ -2688,6 +2826,122 @@ async def respond_info(bot: BotState, req_id: Optional[str], message: str, final
         return
     if final:
         cleanup_reply_session(bot, req_id, sess)
+
+
+async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> None:
+    req_id = str(((message.get("headers") or {}).get("req_id")) or "").strip()
+    event = (((message.get("body") or {}).get("event") or {}).get("template_card_event") or {})
+    if not req_id or not isinstance(event, dict):
+        return
+    card_type = str(event.get("card_type") or "").strip()
+    event_key = str(event.get("event_key") or "").strip()
+    task_id = str(event.get("task_id") or "").strip()
+    click_user_id = message_sender_userid(message)
+    owner_user_id = extract_template_card_owner_user_id(task_id)
+    key = chat_key_for_bot(bot, message)
+    action_token = f"{task_id}\n{event_key}\n{click_user_id}"
+    if not card_type:
+        return
+    if owner_user_id and click_user_id and owner_user_id != click_user_id:
+        add_event_log(
+            bot,
+            "template_card.click_rejected_non_owner",
+            reqId=req_id,
+            cardType=card_type,
+            taskId=task_id or None,
+            ownerUserId=owner_user_id,
+            clickUserId=click_user_id or None,
+            eventKey=event_key or None,
+        )
+        notice_payload = build_proactive_chat_payload(key, f"这是 {owner_user_id} 的卡片，你点击了但不会改动它。")
+        try:
+            await send_ws_payload_with_ack(bot, notice_payload, 5)
+        except Exception as exc:
+            add_log(bot, f"template card non-owner notice skipped req_id={req_id}: {exc}")
+        return
+    if card_type != "button_interaction":
+        add_event_log(
+            bot,
+            "template_card.click_no_auto_update",
+            reqId=req_id,
+            cardType=card_type,
+            taskId=task_id or None,
+            ownerUserId=owner_user_id,
+            clickUserId=click_user_id or None,
+            eventKey=event_key or None,
+        )
+        notice_payload = build_proactive_chat_payload(key, f"已收到卡片点击：{event_key or card_type}。当前类型暂不自动更新卡片。")
+        try:
+            await send_ws_payload_with_ack(bot, notice_payload, 5)
+        except Exception as exc:
+            add_log(bot, f"template card informational notice skipped req_id={req_id}: {exc}")
+        return
+    if action_token in bot.consumed_template_card_actions:
+        add_event_log(
+            bot,
+            "template_card.click_duplicate_ignored",
+            reqId=req_id,
+            cardType=card_type,
+            taskId=task_id or None,
+            ownerUserId=owner_user_id,
+            clickUserId=click_user_id or None,
+            eventKey=event_key or None,
+        )
+        notice_payload = build_proactive_chat_payload(key, "该操作已处理，请勿重复点击。")
+        try:
+            await send_ws_payload_with_ack(bot, notice_payload, 5)
+        except Exception as exc:
+            add_log(bot, f"template card duplicate notice skipped req_id={req_id}: {exc}")
+        return
+    event_text = (
+        bot.template_card_button_texts.get(task_id, {}).get(event_key)
+        or event_key
+        or "确认"
+    )
+    original_card = dict(bot.template_card_payloads.get(task_id) or {})
+    update_card = dict(original_card)
+    update_card["card_type"] = "button_interaction"
+    update_card["task_id"] = task_id or f"processed-{uid()}"
+    main_title = dict(update_card.get("main_title") or {})
+    original_title = str(main_title.get("title") or "").strip()
+    main_title["title"] = original_title or "已确认"
+    if not str(main_title.get("desc") or "").strip():
+        main_title["desc"] = event_text
+    update_card["main_title"] = main_title
+    rebuilt_buttons = []
+    for item in original_card.get("button_list") or []:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        if str(current.get("key") or "").strip() == event_key:
+            current["style"] = 1
+            current["text"] = str(current.get("text") or "").strip() or event_text
+        rebuilt_buttons.append(current)
+    if not rebuilt_buttons:
+        rebuilt_buttons = [{"text": event_text, "style": 1, "key": event_key or "processed"}]
+    update_card["button_list"] = rebuilt_buttons
+    bot.consumed_template_card_actions.add(action_token)
+    await enqueue_message(bot, key, event_text, None, silent_lease_failure=True)
+    try:
+        response = await send_ws_payload_with_ack(
+            bot,
+            build_template_card_update_payload(req_id, update_card),
+            5,
+        )
+        if response.get("errcode") not in (None, 0):
+            raise BridgeError(502, f"template card update failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+        add_event_log(
+            bot,
+            "template_card.updated",
+            reqId=req_id,
+            cardType=card_type,
+            taskId=task_id or None,
+            ownerUserId=owner_user_id,
+            clickUserId=click_user_id or None,
+            eventKey=event_key or None,
+        )
+    except Exception as exc:
+        add_log(bot, f"template card update skipped req_id={req_id}: {exc}")
 
 
 async def respond_session_info(
@@ -4020,6 +4274,205 @@ def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path
     raise BridgeError(400, "chatKey or sessionId required")
 
 
+def build_proactive_template_card_payload(key: str, template_card: dict[str, Any]) -> dict[str, Any]:
+    chat_type, chat_id = chat_key_to_send_target(key)
+    card = enrich_template_card_for_delivery(key, template_card, unique_token=uid())
+    return {
+        "cmd": "aibot_send_msg",
+        "headers": {"req_id": uid()},
+        "body": attach_message_feedback(
+            {
+                "chatid": chat_id,
+                "chat_type": chat_type,
+                "msgtype": "template_card",
+                "template_card": card,
+            },
+            None,
+        ),
+    }
+
+
+def build_template_card_update_payload(req_id: str, template_card: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "cmd": "aibot_respond_update_msg",
+        "headers": {"req_id": req_id},
+        "body": {
+            "response_type": "update_template_card",
+            "template_card": dict(template_card or {}),
+        },
+    }
+
+
+def template_card_event_text(event: dict[str, Any], fallback: str) -> str:
+    event_key = str(event.get("event_key") or "").strip()
+    button_list = event.get("button_list")
+    if isinstance(button_list, list):
+        for item in button_list:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key") or "").strip() != event_key:
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                return text
+    return fallback
+
+
+def register_template_card_button_texts(bot: BotState, template_card: dict[str, Any]) -> None:
+    if not isinstance(template_card, dict):
+        return
+    task_id = str(template_card.get("task_id") or "").strip()
+    if not task_id:
+        return
+    bot.template_card_payloads[task_id] = dict(template_card)
+    button_texts: dict[str, str] = {}
+    for item in template_card.get("button_list") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if key and text:
+            button_texts[key] = text
+    if button_texts:
+        bot.template_card_button_texts[task_id] = button_texts
+
+
+
+def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, dict[str, Any]]:
+    chat_key_value = data.get("chatKey") or data.get("chat_key")
+    bot_name = data.get("botName") or data.get("bot_name")
+    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
+    session_id = data.get("sessionId") or data.get("session_id")
+    msgtype = str(data.get("msgtype") or "").strip()
+    if not msgtype:
+        raise BridgeError(400, "msgtype required")
+    last_error: Optional[BridgeError] = None
+
+    if msgtype == "template_card":
+        try:
+            template_card = validate_template_card_payload(data.get("templateCard"), require_interaction_task_id=False)
+        except ValueError as exc:
+            raise BridgeError(400, str(exc)) from exc
+        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        if feedback_id is not None:
+            try:
+                feedback_id = validate_feedback_id(feedback_id)
+            except ValueError as exc:
+                raise BridgeError(400, str(exc)) from exc
+        payload_data = {"msgtype": "template_card", "templateCard": template_card, "feedbackId": feedback_id}
+    elif msgtype == "markdown":
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise BridgeError(400, "content required")
+        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        if feedback_id is not None:
+            try:
+                feedback_id = validate_feedback_id(feedback_id)
+            except ValueError as exc:
+                raise BridgeError(400, str(exc)) from exc
+        payload_data = {
+            "msgtype": "markdown",
+            "content": content,
+            "mentionUserId": str(data.get("mentionUserId") or data.get("mention_user_id") or "").strip() or None,
+            "feedbackId": feedback_id,
+        }
+    else:
+        raise BridgeError(400, f"unsupported msgtype: {msgtype}")
+
+    if chat_key_value:
+        try:
+            validated_chat_key = validate_chat_key(chat_key_value)
+            if target_config_id:
+                bot = resolve_loaded_target_bot(target_config_id, bot_name)
+            else:
+                bot = require_unique_bot_for_chat_key(validated_chat_key, bot_name)
+            if not bot.ws or bot.ws.closed:
+                raise BridgeError(503, "bot not connected")
+            return bot, validated_chat_key, payload_data
+        except BridgeError as exc:
+            last_error = exc
+            if not session_id:
+                raise
+
+    if session_id:
+        try:
+            record = read_session_record_by_id(session_id)
+            if not record:
+                raise BridgeError(404, f"session not found: {session_id}")
+            if target_config_id and str(record["botId"]) != target_config_id:
+                raise BridgeError(409, f"bot config mismatch for message send target: {target_config_id}")
+            resolved_target_config_id = target_config_id or str(record["botId"])
+            bot = resolve_loaded_target_bot(resolved_target_config_id, bot_name)
+            resolved_chat_key = str(record["chatKey"])
+            if not bot.ws or bot.ws.closed:
+                raise BridgeError(503, "bot not connected")
+            return bot, resolved_chat_key, payload_data
+        except BridgeError as exc:
+            if last_error is None:
+                raise
+            raise exc
+
+    if last_error is not None:
+        raise last_error
+
+    raise BridgeError(400, "chatKey or sessionId required")
+
+
+async def submit_send_message_request(data: dict[str, Any], source: str = "api") -> dict[str, Any]:
+    bot, resolved_chat_key, payload_data = resolve_message_send_request(data)
+    if payload_data["msgtype"] == "template_card":
+        payload = build_proactive_template_card_payload(resolved_chat_key, payload_data["templateCard"])
+        payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
+        register_template_card_button_texts(bot, ((payload.get("body") or {}).get("template_card") or {}))
+    else:
+        payload = build_proactive_chat_payload(resolved_chat_key, payload_data["content"], payload_data.get("mentionUserId"))
+        payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
+    response = await send_ws_payload_with_ack(bot, payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
+    if response.get("errcode") not in (None, 0):
+        raise BridgeError(502, f"message send failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+    add_log(bot, f"[{resolved_chat_key}] message request accepted via {source}: {payload_data['msgtype']}")
+    add_event_log(
+        bot,
+        "message.send_accepted",
+        chatKey=resolved_chat_key,
+        source=source,
+        msgtype=payload_data["msgtype"],
+    )
+    result = {"ok": True, "chatKey": resolved_chat_key, "msgtype": payload_data["msgtype"]}
+    if payload_data["msgtype"] == "template_card":
+        result["cardType"] = str(payload_data["templateCard"].get("card_type") or "")
+    return result
+
+
+def submit_local_send_message_request(data: dict[str, Any], source: str = "local-command") -> dict[str, Any]:
+    bot, resolved_chat_key, payload_data = resolve_message_send_request(data)
+    queue_paths = get_local_send_message_queue_paths()
+    ensure_local_send_message_dirs()
+    request_id = str(data.get("requestId") or data.get("request_id") or "").strip() or uid()
+    requested_at = normalize_optional_int(data.get("requestedAt") or data.get("requested_at")) or now_ms()
+    timeout_ms = normalize_optional_int(data.get("timeoutMs") or data.get("timeout_ms")) or LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS
+    expires_at = normalize_optional_int(data.get("expiresAt") or data.get("expires_at")) or (requested_at + timeout_ms)
+    request = {
+        "requestId": request_id,
+        "chatKey": resolved_chat_key,
+        "botName": bot.config["name"],
+        "targetConfigId": bot.config["id"],
+        "msgtype": payload_data["msgtype"],
+        "content": payload_data.get("content"),
+        "mentionUserId": payload_data.get("mentionUserId"),
+        "feedbackId": payload_data.get("feedbackId"),
+        "templateCard": payload_data.get("templateCard"),
+        "requestedAt": requested_at,
+        "timeoutMs": timeout_ms,
+        "expiresAt": expires_at,
+        "source": source,
+    }
+    pending_file = queue_paths["pending"] / f"{request_id}.json"
+    write_json_atomic(pending_file, request)
+    add_log(bot, f"[{resolved_chat_key}] local message request accepted via {source}: {payload_data['msgtype']}")
+    return {"ok": True, "requestId": request_id, "chatKey": resolved_chat_key, "msgtype": payload_data["msgtype"]}
+
+
 def submit_file_send_request(data: dict[str, Any], source: str = "api") -> dict[str, Any]:
     bot, resolved_chat_key, resolved_file = resolve_file_send_request(data)
     local_request_id = str(data.get("localRequestId") or data.get("local_request_id") or "").strip() or None
@@ -5209,6 +5662,54 @@ async def process_local_file_send_queue_once() -> None:
                     finalize_local_file_send_job(processing_file, False)
     finally:
         LOCAL_FILE_SEND_QUEUE_BUSY = False
+
+
+async def process_local_send_message_queue_once() -> None:
+    ensure_local_send_message_dirs(sorted(BOTS.keys()))
+    for queue_paths in list_local_send_message_queue_path_groups():
+        for pending_file in [*sorted(queue_paths["pending"].glob("*.json")), *sorted(queue_paths["processing"].glob("*.json"))]:
+            processing_file = pending_file
+            if pending_file.parent == queue_paths["pending"]:
+                processing_file = queue_paths["processing"] / pending_file.name
+                try:
+                    pending_file.replace(processing_file)
+                except FileNotFoundError:
+                    continue
+            request = read_json_file(processing_file, None)
+            if not isinstance(request, dict):
+                write_local_send_message_result(
+                    processing_file.stem,
+                    {"ok": False, "statusCode": 400, "error": "invalid local message request"},
+                    queue_paths,
+                )
+                finalize_local_send_message_job(processing_file, False)
+                continue
+            request_id = str(request.get("requestId") or processing_file.stem).strip() or processing_file.stem
+            expires_at = normalize_optional_int(request.get("expiresAt") or request.get("expires_at"))
+            if expires_at is not None and now_ms() > expires_at:
+                write_local_send_message_result(
+                    request_id,
+                    {"ok": False, "statusCode": 408, "error": "timeout waiting for bridge result"},
+                    queue_paths,
+                )
+                finalize_local_send_message_job(processing_file, False)
+                continue
+            try:
+                result = await submit_send_message_request(request, "local-command")
+                write_local_send_message_result(request_id, result, queue_paths)
+                finalize_local_send_message_job(processing_file, True)
+            except BridgeError as exc:
+                if exc.status_code == 503 and (exc.message == "bot not connected" or exc.message.startswith("bot not running:")):
+                    write_json_atomic(queue_paths["pending"] / processing_file.name, request)
+                    with suppress(FileNotFoundError):
+                        processing_file.unlink()
+                    continue
+                write_local_send_message_result(
+                    request_id,
+                    {"ok": False, "statusCode": exc.status_code, "error": exc.message},
+                    queue_paths,
+                )
+                finalize_local_send_message_job(processing_file, False)
 
 
 def create_request_future(bot: BotState, req_id: str) -> asyncio.Future:
@@ -6416,6 +6917,10 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         )
         return
 
+    if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "template_card_event"):
+        await handle_template_card_event(bot, message)
+        return
+
     if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "disconnected_event"):
         bot.status = "disconnected"
         bot.last_disconnect_at_ms = now_ms()
@@ -6763,6 +7268,19 @@ async def local_file_send_loop() -> None:
             raise
         except Exception as exc:
             print_log(f"[LOOP] local_file_send_loop error: {exc}")
+            if not SHUTDOWN_EVENT.is_set():
+                await asyncio.sleep(1)
+
+
+async def local_send_message_loop() -> None:
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            await process_local_send_message_queue_once()
+            await asyncio.sleep(LOCAL_FILE_SEND_POLL_MS / 1000)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print_log(f"[LOOP] local_send_message_loop error: {exc}")
             if not SHUTDOWN_EVENT.is_set():
                 await asyncio.sleep(1)
 
@@ -7164,6 +7682,17 @@ async def api_send_file(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
 
 
+async def api_send_message(request: web.Request) -> web.Response:
+    denied = await require_api_access(request)
+    if denied:
+        return denied
+    try:
+        data = await read_json_body(request)
+        return web.json_response(await submit_send_message_request(data))
+    except BridgeError as exc:
+        return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
+
+
 async def api_get_schedules(request: web.Request) -> web.Response:
     denied = await require_api_access(request)
     if denied:
@@ -7302,6 +7831,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/bots/{bot_id}/sessions/{chat_key}/chat", api_get_chat)
     app.router.add_post("/api/bots/{bot_id}/sessions/{chat_key}/interrupt", api_interrupt_session)
     app.router.add_post("/api/bots/{bot_id}/sessions/{chat_key}/reset", api_reset_session)
+    app.router.add_post("/api/send-message", api_send_message)
     app.router.add_post("/api/send-file", api_send_file)
     app.router.add_get("/api/schedules", api_get_schedules)
     app.router.add_post("/api/schedules", api_add_schedule)
@@ -7369,6 +7899,7 @@ async def main() -> None:
     recycler_task = asyncio.create_task(session_recycler_loop())
     renew_task = asyncio.create_task(lease_renew_loop())
     local_send_task = asyncio.create_task(local_file_send_loop())
+    local_send_message_task = asyncio.create_task(local_send_message_loop())
     schedule_definition_task = asyncio.create_task(schedule_definition_loop())
     scheduled_message_task = asyncio.create_task(scheduled_message_loop())
     paused_recovery_task = asyncio.create_task(paused_session_recovery_loop())
@@ -7391,6 +7922,7 @@ async def main() -> None:
     recycler_task.cancel()
     renew_task.cancel()
     local_send_task.cancel()
+    local_send_message_task.cancel()
     schedule_definition_task.cancel()
     scheduled_message_task.cancel()
     paused_recovery_task.cancel()
@@ -7400,6 +7932,7 @@ async def main() -> None:
         recycler_task,
         renew_task,
         local_send_task,
+        local_send_message_task,
         schedule_definition_task,
         scheduled_message_task,
         paused_recovery_task,

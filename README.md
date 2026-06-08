@@ -476,6 +476,12 @@ sh ./check_restart_noise.sh
 sh ./smoke_bridge.sh
 ```
 
+模板卡片双人群聊 smoke：
+
+```bash
+sh ./smoke_template_card.sh "<chat-key>" "<bot-config-id>" "<bot-name>"
+```
+
 完整测试：
 
 ```bash

@@ -49,6 +49,7 @@ def build_bot_config(
         codex_exec_mode=(str(codex_exec_mode).strip().lower() or "host"),
         file_send_roots=tuple(Path(item).expanduser().resolve() for item in file_send_roots),
         max_upload_size=max(1, int(max_upload_size)),
+        platform="wecom",
     )
 
 

@@ -12,12 +12,13 @@ from aiohttp import web
 from .async_utils import run_blocking
 from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
-from .layout import build_workspace_ref
-from .models import WeComBotRuntime, WeComTextMessage
+from .layout import build_workspace_ref, parse_chat_key
+from .messaging import get_messaging_provider
+from .models import OutboundMessage, TemplateCardUpdateRequest, WeComBotRuntime, WeComTextMessage
 from .reply_state import cleanup_reply_state
 from .runtime import cleanup_orphan_session_codex_homes, cleanup_stale_session_codex_homes, stable_session_id
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
-from .wecom_upload import upload_and_send_file
+from .template_card_validation import validate_feedback_id, validate_template_card_payload, validate_template_card_update_payload
 from .wecom_runtime import run_wecom_runtime
 from .wecom_upload import reject_pending_requests
 
@@ -214,7 +215,7 @@ async def api_send_file(request) -> web.Response:
     if runtime.ws is None or not runtime.connected:
         raise web.HTTPServiceUnavailable(text="bot not connected")
     try:
-        result = await upload_and_send_file(runtime, file_request)
+        result = await get_messaging_provider(bot).send_file(runtime, file_request)
     except asyncio.TimeoutError as exc:
         raise web.HTTPGatewayTimeout(text="file send timed out") from exc
     except RuntimeError as exc:
@@ -236,6 +237,124 @@ async def api_send_file(request) -> web.Response:
             "message": f"sent {file_request.file_name}",
         }
     )
+
+
+async def api_send_message(request) -> web.Response:
+    bot = request.app[APP_BOT_KEY]
+    runtime = request.app[APP_WECOM_RUNTIME_KEY]
+    try:
+        data = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text="request body must be a JSON object")
+    chat_key = str(data.get("chatKey") or "").strip()
+    msgtype = str(data.get("msgtype") or "").strip()
+    if not chat_key:
+        raise web.HTTPBadRequest(text="chatKey required")
+    try:
+        parse_chat_key(chat_key)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    if not msgtype:
+        raise web.HTTPBadRequest(text="msgtype required")
+    if msgtype == "markdown":
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise web.HTTPBadRequest(text="content required")
+        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        if feedback_id is not None:
+            try:
+                feedback_id = validate_feedback_id(feedback_id)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text=str(exc)) from exc
+        message = OutboundMessage(
+            chat_key=chat_key,
+            msgtype="markdown",
+            content=content,
+            mention_user_id=str(data.get("mentionUserId") or data.get("mention_user_id") or "").strip() or None,
+            feedback_id=feedback_id,
+        )
+    elif msgtype == "template_card":
+        template_card = data["templateCard"] if "templateCard" in data else data.get("template_card")
+        try:
+            template_card = validate_template_card_payload(template_card, require_interaction_task_id=False)
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        card_type = str(template_card.get("card_type") or "").strip()
+        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        if feedback_id is not None:
+            try:
+                feedback_id = validate_feedback_id(feedback_id)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text=str(exc)) from exc
+        message = OutboundMessage(
+            chat_key=chat_key,
+            msgtype="template_card",
+            template_card=template_card,
+            feedback_id=feedback_id,
+        )
+    else:
+        raise web.HTTPBadRequest(text=f"unsupported msgtype: {msgtype}")
+    if runtime.ws is None or not runtime.connected:
+        raise web.HTTPServiceUnavailable(text="bot not connected")
+    try:
+        result = await get_messaging_provider(bot).send_proactive_message(runtime, message)
+    except asyncio.TimeoutError as exc:
+        raise web.HTTPGatewayTimeout(text="message send timed out") from exc
+    except RuntimeError as exc:
+        message_text = str(exc) or "message send failed"
+        if "not connected" in message_text:
+            raise web.HTTPServiceUnavailable(text=message_text) from exc
+        raise web.HTTPBadGateway(text=message_text) from exc
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=str(exc) or "message send failed") from exc
+    response_payload = {
+        "ok": True,
+        "chatKey": chat_key,
+        "msgtype": msgtype,
+        "payloadCount": int(result.get("payloadCount") or 1),
+    }
+    if msgtype == "template_card":
+        response_payload["cardType"] = str((template_card or {}).get("card_type") or "")
+    return web.json_response(response_payload)
+
+
+async def api_update_template_card(request) -> web.Response:
+    bot = request.app[APP_BOT_KEY]
+    runtime = request.app[APP_WECOM_RUNTIME_KEY]
+    try:
+        data = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text="request body must be a JSON object")
+    req_id = str(data.get("reqId") or data.get("req_id") or "").strip()
+    template_card = data["templateCard"] if "templateCard" in data else data.get("template_card")
+    if not req_id:
+        raise web.HTTPBadRequest(text="reqId required")
+    if not isinstance(template_card, dict):
+        raise web.HTTPBadRequest(text="templateCard must be a JSON object")
+    try:
+        template_card = validate_template_card_update_payload(template_card)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    card_type = str(template_card.get("card_type") or "").strip()
+    if runtime.ws is None or not runtime.connected:
+        raise web.HTTPServiceUnavailable(text="bot not connected")
+    update_request = TemplateCardUpdateRequest(req_id=req_id, template_card=template_card)
+    try:
+        await get_messaging_provider(bot).update_template_card(runtime, update_request)
+    except asyncio.TimeoutError as exc:
+        raise web.HTTPGatewayTimeout(text="template card update timed out") from exc
+    except RuntimeError as exc:
+        message_text = str(exc) or "template card update failed"
+        if "not connected" in message_text:
+            raise web.HTTPServiceUnavailable(text=message_text) from exc
+        raise web.HTTPBadGateway(text=message_text) from exc
+    except Exception as exc:
+        raise web.HTTPBadGateway(text=str(exc) or "template card update failed") from exc
+    return web.json_response({"ok": True, "reqId": req_id, "cardType": card_type})
 
 
 async def api_list_schedules(request) -> web.Response:
@@ -444,6 +563,8 @@ def create_app(config: AppConfig) -> web.Application:
     app.router.add_get("/", api_health)
     app.router.add_get("/healthz", api_health)
     app.router.add_post("/api/prepare", api_prepare)
+    app.router.add_post("/api/send-message", api_send_message)
+    app.router.add_post("/api/template-card/update", api_update_template_card)
     app.router.add_post("/api/send-file", api_send_file)
     app.router.add_get("/api/schedules", api_list_schedules)
     app.router.add_post("/api/schedules", api_create_schedule)

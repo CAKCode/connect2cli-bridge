@@ -4744,6 +4744,240 @@ async def test_handle_wecom_disconnected_event_closes_websocket(bridge_module):
 
 
 @pytest.mark.asyncio
+async def test_handle_wecom_template_card_event_updates_card(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sent = []
+    enqueued = []
+    bot.template_card_button_texts["task-1"] = {"ack_received": "确认"}
+    bot.template_card_payloads["task-1"] = {
+        "card_type": "button_interaction",
+        "main_title": {"title": "请确认执行", "desc": "converter smoke"},
+        "button_list": [{"text": "确认", "style": 0, "key": "ack_received"}],
+        "task_id": "task-1",
+    }
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        sent.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    async def fake_enqueue_message(_bot, _key, text, _req_id, **_kwargs):
+        enqueued.append(text)
+        return True
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "enqueue_message", fake_enqueue_message)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "evt-req-1"},
+            "body": {
+                "msgtype": "event",
+                "chattype": "single",
+                "from": {"userid": "user-a"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "button_interaction",
+                        "event_key": "ack_received",
+                        "task_id": "task-1",
+                    },
+                },
+            },
+        },
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_respond_update_msg"
+    assert sent[0]["headers"]["req_id"] == "evt-req-1"
+    assert sent[0]["body"]["response_type"] == "update_template_card"
+    assert sent[0]["body"]["template_card"]["card_type"] == "button_interaction"
+    assert sent[0]["body"]["template_card"]["main_title"]["title"] == "请确认执行"
+    assert sent[0]["body"]["template_card"]["button_list"][0]["text"] == "确认"
+    assert enqueued == ["确认"]
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_template_card_event_ignores_duplicate_owner_click(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sent = []
+    enqueued = []
+    bot.template_card_button_texts["task-1"] = {"ack_received": "确认"}
+    bot.consumed_template_card_actions.add("task-1\nack_received\nuser-a")
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        sent.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    async def fake_enqueue_message(_bot, _key, text, _req_id, **_kwargs):
+        enqueued.append(text)
+        return True
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "enqueue_message", fake_enqueue_message)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "evt-req-dup"},
+            "body": {
+                "msgtype": "event",
+                "chattype": "single",
+                "from": {"userid": "user-a"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "button_interaction",
+                        "event_key": "ack_received",
+                        "task_id": "task-1",
+                    },
+                },
+            },
+        },
+    )
+
+    assert enqueued == []
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_send_msg"
+    assert "该操作已处理，请勿重复点击。" in sent[0]["body"]["markdown"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_template_card_event_still_enqueues_when_card_update_fails(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    enqueued = []
+    bot.template_card_button_texts["task-1"] = {"ack_received": "确认执行"}
+    bot.template_card_payloads["task-1"] = {
+        "card_type": "button_interaction",
+        "main_title": {"title": "请确认执行"},
+        "button_list": [{"text": "确认执行", "style": 0, "key": "ack_received"}],
+        "task_id": "task-1",
+    }
+
+    async def fake_send_ws_payload_with_ack(_bot, _payload, _timeout_sec):
+        raise bridge_module.BridgeError(504, "websocket ack timeout")
+
+    async def fake_enqueue_message(_bot, _key, text, _req_id, **_kwargs):
+        enqueued.append(text)
+        return True
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "enqueue_message", fake_enqueue_message)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "evt-req-timeout"},
+            "body": {
+                "msgtype": "event",
+                "chattype": "single",
+                "from": {"userid": "user-a"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "button_interaction",
+                        "event_key": "ack_received",
+                        "task_id": "task-1",
+                    },
+                },
+            },
+        },
+    )
+
+    assert enqueued == ["确认执行"]
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_template_card_event_from_non_owner_only_replies_info(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sent = []
+    events = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        sent.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    def fake_add_event_log(_bot, event, **fields):
+        events.append((event, fields))
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "add_event_log", fake_add_event_log)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "evt-req-2"},
+            "body": {
+                "msgtype": "event",
+                "chattype": "group",
+                "chatid": "room-1",
+                "from": {"userid": "user-b"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "button_interaction",
+                        "event_key": "ack_received",
+                        "task_id": "task-1__owner__user-a",
+                    },
+                },
+            },
+        },
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_send_msg"
+    assert "这是 user-a 的卡片" in sent[0]["body"]["markdown"]["content"]
+    assert events[0][0] == "template_card.click_rejected_non_owner"
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_template_card_event_non_button_type_only_replies_info(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sent = []
+    events = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        sent.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    def fake_add_event_log(_bot, event, **fields):
+        events.append((event, fields))
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "add_event_log", fake_add_event_log)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "evt-req-3"},
+            "body": {
+                "msgtype": "event",
+                "chattype": "single",
+                "from": {"userid": "user-a"},
+                "event": {
+                    "eventtype": "template_card_event",
+                    "template_card_event": {
+                        "card_type": "vote_interaction",
+                        "event_key": "submit_vote",
+                        "task_id": "task-1",
+                    },
+                },
+            },
+        },
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_send_msg"
+    assert "当前类型暂不自动更新卡片" in sent[0]["body"]["markdown"]["content"]
+    assert events[0][0] == "template_card.click_no_auto_update"
+
+
+@pytest.mark.asyncio
 async def test_handle_wecom_message_logs_raw_inbound_summary(bridge_module):
     bot = make_bot(bridge_module)
     bridge_module.WECOM_RAW_INBOUND_LOG_ENABLED = True
@@ -4919,6 +5153,263 @@ def test_api_add_bot_uses_stable_default_id(monkeypatch, bridge_module):
 
     assert body["ok"] is True
     assert body["id"] == bridge_module.default_bot_config_id("bot-id")
+
+
+def test_submit_send_message_request_sends_template_card(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    ack_payloads = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        ack_payloads.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    result = asyncio.run(
+        bridge_module.submit_send_message_request(
+            {
+                "chatKey": "single:test-user",
+                "msgtype": "template_card",
+                "templateCard": {
+                    "card_type": "text_notice",
+                    "main_title": {"title": "hello"},
+                    "card_action": {"type": 1, "url": "https://example.com"},
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["msgtype"] == "template_card"
+    assert result["cardType"] == "text_notice"
+    assert ack_payloads[0]["cmd"] == "aibot_send_msg"
+    assert ack_payloads[0]["body"]["msgtype"] == "template_card"
+    assert ack_payloads[0]["body"]["template_card"]["card_type"] == "text_notice"
+
+
+def test_submit_send_message_request_preserves_feedback_id(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    ack_payloads = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        ack_payloads.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    asyncio.run(
+        bridge_module.submit_send_message_request(
+            {
+                "chatKey": "single:test-user",
+                "msgtype": "template_card",
+                "feedbackId": "feedback-1",
+                "templateCard": {
+                    "card_type": "text_notice",
+                    "main_title": {"title": "hello"},
+                    "card_action": {"type": 1, "url": "https://example.com"},
+                },
+            }
+        )
+    )
+
+    assert ack_payloads[0]["body"]["template_card"]["feedback"]["id"] == "feedback-1"
+
+
+def test_resolve_message_send_request_rejects_oversized_feedback_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.resolve_message_send_request(
+            {
+                "chatKey": "single:test-user",
+                "msgtype": "markdown",
+                "content": "hello",
+                "feedbackId": "x" * 257,
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "feedback.id exceeds 256 bytes"
+
+
+def test_api_send_message_returns_template_card_result(monkeypatch, bridge_module):
+    payload = {
+        "chatKey": "single:test-user",
+        "msgtype": "template_card",
+        "templateCard": {
+            "card_type": "text_notice",
+            "main_title": {"title": "hello"},
+            "card_action": {"type": 1, "url": "https://example.com"},
+        },
+    }
+
+    async def fake_read_json_body(_request):
+        return payload
+
+    async def fake_require_api_access(_request):
+        return None
+
+    async def fake_submit_send_message_request(data, source="api"):
+        assert data == payload
+        assert source == "api"
+        return {"ok": True, "chatKey": "single:test-user", "msgtype": "template_card", "cardType": "text_notice"}
+
+    monkeypatch.setattr(bridge_module, "read_json_body", fake_read_json_body)
+    monkeypatch.setattr(bridge_module, "require_api_access", fake_require_api_access)
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+
+    response = asyncio.run(bridge_module.api_send_message(SimpleNamespace()))
+    body = json.loads(response.text)
+
+    assert body["ok"] is True
+    assert body["msgtype"] == "template_card"
+    assert body["cardType"] == "text_notice"
+
+
+def test_build_template_card_update_payload_uses_update_template_card_response_type(bridge_module):
+    payload = bridge_module.build_template_card_update_payload(
+        "req-update-1",
+        {"card_type": "button_interaction", "main_title": {"title": "updated"}},
+    )
+
+    assert payload["cmd"] == "aibot_respond_update_msg"
+    assert payload["headers"]["req_id"] == "req-update-1"
+    assert payload["body"]["response_type"] == "update_template_card"
+    assert payload["body"]["template_card"]["card_type"] == "button_interaction"
+
+
+def test_build_proactive_template_card_payload_marks_group_owner(bridge_module):
+    payload = bridge_module.build_proactive_template_card_payload(
+        "group-user:room-1:user-a",
+        {
+            "card_type": "button_interaction",
+            "sub_title_text": "原始说明",
+            "button_list": [{"text": "处理", "style": 1, "key": "go"}],
+            "task_id": "task-1",
+        },
+    )
+
+    assert payload["body"]["chat_type"] == 2
+    assert payload["body"]["chatid"] == "room-1"
+    assert payload["body"]["template_card"]["sub_title_text"].startswith("此卡片归属：user-a")
+    assert payload["body"]["template_card"]["task_id"].startswith("task-1--owner--user-a--uniq--")
+
+
+def test_build_proactive_template_card_payload_generates_task_id_for_interaction_card(bridge_module):
+    payload = bridge_module.build_proactive_template_card_payload(
+        "group-user:room-1:user-a",
+        {
+            "card_type": "button_interaction",
+            "button_list": [{"text": "处理", "style": 1, "key": "go"}],
+        },
+    )
+
+    assert payload["body"]["template_card"]["task_id"].startswith("codex-card-")
+    assert "--owner--user-a--uniq--" in payload["body"]["template_card"]["task_id"]
+
+
+def test_resolve_message_send_request_allows_missing_task_id_for_interaction_card(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    resolved_bot, resolved_chat_key, payload_data = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "hello"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert payload_data["templateCard"]["card_type"] == "button_interaction"
+
+
+def test_extract_template_card_owner_user_id_supports_new_and_legacy_formats(bridge_module):
+    assert bridge_module.extract_template_card_owner_user_id("task-1--owner--user-a--uniq--abcdef") == "user-a"
+    assert bridge_module.extract_template_card_owner_user_id("task-1__owner__user-a__uniq__abcdef") == "user-a"
+
+
+@pytest.mark.asyncio
+async def test_process_local_send_message_queue_writes_success_result(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    request_id = "local-msg-1"
+    queue_paths = bridge_module.get_local_send_message_queue_paths(bot.config["id"])
+    for root in ("pending", "processing", "results", "done"):
+        with contextlib.suppress(FileNotFoundError):
+            (queue_paths[root] / f"{request_id}.json").unlink()
+    bridge_module.write_json_atomic(
+        queue_paths["pending"] / f"{request_id}.json",
+        {
+            "requestId": request_id,
+            "chatKey": "single:test-user",
+            "msgtype": "markdown",
+            "content": "hello",
+            "requestedAt": bridge_module.now_ms(),
+            "timeoutMs": bridge_module.LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS,
+            "expiresAt": bridge_module.now_ms() + bridge_module.LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS,
+        },
+    )
+
+    async def fake_submit_send_message_request(data, source="api"):
+        assert data["chatKey"] == "single:test-user"
+        assert source == "local-command"
+        return {"ok": True, "chatKey": "single:test-user", "msgtype": "markdown"}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+
+    await bridge_module.process_local_send_message_queue_once()
+
+    result = bridge_module.read_json_file(queue_paths["results"] / f"{request_id}.json", None)
+    assert result["ok"] is True
+    assert (queue_paths["done"] / f"{request_id}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_local_send_message_queue_requeues_transient_503(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    request_id = "local-msg-2"
+    queue_paths = bridge_module.get_local_send_message_queue_paths(bot.config["id"])
+    for root in ("pending", "processing", "results", "done"):
+        with contextlib.suppress(FileNotFoundError):
+            (queue_paths[root] / f"{request_id}.json").unlink()
+    bridge_module.write_json_atomic(
+        queue_paths["pending"] / f"{request_id}.json",
+        {
+            "requestId": request_id,
+            "chatKey": "single:test-user",
+            "msgtype": "markdown",
+            "content": "hello",
+            "requestedAt": bridge_module.now_ms(),
+            "timeoutMs": bridge_module.LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS,
+            "expiresAt": bridge_module.now_ms() + bridge_module.LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS,
+        },
+    )
+
+    async def fake_submit_send_message_request(_data, source="api"):
+        raise bridge_module.BridgeError(503, "bot not connected")
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+
+    await bridge_module.process_local_send_message_queue_once()
+
+    assert (queue_paths["pending"] / f"{request_id}.json").exists()
+    assert not (queue_paths["results"] / f"{request_id}.json").exists()
 
 
 @pytest.mark.asyncio

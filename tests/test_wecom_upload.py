@@ -3,6 +3,8 @@ from pathlib import Path
 
 from workspace_bridge.models import BotConfig, FileSendRequest, SourceConfig, WeComBotRuntime
 from workspace_bridge.wecom_upload import build_send_file_payload, chat_key_to_send_target, require_ack_ok, resolve_pending_request, upload_and_send_file
+from workspace_bridge.wecom_messaging import WeComMessagingProvider
+from workspace_bridge.models import TemplateCardUpdateRequest
 
 
 class FakeWS:
@@ -136,3 +138,28 @@ async def test_upload_and_send_file_rejects_failed_send_ack(tmp_path: Path) -> N
         assert "send file failed: send failed" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+async def test_wecom_provider_updates_template_card_with_ack(tmp_path: Path) -> None:
+    runtime = make_bot_runtime(tmp_path)
+    provider = WeComMessagingProvider()
+
+    async def fake_send_json(payload: dict) -> None:
+        runtime.ws.sent.append(payload)
+        req_id = payload["headers"]["req_id"]
+        if payload["cmd"] == "aibot_respond_update_msg":
+            resolve_pending_request(runtime, {"headers": {"req_id": req_id}, "errcode": 0, "body": {}})
+
+    runtime.ws.send_json = fake_send_json
+
+    result = await provider.update_template_card(
+        runtime,
+        TemplateCardUpdateRequest(
+            req_id="req-update-1",
+            template_card={"card_type": "button_interaction", "main_title": {"title": "updated"}},
+        ),
+    )
+
+    assert result["ok"] is True
+    assert runtime.ws.sent[0]["cmd"] == "aibot_respond_update_msg"
+    assert runtime.ws.sent[0]["body"]["response_type"] == "update_template_card"

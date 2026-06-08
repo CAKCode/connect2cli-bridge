@@ -27,6 +27,7 @@ class BotConfig:
     codex_exec_mode: Literal["sandboxed", "host"] = "host"
     file_send_roots: tuple[Path, ...] = ()
     max_upload_size: int = 100 * 1024 * 1024
+    platform: str = "wecom"
 
 
 @dataclass
@@ -163,6 +164,40 @@ class WeComTextMessage:
     chat_key: str
     content: str
     raw_payload: dict
+
+
+@dataclass(frozen=True)
+class OutboundMessage:
+    chat_key: str
+    msgtype: str
+    content: str | None = None
+    template_card: dict | None = None
+    media_id: str | None = None
+    mention_user_id: str | None = None
+    feedback_id: str | None = None
+
+
+@dataclass(frozen=True)
+class WeComTemplateCardSelection:
+    question_key: str
+    option_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WeComTemplateCardEvent:
+    req_id: str
+    chat_key: str
+    card_type: str
+    event_key: str
+    task_id: str | None
+    selected_items: tuple[WeComTemplateCardSelection, ...]
+    raw_payload: dict
+
+
+@dataclass(frozen=True)
+class TemplateCardUpdateRequest:
+    req_id: str
+    template_card: dict
 
 
 @dataclass(frozen=True)

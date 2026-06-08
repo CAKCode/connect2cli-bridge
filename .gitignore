@@ -19,6 +19,7 @@ __pycache__/
 .user-aliases/
 chatfile/
 .local-file-send-queue/
+.local-send-message-queue/
 .session-locks/
 .session-registry/
 .scheduled-messages/

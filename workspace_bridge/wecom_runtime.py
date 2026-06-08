@@ -13,7 +13,6 @@ from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payl
 from .reply_state import cleanup_reply_state
 from .runtime import list_session_records, prepare_session_run, remove_session_codex_home, stable_session_id, update_session_record
 from .wecom_protocol import (
-    build_proactive_text_payload,
     build_subscribe_payload,
     build_text_response_payload,
     chat_key_to_user_id,

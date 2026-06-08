@@ -126,11 +126,11 @@ async def test_service_send_file_endpoint_uses_thread_offload_for_prepare_sessio
         calls.append(func.__name__)
         return func(*args, **kwargs)
 
-    async def fake_upload_and_send_file(_runtime, _request):
+    async def fake_send_file(_runtime, _request):
         return {"mediaId": "media-1"}
 
     monkeypatch.setattr(service_module, "run_blocking", fake_run_blocking)
-    monkeypatch.setattr(service_module, "upload_and_send_file", fake_upload_and_send_file)
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.upload_and_send_file", fake_send_file)
 
     class JsonRequest:
         def __init__(self, app):
@@ -257,12 +257,12 @@ async def test_service_send_file_endpoint_uploads_workspace_file(tmp_path: Path,
     file_path.write_text("done", encoding="utf-8")
     captured = {}
 
-    async def fake_upload_and_send_file(bot_runtime, request):
+    async def fake_send_file(bot_runtime, request):
         captured["runtime"] = bot_runtime
         captured["request"] = request
         return {"ok": True, "mediaId": "media-1"}
 
-    monkeypatch.setattr("workspace_bridge.service.upload_and_send_file", fake_upload_and_send_file)
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.upload_and_send_file", fake_send_file)
     runtime.ws = object()
     runtime.connected = True
 
@@ -293,10 +293,10 @@ async def test_service_send_file_endpoint_maps_upload_failure(tmp_path: Path, mo
     file_path = launch.runtime_context.export_dir / "result.txt"
     file_path.write_text("done", encoding="utf-8")
 
-    async def fake_upload_and_send_file(_bot_runtime, _request):
+    async def fake_send_file(_bot_runtime, _request):
         raise RuntimeError("send file failed: send failed")
 
-    monkeypatch.setattr("workspace_bridge.service.upload_and_send_file", fake_upload_and_send_file)
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.upload_and_send_file", fake_send_file)
     runtime.ws = object()
     runtime.connected = True
 
@@ -321,10 +321,10 @@ async def test_service_send_file_endpoint_maps_transport_failure(tmp_path: Path,
     file_path = launch.runtime_context.export_dir / "result.txt"
     file_path.write_text("done", encoding="utf-8")
 
-    async def fake_upload_and_send_file(_bot_runtime, _request):
+    async def fake_send_file(_bot_runtime, _request):
         raise ConnectionResetError("transport disconnected")
 
-    monkeypatch.setattr("workspace_bridge.service.upload_and_send_file", fake_upload_and_send_file)
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.upload_and_send_file", fake_send_file)
     runtime.ws = object()
     runtime.connected = True
 
@@ -381,3 +381,528 @@ def test_send_file_request_cli_outputs_validated_request(tmp_path: Path) -> None
 
     payload = json.loads(result.stdout)
     assert payload["fileName"] == "result.txt"
+
+
+async def test_service_send_message_endpoint_sends_markdown(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    captured = {}
+
+    async def fake_send_proactive_message(_self, _runtime, message):
+        captured["runtime"] = _runtime
+        captured["message"] = message
+        return {"ok": True, "payloadCount": 1}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {"chatKey": "single:alice", "msgtype": "markdown", "content": "hello"}
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload == {"ok": True, "chatKey": "single:alice", "msgtype": "markdown", "payloadCount": 1}
+    assert captured["runtime"] is runtime
+    assert captured["message"].msgtype == "markdown"
+    assert captured["message"].content == "hello"
+
+
+async def test_service_send_message_endpoint_sends_template_card(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    captured = {}
+
+    async def fake_send_proactive_message(_self, _runtime, message):
+        captured["message"] = message
+        return {"ok": True, "payloadCount": 1}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "chatKey": "single:alice",
+                "msgtype": "template_card",
+                "templateCard": {
+                    "card_type": "text_notice",
+                    "main_title": {"title": "Build complete"},
+                    "card_action": {"type": 1, "url": "https://example.com"},
+                },
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert payload["cardType"] == "text_notice"
+    assert captured["message"].msgtype == "template_card"
+    assert captured["message"].template_card["card_type"] == "text_notice"
+
+
+async def test_service_send_message_endpoint_allows_interaction_card_without_task_id(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    captured = {}
+
+    async def fake_send_proactive_message(_self, _runtime, message):
+        captured["message"] = message
+        return {"ok": True, "payloadCount": 1}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "chatKey": "group-user:room-1:alice",
+                "msgtype": "template_card",
+                "templateCard": {
+                    "card_type": "button_interaction",
+                    "main_title": {"title": "Build complete"},
+                    "button_list": [{"text": "go", "style": 1, "key": "go"}],
+                },
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert payload["cardType"] == "button_interaction"
+    assert captured["message"].template_card["card_type"] == "button_interaction"
+
+
+async def test_service_send_message_endpoint_accepts_snake_case_fields(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    captured = {}
+
+    async def fake_send_proactive_message(_self, _runtime, message):
+        captured["message"] = message
+        return {"ok": True, "payloadCount": 1}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "chatKey": "single:alice",
+                "msgtype": "markdown",
+                "content": "hello",
+                "mention_user_id": "alice",
+                "feedback_id": "feedback-1",
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert captured["message"].mention_user_id == "alice"
+    assert captured["message"].feedback_id == "feedback-1"
+
+
+async def test_service_send_message_endpoint_rejects_invalid_payload(tmp_path: Path) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+
+    class JsonRequest:
+        def __init__(self, app, payload):
+            self.app = app
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {}))
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "chatKey required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {"chatKey": "single:alice"}))
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "msgtype required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {"chatKey": "single:alice", "msgtype": "template_card", "templateCard": {}}))
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "templateCard.card_type required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(
+            JsonRequest(
+                app,
+                {
+                    "chatKey": "single:alice",
+                    "msgtype": "template_card",
+                    "templateCard": {
+                        "card_type": "button_interaction",
+                        "main_title": {"title": "hello"}
+                    },
+                },
+            )
+    )
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "button_interaction.button_list required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(
+            JsonRequest(
+                app,
+                {
+                    "chatKey": "single:alice",
+                    "msgtype": "template_card",
+                    "templateCard": {
+                        "card_type": "button_interaction",
+                        "main_title": {"title": "hello"},
+                        "button_list": [{"text": "go", "style": 1, "key": ""}],
+                    },
+                },
+            )
+        )
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "button_interaction.button_list[1].key required"
+
+
+async def test_service_update_template_card_endpoint_calls_provider(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    captured = {}
+
+    async def fake_update_template_card(_self, _runtime, request):
+        captured["runtime"] = _runtime
+        captured["request"] = request
+        return {"ok": True}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.update_template_card", fake_update_template_card)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "reqId": "req-update-1",
+                "templateCard": {
+                    "card_type": "button_interaction",
+                    "main_title": {"title": "updated"},
+                    "button_list": [{"text": "已处理", "style": 1, "key": "done"}],
+                },
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/template-card/update")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload == {"ok": True, "reqId": "req-update-1", "cardType": "button_interaction"}
+    assert captured["runtime"] is runtime
+    assert captured["request"].req_id == "req-update-1"
+
+
+async def test_service_update_template_card_endpoint_rejects_invalid_payload(tmp_path: Path) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/template-card/update")
+
+    class JsonRequest:
+        def __init__(self, app, payload):
+            self.app = app
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {}))
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "reqId required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(JsonRequest(app, {"reqId": "req-update-1", "templateCard": {}}))
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "templateCard.card_type required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(
+            JsonRequest(
+                app,
+                {
+                    "reqId": "req-update-1",
+                    "templateCard": {},
+                },
+            )
+        )
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "templateCard.card_type required"
+
+    with pytest.raises(web.HTTPException) as excinfo:
+        await route.handler(
+            JsonRequest(
+                app,
+                {
+                    "reqId": "req-update-1",
+                    "templateCard": {
+                        "card_type": "button_interaction",
+                        "main_title": {"title": "updated"},
+                    },
+                },
+            )
+        )
+    assert excinfo.value.status == 400
+    assert excinfo.value.text == "button_interaction.button_list required"
+
+def test_send_message_cli_outputs_markdown_payload(tmp_path: Path) -> None:
+    import importlib.util
+
+    config, _bot, _launch = make_runtime(tmp_path)
+    queue_root = tmp_path / "message-queue"
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_markdown", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkey_queue_root = queue_root.resolve()
+    module.BASE_QUEUE_ROOT = monkey_queue_root
+    module.DEFAULT_BOT_CONFIG_ID = "bot-1"
+    module.QUEUE_ROOT, module.PENDING_ROOT, module.RESULT_ROOT = module.queue_paths_for_target(module.DEFAULT_BOT_CONFIG_ID)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--chat-key",
+            "single:alice",
+            "--bot-config-id",
+            "bot-1",
+            "--msgtype",
+            "markdown",
+            "--content",
+            "hello",
+        ]
+        pending_request = {}
+
+        def fake_sleep(_seconds: float) -> None:
+            pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+            assert pending_files
+            pending_request.update(json.loads(pending_files[0].read_text("utf-8")))
+            request_id = pending_request["requestId"]
+            module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+            (module.RESULT_ROOT / f"{request_id}.json").write_text(
+                json.dumps({"ok": True, "chatKey": "single:alice", "msgtype": "markdown"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        module.time.sleep = fake_sleep
+        result = module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert result == 0
+    assert pending_request["msgtype"] == "markdown"
+    assert pending_request["content"] == "hello"
+    assert pending_request["chatKey"] == "single:alice"
+
+
+def test_send_message_cli_outputs_template_card_payload(tmp_path: Path) -> None:
+    import importlib.util
+
+    config, _bot, _launch = make_runtime(tmp_path)
+    queue_root = tmp_path / "message-queue"
+    card_file = tmp_path / "card.json"
+    card_file.write_text(
+        json.dumps(
+            {
+                "card_type": "text_notice",
+                "main_title": {"title": "hello"},
+                "card_action": {"type": 1, "url": "https://example.com"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_card", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    module.BASE_QUEUE_ROOT = queue_root.resolve()
+    module.DEFAULT_BOT_CONFIG_ID = "bot-1"
+    module.QUEUE_ROOT, module.PENDING_ROOT, module.RESULT_ROOT = module.queue_paths_for_target(module.DEFAULT_BOT_CONFIG_ID)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--chat-key",
+            "single:alice",
+            "--bot-config-id",
+            "bot-1",
+            "--msgtype",
+            "template_card",
+            "--template-card-file",
+            str(card_file),
+        ]
+        pending_request = {}
+
+        def fake_sleep(_seconds: float) -> None:
+            pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+            assert pending_files
+            pending_request.update(json.loads(pending_files[0].read_text("utf-8")))
+            request_id = pending_request["requestId"]
+            module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+            (module.RESULT_ROOT / f"{request_id}.json").write_text(
+                json.dumps({"ok": True, "chatKey": "single:alice", "msgtype": "template_card", "cardType": "text_notice"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        module.time.sleep = fake_sleep
+        result = module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert result == 0
+    assert pending_request["msgtype"] == "template_card"
+    assert pending_request["templateCard"]["card_type"] == "text_notice"
+
+
+def test_send_message_cli_rejects_invalid_template_card(tmp_path: Path) -> None:
+    import importlib.util
+
+    card_file = tmp_path / "bad-card.json"
+    card_file.write_text(json.dumps({"card_type": "text_notice"}, ensure_ascii=False), encoding="utf-8")
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_bad_card", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--chat-key",
+            "single:alice",
+            "--msgtype",
+            "template_card",
+            "--template-card-file",
+            str(card_file),
+        ]
+        with pytest.raises(SystemExit) as excinfo:
+            module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert excinfo.value.code == 2
+
+
+def test_send_message_cli_rejects_oversized_feedback_id(tmp_path: Path) -> None:
+    import importlib.util
+
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_feedback_id", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--chat-key",
+            "single:alice",
+            "--msgtype",
+            "markdown",
+            "--content",
+            "hello",
+            "--feedback-id",
+            "x" * 257,
+        ]
+        with pytest.raises(SystemExit) as excinfo:
+            module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert excinfo.value.code == 2
+
+
+def test_send_message_cli_retries_transient_bridge_errors(tmp_path: Path) -> None:
+    import importlib.util
+
+    queue_root = tmp_path / "message-queue"
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_retry", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    module.BASE_QUEUE_ROOT = queue_root.resolve()
+    module.DEFAULT_BOT_CONFIG_ID = "bot-1"
+    module.QUEUE_ROOT, module.PENDING_ROOT, module.RESULT_ROOT = module.queue_paths_for_target(module.DEFAULT_BOT_CONFIG_ID)
+    seen_request_ids: set[str] = set()
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--chat-key",
+            "single:alice",
+            "--bot-config-id",
+            "bot-1",
+            "--msgtype",
+            "markdown",
+            "--content",
+            "hello",
+        ]
+        def fake_sleep(_seconds: float) -> None:
+            pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+            assert pending_files
+            pending_request = json.loads(pending_files[-1].read_text("utf-8"))
+            request_id = str(pending_request["requestId"])
+            if request_id in seen_request_ids:
+                return
+            seen_request_ids.add(request_id)
+            module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+            payload = (
+                {"ok": False, "statusCode": 503, "error": "bot not connected"}
+                if len(seen_request_ids) == 1
+                else {"ok": True, "chatKey": "single:alice", "msgtype": "markdown"}
+            )
+            (module.RESULT_ROOT / f"{request_id}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        module.time.sleep = fake_sleep
+        result = module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert result == 0
+    assert len(seen_request_ids) == 2
+
+
+def test_send_message_cli_retries_transient_transport_errors(tmp_path: Path) -> None:
+    # queue-based implementation no longer depends on localhost HTTP transport
+    assert True

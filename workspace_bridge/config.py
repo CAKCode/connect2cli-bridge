@@ -124,4 +124,5 @@ def build_bot_from_app_config(config: AppConfig):
         codex_exec_mode=bot.codex_exec_mode,
         file_send_roots=bot.file_send_roots,
         max_upload_size=bot.max_upload_size,
+        platform=bot.platform,
     )

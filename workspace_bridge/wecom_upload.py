@@ -6,16 +6,7 @@ import hashlib
 from pathlib import Path
 
 from .models import FileSendRequest, WeComBotRuntime
-
-
-def uid() -> str:
-    import time
-    import itertools
-
-    if not hasattr(uid, "_counter"):
-        uid._counter = itertools.count()
-
-    return f"{int(time.time() * 1000):x}-{next(uid._counter):x}"
+from .wecom_protocol import uid
 
 
 def chat_key_to_send_target(key: str) -> tuple[int, str]:

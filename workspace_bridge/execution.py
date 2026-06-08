@@ -13,10 +13,9 @@ from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create
 from .runner import build_runner_invocation, run_invocation
 from .runtime import prepare_session_run, update_session_record
 from .schedule import advance_schedule_definition_after_success, schedule_done_root, schedule_failed_root, schedule_pending_root
-from .wecom_protocol import (
-    build_proactive_text_payloads,
-    build_text_response_payloads,
-)
+from .messaging import get_messaging_provider
+from .models import OutboundMessage
+from .wecom_protocol import build_text_response_payloads
 from .wecom_upload import ws_send_json
 
 STATUS_STREAM_INTERVAL_SEC = 2
@@ -176,7 +175,9 @@ def _resolve_launch_thread_id(bot_or_runtime, launch, message) -> str | None:
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
     payloads = (
-        build_proactive_text_payloads(message.chat_key, content)
+        get_messaging_provider(runtime.config).build_proactive_payloads(
+            OutboundMessage(chat_key=message.chat_key, msgtype="markdown", content=content)
+        )
         if final and not message.req_id
         else build_text_response_payloads(message.req_id, session_id, content, final=final)
     )
