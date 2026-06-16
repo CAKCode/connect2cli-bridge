@@ -16,7 +16,13 @@ from .layout import build_workspace_ref, parse_chat_key
 from .messaging import get_messaging_provider
 from .models import OutboundMessage, TemplateCardUpdateRequest, WeComBotRuntime, WeComTextMessage
 from .reply_state import cleanup_reply_state
-from .runtime import cleanup_orphan_session_codex_homes, cleanup_stale_session_codex_homes, stable_session_id
+from .runtime import (
+    cleanup_orphan_session_codex_homes,
+    cleanup_stale_session_codex_homes,
+    load_reply_url_state,
+    load_template_card_state,
+    stable_session_id,
+)
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
 from .template_card_validation import validate_feedback_id, validate_template_card_payload, validate_template_card_update_payload
 from .wecom_runtime import run_wecom_runtime
@@ -249,13 +255,15 @@ async def api_send_message(request) -> web.Response:
     if not isinstance(data, dict):
         raise web.HTTPBadRequest(text="request body must be a JSON object")
     chat_key = str(data.get("chatKey") or "").strip()
+    reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip()
     msgtype = str(data.get("msgtype") or "").strip()
-    if not chat_key:
+    if not chat_key and not reply_req_id:
         raise web.HTTPBadRequest(text="chatKey required")
-    try:
-        parse_chat_key(chat_key)
-    except ValueError as exc:
-        raise web.HTTPBadRequest(text=str(exc)) from exc
+    if chat_key:
+        try:
+            parse_chat_key(chat_key)
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
     if not msgtype:
         raise web.HTTPBadRequest(text="msgtype required")
     if msgtype == "markdown":
@@ -269,7 +277,7 @@ async def api_send_message(request) -> web.Response:
             except ValueError as exc:
                 raise web.HTTPBadRequest(text=str(exc)) from exc
         message = OutboundMessage(
-            chat_key=chat_key,
+            chat_key=chat_key or str((runtime.reply_urls.get(reply_req_id) or {}).get("chatKey") or ""),
             msgtype="markdown",
             content=content,
             mention_user_id=str(data.get("mentionUserId") or data.get("mention_user_id") or "").strip() or None,
@@ -289,7 +297,7 @@ async def api_send_message(request) -> web.Response:
             except ValueError as exc:
                 raise web.HTTPBadRequest(text=str(exc)) from exc
         message = OutboundMessage(
-            chat_key=chat_key,
+            chat_key=chat_key or str((runtime.reply_urls.get(reply_req_id) or {}).get("chatKey") or ""),
             msgtype="template_card",
             template_card=template_card,
             feedback_id=feedback_id,
@@ -299,7 +307,10 @@ async def api_send_message(request) -> web.Response:
     if runtime.ws is None or not runtime.connected:
         raise web.HTTPServiceUnavailable(text="bot not connected")
     try:
-        result = await get_messaging_provider(bot).send_proactive_message(runtime, message)
+        if reply_req_id:
+            result = await get_messaging_provider(bot).send_via_response_url(runtime, reply_req_id=reply_req_id, message=message)
+        else:
+            result = await get_messaging_provider(bot).send_proactive_message(runtime, message)
     except asyncio.TimeoutError as exc:
         raise web.HTTPGatewayTimeout(text="message send timed out") from exc
     except RuntimeError as exc:
@@ -316,7 +327,11 @@ async def api_send_message(request) -> web.Response:
         "payloadCount": int(result.get("payloadCount") or 1),
     }
     if msgtype == "template_card":
+        delivered_template_card = dict(result.get("deliveredTemplateCard") or {})
         response_payload["cardType"] = str((template_card or {}).get("card_type") or "")
+        task_id = str(delivered_template_card.get("task_id") or "").strip()
+        if task_id:
+            response_payload["taskId"] = task_id
     return web.json_response(response_payload)
 
 
@@ -555,6 +570,26 @@ def create_app(config: AppConfig) -> web.Application:
     app = web.Application()
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.template_card_delivery_meta = load_template_card_state(config.runtime_root, config.bot_id)
+    runtime.reply_urls = load_reply_url_state(config.runtime_root, config.bot_id)
+    for item in runtime.template_card_delivery_meta.values():
+        template_card = item.get("templateCard")
+        if not isinstance(template_card, dict):
+            continue
+        task_id = str(template_card.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        runtime.template_card_payloads[task_id] = dict(template_card)
+        button_texts: dict[str, str] = {}
+        for button in template_card.get("button_list") or []:
+            if not isinstance(button, dict):
+                continue
+            key = str(button.get("key") or "").strip()
+            text = str(button.get("text") or "").strip()
+            if key and text:
+                button_texts[key] = text
+        if button_texts:
+            runtime.template_card_button_texts[task_id] = button_texts
     app[APP_CONFIG_KEY] = config
     app[APP_BOT_KEY] = bot
     app[APP_WECOM_RUNTIME_KEY] = runtime

@@ -1,0 +1,34 @@
+{
+  "card_type": "button_interaction",
+  "source": {
+    "desc": "Codex Action",
+    "desc_color": 0
+  },
+  "main_title": {
+    "title": "执行确认",
+    "desc": "点击按钮后把按钮文案投回当前会话"
+  },
+  "sub_title_text": "适合在真正执行前做一次人工确认。bridge 会把按钮文案作为新消息投回当前点击者的会话。",
+  "horizontal_content_list": [
+    {
+      "keyname": "动作",
+      "value": "确认执行"
+    },
+    {
+      "keyname": "模式",
+      "value": "button_interaction"
+    }
+  ],
+  "button_list": [
+    {
+      "text": "确认执行",
+      "style": 1,
+      "key": "confirm_execute"
+    },
+    {
+      "text": "稍后处理",
+      "style": 0,
+      "key": "handle_later"
+    }
+  ]
+}

@@ -12,12 +12,15 @@ from .async_utils import run_blocking
 from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
 from .reply_state import cleanup_reply_state
 from .runtime import list_session_records, prepare_session_run, remove_session_codex_home, stable_session_id, update_session_record
+from .runtime import store_reply_url_state
 from .wecom_protocol import (
     build_subscribe_payload,
     build_text_response_payload,
     chat_key_to_user_id,
+    extract_response_url,
     is_subscribe_ok,
     normalize_bridge_command_text,
+    parse_template_card_event,
     parse_text_callback,
     strip_text_mentions,
 )
@@ -276,6 +279,24 @@ async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
 async def handle_wecom_payload(config, runtime, ws, payload, handler):
     if resolve_pending_request(runtime, payload):
         return
+    req_id = str((payload.get("headers") or {}).get("req_id") or "").strip()
+    response_url = extract_response_url(payload)
+    if req_id and response_url:
+        chat_key = None
+        parsed_preview = parse_text_callback(payload)
+        if parsed_preview is not None:
+            chat_key = parsed_preview.chat_key
+        else:
+            event_preview = parse_template_card_event(payload)
+            if event_preview is not None:
+                chat_key = event_preview.chat_key
+        runtime.reply_urls[req_id] = {
+            "responseUrl": response_url,
+            "chatKey": str(chat_key or ""),
+            "capturedAtMs": int(__import__("time").time() * 1000),
+            "consumed": False,
+        }
+        store_reply_url_state(runtime.config.runtime_root, runtime.config.bot_id, runtime.reply_urls)
     if str(payload.get("cmd") or "").strip() == "aibot_event_callback":
         event_type = str((((payload.get("body") or {}).get("event") or {}).get("eventtype") or "")).strip()
         if event_type == "disconnected_event":
@@ -283,6 +304,16 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
             if runtime.ws is not None and ws is not None and runtime.ws is ws:
                 await ws.close()
             return
+    card_event = parse_template_card_event(payload)
+    if card_event is not None:
+        task_id = str(card_event.task_id or "").strip()
+        if task_id:
+            runtime.template_card_delivery_meta[task_id] = {
+                "taskId": task_id,
+                "chatKey": card_event.chat_key,
+                "templateCard": dict(runtime.template_card_payloads.get(task_id) or {}),
+            }
+        return
     parsed = parse_text_callback(payload)
     if parsed is None:
         return

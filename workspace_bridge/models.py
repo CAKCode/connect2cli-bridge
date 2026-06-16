@@ -56,6 +56,11 @@ class WeComBotRuntime:
     last_status: str | None = None
     resume_candidates: dict[str, list[dict[str, str | int]]] = field(default_factory=dict)
     resume_selection_expires_at: dict[str, int] = field(default_factory=dict)
+    template_card_payloads: dict[str, dict] = field(default_factory=dict)
+    template_card_button_texts: dict[str, dict[str, str]] = field(default_factory=dict)
+    template_card_delivery_meta: dict[str, dict] = field(default_factory=dict)
+    consumed_template_card_actions: set[str] = field(default_factory=set)
+    reply_urls: dict[str, dict[str, str | int | bool]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

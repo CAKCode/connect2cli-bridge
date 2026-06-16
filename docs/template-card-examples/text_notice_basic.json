@@ -1,0 +1,26 @@
+{
+  "card_type": "text_notice",
+  "source": {
+    "desc": "Codex",
+    "desc_color": 0
+  },
+  "main_title": {
+    "title": "任务已创建",
+    "desc": "这是一个最基础的文本通知模板卡片"
+  },
+  "sub_title_text": "适合展示任务创建、状态变化、结果汇总这类单向通知。",
+  "horizontal_content_list": [
+    {
+      "keyname": "任务类型",
+      "value": "通知"
+    },
+    {
+      "keyname": "当前状态",
+      "value": "ready"
+    }
+  ],
+  "card_action": {
+    "type": 1,
+    "url": "https://developer.work.weixin.qq.com/document"
+  }
+}

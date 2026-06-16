@@ -326,6 +326,38 @@ async def test_template_card_event_is_not_dispatched_to_text_handler(tmp_path) -
     assert called["value"] is False
 
 
+async def test_template_card_event_or_text_callback_saves_response_url(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+
+    async def fake_handler(*_args, **_kwargs):
+        return None
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "single",
+                "chatid": "alice",
+                "text": {"content": "hello"},
+                "from": {"userid": "alice"},
+                "response_url": "https://example.com/response",
+            },
+        },
+        fake_handler,
+    )
+
+    assert bot.reply_urls["req-1"]["responseUrl"] == "https://example.com/response"
+
+
 async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
 

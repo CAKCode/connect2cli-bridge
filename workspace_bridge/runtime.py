@@ -65,6 +65,14 @@ def session_codex_home_root(runtime_root: Path | str) -> Path:
     return Path(runtime_root).expanduser().resolve() / ".bridge-codex-home" / "sessions"
 
 
+def template_card_state_file(runtime_root: Path | str, bot_id: str) -> Path:
+    return Path(runtime_root).expanduser().resolve() / "template-card-state" / f"{bot_id}.json"
+
+
+def reply_url_state_file(runtime_root: Path | str, bot_id: str) -> Path:
+    return Path(runtime_root).expanduser().resolve() / "template-card-state" / f"{bot_id}.reply-urls.json"
+
+
 def remove_session_codex_home(runtime_root: Path | str, session_id: str) -> None:
     root = session_codex_home_root(runtime_root) / session_id
     if root.exists():
@@ -84,6 +92,56 @@ def read_json_file(path: Path) -> dict | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def prune_template_card_state(state: dict[str, dict], *, current_ms: int | None = None, ttl_ms: int = 72 * 60 * 60 * 1000) -> dict[str, dict]:
+    return {str(task_id): dict(item) for task_id, item in state.items() if str(task_id).strip() and isinstance(item, dict)}
+
+
+def load_template_card_state(runtime_root: Path | str, bot_id: str) -> dict[str, dict]:
+    payload = read_json_file(template_card_state_file(runtime_root, bot_id))
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, dict] = {}
+    for task_id, item in payload.items():
+        task_text = str(task_id or "").strip()
+        if not task_text or not isinstance(item, dict):
+            continue
+        normalized[task_text] = dict(item)
+    return prune_template_card_state(normalized)
+
+
+def store_template_card_state(runtime_root: Path | str, bot_id: str, state: dict[str, dict]) -> None:
+    write_json_atomic(template_card_state_file(runtime_root, bot_id), prune_template_card_state(state))
+
+
+def load_reply_url_state(runtime_root: Path | str, bot_id: str) -> dict[str, dict]:
+    payload = read_json_file(reply_url_state_file(runtime_root, bot_id))
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, dict] = {}
+    for req_id, item in payload.items():
+        req_text = str(req_id or "").strip()
+        if not req_text or not isinstance(item, dict):
+            continue
+        captured_at_ms = int(item.get("capturedAtMs") or 0)
+        if captured_at_ms <= 0 or now_ms() - captured_at_ms >= 60 * 60 * 1000:
+            continue
+        normalized[req_text] = dict(item)
+    return normalized
+
+
+def store_reply_url_state(runtime_root: Path | str, bot_id: str, state: dict[str, dict]) -> None:
+    filtered: dict[str, dict] = {}
+    for req_id, item in state.items():
+        req_text = str(req_id or "").strip()
+        if not req_text or not isinstance(item, dict):
+            continue
+        captured_at_ms = int(item.get("capturedAtMs") or 0)
+        if captured_at_ms <= 0 or now_ms() - captured_at_ms >= 60 * 60 * 1000:
+            continue
+        filtered[req_text] = dict(item)
+    write_json_atomic(reply_url_state_file(runtime_root, bot_id), filtered)
 
 
 def load_session_record(runtime_root: Path | str, session_id: str) -> SessionRecord | None:

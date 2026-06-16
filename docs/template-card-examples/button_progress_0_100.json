@@ -1,0 +1,38 @@
+{
+  "card_type": "button_interaction",
+  "source": {
+    "desc": "Codex Progress Demo",
+    "desc_color": 0
+  },
+  "main_title": {
+    "title": "进度 0/100",
+    "desc": "可用于演示点击回调内原位更新"
+  },
+  "sub_title_text": "这是一张 0-100 的进度卡示例。适合在按钮点击回调当次原位更新到 50/100、100/100；如果需要延迟推进状态，应补发一张新的状态卡。",
+  "horizontal_content_list": [
+    {
+      "keyname": "当前进度",
+      "value": "0%"
+    },
+    {
+      "keyname": "目标进度",
+      "value": "100%"
+    },
+    {
+      "keyname": "状态",
+      "value": "waiting"
+    }
+  ],
+  "button_list": [
+    {
+      "text": "推进到 50%",
+      "style": 1,
+      "key": "progress_50"
+    },
+    {
+      "text": "完成 100%",
+      "style": 0,
+      "key": "progress_100"
+    }
+  ]
+}

@@ -36,6 +36,8 @@ EXPECTED_ARG_KEYS = {
     "session_id",
     "chat-key",
     "chat_key",
+    "reply-req-id",
+    "reply_req_id",
     "bot-name",
     "bot_name",
     "bot-config-id",
@@ -150,14 +152,15 @@ def main() -> int:
     args = parse_args(sys.argv[1:])
     session_id = args.get("session-id") or args.get("session_id") or ""
     chat_key = args.get("chat-key") or args.get("chat_key") or ""
+    reply_req_id = args.get("reply-req-id") or args.get("reply_req_id") or ""
     bot_name = args.get("bot-name") or args.get("bot_name") or DEFAULT_BOT_NAME
     bot_config_id = args.get("bot-config-id") or args.get("bot_config_id") or DEFAULT_BOT_CONFIG_ID
     timeout_ms = parse_timeout_ms(args.get("timeout-ms") or args.get("timeout_ms"))
     msgtype = str(args.get("msgtype") or "markdown").strip()
     _queue_root, pending_root, result_root = queue_paths_for_target(bot_config_id)
 
-    if not session_id and not chat_key:
-        fail("session-id or chat-key required", 2)
+    if not session_id and not chat_key and not reply_req_id:
+        fail("session-id or chat-key or reply-req-id required", 2)
     if chat_key:
         try:
             parse_chat_key(chat_key)
@@ -167,6 +170,7 @@ def main() -> int:
     request: dict[str, object] = {
         "sessionId": session_id or None,
         "chatKey": chat_key or None,
+        "replyReqId": reply_req_id or None,
         "botName": bot_name or None,
         "targetConfigId": bot_config_id or None,
         "msgtype": msgtype,

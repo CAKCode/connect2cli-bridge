@@ -53,6 +53,23 @@ def test_schedule_message_parse_args_supports_chat_key():
     assert parsed["run-at"] == "123"
 
 
+def test_schedule_message_parse_args_supports_reply_req_id_and_template_card():
+    module = load_schedule_message_module()
+
+    parsed = module.parse_args(
+        [
+            "--reply-req-id=req-1",
+            "--msgtype=template_card",
+            "--template-card-file=/tmp/card.json",
+            "--run-at=123",
+        ]
+    )
+
+    assert parsed["reply-req-id"] == "req-1"
+    assert parsed["msgtype"] == "template_card"
+    assert parsed["template-card-file"] == "/tmp/card.json"
+
+
 def test_schedule_message_parse_args_rejects_unknown_option(capsys):
     module = load_schedule_message_module()
 
@@ -168,3 +185,42 @@ def test_schedule_message_main_reports_bridge_error_from_local_command(monkeypat
         raise AssertionError("expected SystemExit")
 
     assert "bot not connected" in capsys.readouterr().err
+
+
+def test_schedule_message_main_accepts_reply_req_id_template_card(monkeypatch, capsys, tmp_path):
+    module = load_schedule_message_module()
+    captured = {}
+    card_file = tmp_path / "card.json"
+    card_file.write_text(
+        '{"card_type":"button_interaction","main_title":{"title":"hello"},"button_list":[{"text":"go","style":1,"key":"go"}]}',
+        encoding="utf-8",
+    )
+
+    def fake_write_one_shot_schedule(data):
+        captured.update(data)
+        return {"ok": True, "replyReqId": data.get("replyReqId")}
+
+    monkeypatch.setattr(module, "write_one_shot_schedule", fake_write_one_shot_schedule)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "schedule_message.py",
+            "--reply-req-id",
+            "req-1",
+            "--msgtype",
+            "template_card",
+            "--template-card-file",
+            str(card_file),
+            "--run-at",
+            "123",
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert captured["replyReqId"] == "req-1"
+    assert captured["msgtype"] == "template_card"
+    assert captured["templateCard"]["card_type"] == "button_interaction"
+    assert '"ok": true' in output.lower()

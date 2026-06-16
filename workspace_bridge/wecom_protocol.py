@@ -213,6 +213,13 @@ def build_proactive_message_payloads(message: OutboundMessage) -> list[dict]:
     return payloads
 
 
+def resolve_template_card_for_delivery(message: OutboundMessage) -> dict | None:
+    if str(message.msgtype or "").strip() != "template_card":
+        return None
+    body = _resolve_message_body(message)
+    return dict(body.get("template_card") or {})
+
+
 def strip_text_mentions(content: str, bot_name: str | None = None) -> str:
     text = str(content or "")
     normalized_bot_name = str(bot_name or "").strip()
@@ -296,6 +303,23 @@ def parse_text_callback(payload: dict) -> WeComTextMessage | None:
         content=str(((body.get("text") or {}).get("content")) or ""),
         raw_payload=payload,
     )
+
+
+def extract_response_url(payload: dict) -> str | None:
+    body = payload.get("body") or {}
+    headers = payload.get("headers") or {}
+    for candidate in (
+        body.get("response_url"),
+        body.get("responseUrl"),
+        headers.get("response_url"),
+        headers.get("responseUrl"),
+        payload.get("response_url"),
+        payload.get("responseUrl"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return None
 
 
 def parse_template_card_event(payload: dict) -> WeComTemplateCardEvent | None:

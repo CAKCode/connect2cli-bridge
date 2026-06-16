@@ -90,6 +90,8 @@ WECOM_BOT_ENABLED=true
 
 - `BRIDGE_BASIC_AUTH` 和 `BRIDGE_TOKEN` 二选一即可；如果都不配，API 只允许 localhost 访问
 - `WECOM_BOT_SECRET_FILE` 必须指向 secret 文件；当前版本不再支持明文 `secret`
+- 模板卡片原位更新严格走企业微信 `101031`：只在模板卡片点击回调当次即时更新
+- 如果要延迟推进状态，应通过 `101032` 的 `response_url` 主动补发一条新消息或新卡，而不是继续原位更新旧卡
 - `WECOM_BOT_WORK_DIR` 是 Bot 的共享项目根，不等于实际会话 `cwd`
 - `BRIDGE_SHARED_RUNTIME_ROOT` 用于 Bot 锁、session 注册表、schedule、用户别名等共享协调状态；多实例部署时应指向共享且持久的目录
 - `BRIDGE_RUNTIME_ROOT` 用于实例本地 workspace、chatfile、per-session `CODEX_HOME` 等高频 I/O 目录；建议放在本地快盘
@@ -481,6 +483,27 @@ sh ./smoke_bridge.sh
 ```bash
 sh ./smoke_template_card.sh "<chat-key>" "<bot-config-id>" "<bot-name>"
 ```
+
+模板卡片 JSON 示例：
+
+- [docs/template-card-examples/text_notice_basic.json](/home/jenkins/connect2cli-bridge/docs/template-card-examples/text_notice_basic.json)
+- [docs/template-card-examples/button_progress_0_100.json](/home/jenkins/connect2cli-bridge/docs/template-card-examples/button_progress_0_100.json)
+- [docs/template-card-examples/button_confirm_execute.json](/home/jenkins/connect2cli-bridge/docs/template-card-examples/button_confirm_execute.json)
+
+基于 `101032 response_url` 延迟补发新卡：
+
+```bash
+python3 ./schedule_message.py \
+  --reply-req-id "REQ_ID" \
+  --delay-seconds "600" \
+  --msgtype "template_card" \
+  --template-card-file "/home/jenkins/connect2cli-bridge/docs/template-card-examples/button_progress_0_100.json"
+```
+
+说明：
+- `REQ_ID` 来自之前那次消息/事件回调的 `req_id`
+- 该方式会在 1 小时有效期内，通过企业微信 `101032` 的 `response_url` 补发一张新的状态卡
+- 它不会修改旧卡，只会补发新卡
 
 完整测试：
 

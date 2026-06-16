@@ -425,7 +425,12 @@ async def test_service_send_message_endpoint_sends_template_card(tmp_path: Path,
 
     async def fake_send_proactive_message(_self, _runtime, message):
         captured["message"] = message
-        return {"ok": True, "payloadCount": 1}
+        return {
+            "ok": True,
+            "payloadCount": 1,
+            "response": {"body": {"response_code": "resp-1"}},
+            "deliveredTemplateCard": {"card_type": "text_notice", "main_title": {"title": "Build complete"}},
+        }
 
     monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
 
@@ -464,7 +469,17 @@ async def test_service_send_message_endpoint_allows_interaction_card_without_tas
 
     async def fake_send_proactive_message(_self, _runtime, message):
         captured["message"] = message
-        return {"ok": True, "payloadCount": 1}
+        return {
+            "ok": True,
+            "payloadCount": 1,
+            "response": {"body": {"response_code": "resp-2"}},
+            "deliveredTemplateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "Build complete"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+                "task_id": "task-1",
+            },
+        }
 
     monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_proactive_message", fake_send_proactive_message)
 
@@ -489,6 +504,7 @@ async def test_service_send_message_endpoint_allows_interaction_card_without_tas
 
     assert payload["ok"] is True
     assert payload["cardType"] == "button_interaction"
+    assert payload["taskId"] == "task-1"
     assert captured["message"].template_card["card_type"] == "button_interaction"
 
 
@@ -526,6 +542,99 @@ async def test_service_send_message_endpoint_accepts_snake_case_fields(tmp_path:
     assert payload["ok"] is True
     assert captured["message"].mention_user_id == "alice"
     assert captured["message"].feedback_id == "feedback-1"
+
+
+async def test_service_send_message_endpoint_supports_reply_req_id_markdown(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    runtime.reply_urls["req-1"] = {
+        "responseUrl": "https://example.com/response",
+        "chatKey": "single:alice",
+        "capturedAtMs": 9999999999999,
+        "consumed": False,
+    }
+    captured = {}
+
+    async def fake_send_via_response_url(_self, _runtime, *, reply_req_id, message):
+        captured["replyReqId"] = reply_req_id
+        captured["message"] = message
+        return {"ok": True, "response": {"errcode": 0}, "deliveredTemplateCard": None}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_via_response_url", fake_send_via_response_url)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "replyReqId": "req-1",
+                "msgtype": "markdown",
+                "content": "follow up",
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert captured["replyReqId"] == "req-1"
+    assert captured["message"].chat_key == "single:alice"
+    assert captured["message"].content == "follow up"
+
+
+async def test_service_send_message_endpoint_supports_reply_req_id_template_card(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    runtime.ws = object()
+    runtime.connected = True
+    runtime.reply_urls["req-1"] = {
+        "responseUrl": "https://example.com/response",
+        "chatKey": "single:alice",
+        "capturedAtMs": 9999999999999,
+        "consumed": False,
+    }
+
+    async def fake_send_via_response_url(_self, _runtime, *, reply_req_id, message):
+        return {
+            "ok": True,
+            "response": {"errcode": 0},
+            "deliveredTemplateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+                "task_id": "task-1",
+            },
+        }
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.WeComMessagingProvider.send_via_response_url", fake_send_via_response_url)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "replyReqId": "req-1",
+                "msgtype": "template_card",
+                "templateCard": {
+                    "card_type": "button_interaction",
+                    "main_title": {"title": "follow up"},
+                    "button_list": [{"text": "go", "style": 1, "key": "go"}],
+                },
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    response = await route.handler(JsonRequest(app))
+    payload = json.loads(response.text)
+
+    assert payload["ok"] is True
+    assert payload["cardType"] == "button_interaction"
+    assert payload["taskId"] == "task-1"
 
 
 async def test_service_send_message_endpoint_rejects_invalid_payload(tmp_path: Path) -> None:
@@ -682,6 +791,76 @@ async def test_service_update_template_card_endpoint_rejects_invalid_payload(tmp
     assert excinfo.value.status == 400
     assert excinfo.value.text == "button_interaction.button_list required"
 
+
+async def test_service_reloads_template_card_state_after_restart(tmp_path: Path, monkeypatch) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    app = create_app(config)
+    runtime = app[APP_WECOM_RUNTIME_KEY]
+    sent_payloads = []
+    runtime.connected = True
+
+    class FakeWS:
+        closed = False
+
+        async def send_json(self, payload):
+            sent_payloads.append(payload)
+
+    runtime.ws = FakeWS()
+
+    async def fake_send_ws_payload_with_ack(_runtime, payload, _timeout_sec):
+        sent_payloads.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr("workspace_bridge.wecom_messaging.send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {
+                "chatKey": "group-user:room-1:alice",
+                "msgtype": "template_card",
+                "templateCard": {
+                    "card_type": "button_interaction",
+                    "main_title": {"title": "Build complete"},
+                    "button_list": [{"text": "go", "style": 1, "key": "go"}],
+                },
+            }
+
+    route = next(route for route in app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/send-message")
+    await route.handler(JsonRequest(app))
+    task_id = next(iter(runtime.template_card_delivery_meta.keys()))
+
+    restarted_app = create_app(config)
+    restarted_runtime = restarted_app[APP_WECOM_RUNTIME_KEY]
+
+    assert restarted_runtime.template_card_payloads[task_id]["task_id"] == task_id
+
+
+def test_service_reloads_reply_url_state_after_restart(tmp_path: Path) -> None:
+    config, _bot, _launch = make_runtime(tmp_path)
+    from workspace_bridge.runtime import store_reply_url_state
+
+    store_reply_url_state(
+        config.runtime_root,
+        config.bot_id,
+        {
+            "req-1": {
+                "responseUrl": "https://example.com/response",
+                "chatKey": "single:alice",
+                "capturedAtMs": 9999999999999,
+                "consumed": False,
+            }
+        },
+    )
+
+    restarted_app = create_app(config)
+    restarted_runtime = restarted_app[APP_WECOM_RUNTIME_KEY]
+
+    assert restarted_runtime.reply_urls["req-1"]["responseUrl"] == "https://example.com/response"
+
+
 def test_send_message_cli_outputs_markdown_payload(tmp_path: Path) -> None:
     import importlib.util
 
@@ -731,6 +910,56 @@ def test_send_message_cli_outputs_markdown_payload(tmp_path: Path) -> None:
     assert pending_request["msgtype"] == "markdown"
     assert pending_request["content"] == "hello"
     assert pending_request["chatKey"] == "single:alice"
+
+
+def test_send_message_cli_outputs_reply_req_id_payload(tmp_path: Path) -> None:
+    import importlib.util
+
+    config, _bot, _launch = make_runtime(tmp_path)
+    queue_root = tmp_path / "message-queue"
+    script = Path(__file__).resolve().parent.parent / "send_message.py"
+    spec = importlib.util.spec_from_file_location("send_message_test_reply_req", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkey_queue_root = queue_root.resolve()
+    module.BASE_QUEUE_ROOT = monkey_queue_root
+    module.DEFAULT_BOT_CONFIG_ID = "bot-1"
+    module.QUEUE_ROOT, module.PENDING_ROOT, module.RESULT_ROOT = module.queue_paths_for_target(module.DEFAULT_BOT_CONFIG_ID)
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "send_message.py",
+            "--reply-req-id",
+            "req-1",
+            "--bot-config-id",
+            "bot-1",
+            "--msgtype",
+            "markdown",
+            "--content",
+            "follow up",
+        ]
+        pending_request = {}
+
+        def fake_sleep(_seconds: float) -> None:
+            pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+            assert pending_files
+            pending_request.update(json.loads(pending_files[0].read_text("utf-8")))
+            request_id = pending_request["requestId"]
+            module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+            (module.RESULT_ROOT / f"{request_id}.json").write_text(
+                json.dumps({"ok": True, "chatKey": "single:alice", "msgtype": "markdown"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        module.time.sleep = fake_sleep
+        result = module.main()
+    finally:
+        sys.argv = old_argv
+
+    assert result == 0
+    assert pending_request["replyReqId"] == "req-1"
+    assert pending_request["content"] == "follow up"
 
 
 def test_send_message_cli_outputs_template_card_payload(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ __pycache__/
 .bot-runtime-locks/
 .bridge-codex-home/
 .user-aliases/
+.template-card-state/
 chatfile/
 .local-file-send-queue/
 .local-send-message-queue/

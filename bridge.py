@@ -118,6 +118,8 @@ WECOM_INBOUND_IDLE_TIMEOUT_MS = max(60000, int(os.environ.get("WECOM_INBOUND_IDL
 WECOM_HEARTBEAT_ACK_TIMEOUT_MS = max(30000, int(os.environ.get("WECOM_HEARTBEAT_ACK_TIMEOUT_MS", str(2 * 60 * 1000))))
 WECOM_DISCONNECT_GRACE_MS = max(1000, int(os.environ.get("WECOM_DISCONNECT_GRACE_MS", "15000")))
 WECOM_RAW_INBOUND_LOG_ENABLED = str(os.environ.get("WECOM_RAW_INBOUND_LOG_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+WECOM_REPLY_URL_TTL_MS = 60 * 60 * 1000
+REPEATABLE_TEMPLATE_CARD_EVENT_KEYS = {"refresh_progress"}
 
 SESSION_TTL = 30 * 60
 SESSION_LEASE_TTL_MS = int(os.environ.get("SESSION_LEASE_TTL", 30000))
@@ -136,6 +138,7 @@ CHATFILE_ROOT = INSTANCE_RUNTIME_ROOT / "chatfile"
 WORKSPACE_ROOT = INSTANCE_RUNTIME_ROOT / "workspace"
 BRIDGE_CODEX_HOME_ROOT = INSTANCE_RUNTIME_ROOT / ".bridge-codex-home"
 USER_ALIAS_ROOT = SHARED_RUNTIME_ROOT / ".user-aliases"
+TEMPLATE_CARD_STATE_ROOT = SHARED_RUNTIME_ROOT / ".template-card-state"
 LOCAL_FILE_SEND_COMMAND = BASE_DIR / "send_file.py"
 LOCAL_SEND_MESSAGE_COMMAND = BASE_DIR / "send_message.py"
 LOCAL_SCHEDULE_MESSAGE_COMMAND = BASE_DIR / "schedule_message.py"
@@ -183,6 +186,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9]*[a-z]")
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
 LEADING_MENTION_RE = re.compile(r"^\s*@\S+(?:\s+|$)")
 MENTION_DELIMITER_CHARS = ",:;，。：；"
+PROGRESS_EVENT_KEY_RE = re.compile(r"^progress_(\d{1,3})$")
 CRON_MONTH_NAMES = {
     "JAN": 1,
     "FEB": 2,
@@ -286,6 +290,8 @@ class BotState:
     active_upload_job: Optional[dict[str, Any]] = None
     template_card_button_texts: dict[str, dict[str, str]] = field(default_factory=dict)
     template_card_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    template_card_delivery_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reply_urls: dict[str, dict[str, Any]] = field(default_factory=dict)
     consumed_template_card_actions: set[str] = field(default_factory=set)
     runtime_lock_handle: Any = None
     stop_reason: Optional[str] = None
@@ -492,6 +498,107 @@ def get_local_send_message_target_config_id_for_root(root: Path) -> Optional[str
     if resolved.parent != targets_root:
         return None
     return unquote(resolved.name)
+
+
+def get_template_card_state_file(bot_config_id: str) -> Path:
+    safe_bot_id = quote(str(bot_config_id or "").strip(), safe="._-") or "default"
+    return TEMPLATE_CARD_STATE_ROOT / f"{safe_bot_id}.json"
+
+
+def get_reply_url_state_file(bot_config_id: str) -> Path:
+    safe_bot_id = quote(str(bot_config_id or "").strip(), safe="._-") or "default"
+    return TEMPLATE_CARD_STATE_ROOT / f"{safe_bot_id}.reply-urls.json"
+
+
+def read_template_card_state(bot_config_id: str) -> dict[str, dict[str, Any]]:
+    payload = read_json_file(get_template_card_state_file(bot_config_id), {})
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for task_id, item in payload.items():
+        task_text = str(task_id or "").strip()
+        if not task_text or not isinstance(item, dict):
+            continue
+        normalized[task_text] = dict(item)
+    return prune_template_card_state_items(normalized)
+
+
+def read_reply_url_state(bot_config_id: str) -> dict[str, dict[str, Any]]:
+    payload = read_json_file(get_reply_url_state_file(bot_config_id), {})
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for req_id, item in payload.items():
+        req_text = str(req_id or "").strip()
+        if not req_text or not isinstance(item, dict):
+            continue
+        normalized[req_text] = dict(item)
+    return prune_reply_url_state_items(normalized)
+
+
+def prune_template_card_state_items(items: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for task_id, item in items.items():
+        task_text = str(task_id).strip()
+        if not task_text or not isinstance(item, dict):
+            continue
+        current = dict(item)
+        current.pop("responseCode", None)
+        current.pop("responseCodeCapturedAtMs", None)
+        current.pop("responseCodeConsumed", None)
+        current.pop("responseCodeConsumedAtMs", None)
+        normalized[task_text] = current
+    return normalized
+
+
+def prune_reply_url_state_items(items: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    now_value = now_ms()
+    for req_id, item in items.items():
+        req_text = str(req_id).strip()
+        if not req_text or not isinstance(item, dict):
+            continue
+        captured_at = normalize_optional_int(item.get("capturedAtMs")) or 0
+        if captured_at <= 0 or now_value - captured_at >= WECOM_REPLY_URL_TTL_MS:
+            continue
+        normalized[req_text] = dict(item)
+    return normalized
+
+
+def write_template_card_state(bot: BotState) -> None:
+    config_id = str(bot.config.get("id") or "").strip()
+    if not config_id:
+        return
+    state_file = get_template_card_state_file(config_id)
+    ensure_dir_for(state_file)
+    bot.template_card_delivery_meta = prune_template_card_state_items(bot.template_card_delivery_meta)
+    write_json_atomic(state_file, bot.template_card_delivery_meta)
+
+
+def write_reply_url_state(bot: BotState) -> None:
+    config_id = str(bot.config.get("id") or "").strip()
+    if not config_id:
+        return
+    state_file = get_reply_url_state_file(config_id)
+    ensure_dir_for(state_file)
+    bot.reply_urls = prune_reply_url_state_items(bot.reply_urls)
+    write_json_atomic(state_file, bot.reply_urls)
+
+
+def delete_template_card_state(bot_config_id: str) -> None:
+    with suppress(FileNotFoundError):
+        get_template_card_state_file(bot_config_id).unlink()
+    with suppress(FileNotFoundError):
+        get_reply_url_state_file(bot_config_id).unlink()
+
+
+def restore_template_card_runtime_state(bot: BotState) -> None:
+    for item in bot.template_card_delivery_meta.values():
+        if not isinstance(item, dict):
+            continue
+        template_card = item.get("templateCard")
+        if isinstance(template_card, dict):
+            register_template_card_button_texts(bot, template_card)
 
 
 def list_local_send_message_queue_path_groups() -> list[dict[str, Path]]:
@@ -956,6 +1063,45 @@ def summarize_inbound_payload(payload: dict[str, Any]) -> str:
         f"errcode={payload.get('errcode') if payload.get('errcode') is not None else '-'}",
     ]
     return " ".join(parts)
+
+
+def extract_response_url(message: dict[str, Any]) -> Optional[str]:
+    body = message.get("body") or {}
+    headers = message.get("headers") or {}
+    for candidate in (
+        body.get("response_url"),
+        body.get("responseUrl"),
+        headers.get("response_url"),
+        headers.get("responseUrl"),
+        message.get("response_url"),
+        message.get("responseUrl"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return None
+
+
+def save_reply_url(bot: BotState, req_id: str, chat_key: str, response_url: str) -> None:
+    req_text = str(req_id or "").strip()
+    url_text = str(response_url or "").strip()
+    if not req_text or not url_text:
+        return
+    bot.reply_urls[req_text] = {"responseUrl": url_text, "chatKey": chat_key, "capturedAtMs": now_ms(), "consumed": False}
+    write_reply_url_state(bot)
+
+
+def get_reply_url_state(bot: BotState, req_id: str) -> Optional[dict[str, Any]]:
+    req_text = str(req_id or "").strip()
+    state = dict(bot.reply_urls.get(req_text) or {})
+    if not state:
+        return None
+    captured_at = normalize_optional_int(state.get("capturedAtMs")) or 0
+    if captured_at <= 0 or now_ms() - captured_at >= WECOM_REPLY_URL_TTL_MS:
+        return None
+    if state.get("consumed") is True:
+        return None
+    return state
 
 
 def supervise_bot_task(bot: BotState, attr_name: str, task_name: str, factory: Any) -> asyncio.Task:
@@ -2840,6 +2986,7 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
     owner_user_id = extract_template_card_owner_user_id(task_id)
     key = chat_key_for_bot(bot, message)
     action_token = f"{task_id}\n{event_key}\n{click_user_id}"
+    repeatable_event = is_repeatable_template_card_event_key(event_key)
     if not card_type:
         return
     if owner_user_id and click_user_id and owner_user_id != click_user_id:
@@ -2876,7 +3023,7 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
         except Exception as exc:
             add_log(bot, f"template card informational notice skipped req_id={req_id}: {exc}")
         return
-    if action_token in bot.consumed_template_card_actions:
+    if not repeatable_event and action_token in bot.consumed_template_card_actions:
         add_event_log(
             bot,
             "template_card.click_duplicate_ignored",
@@ -2898,30 +3045,36 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
         or event_key
         or "确认"
     )
+    processing_notice = f"已收到「{event_text}」，正在处理..."
+    await respond_info(bot, req_id, processing_notice, final=False)
     original_card = dict(bot.template_card_payloads.get(task_id) or {})
-    update_card = dict(original_card)
-    update_card["card_type"] = "button_interaction"
-    update_card["task_id"] = task_id or f"processed-{uid()}"
-    main_title = dict(update_card.get("main_title") or {})
-    original_title = str(main_title.get("title") or "").strip()
-    main_title["title"] = original_title or "已确认"
-    if not str(main_title.get("desc") or "").strip():
-        main_title["desc"] = event_text
-    update_card["main_title"] = main_title
-    rebuilt_buttons = []
-    for item in original_card.get("button_list") or []:
-        if not isinstance(item, dict):
-            continue
-        current = dict(item)
-        if str(current.get("key") or "").strip() == event_key:
-            current["style"] = 1
-            current["text"] = str(current.get("text") or "").strip() or event_text
-        rebuilt_buttons.append(current)
-    if not rebuilt_buttons:
-        rebuilt_buttons = [{"text": event_text, "style": 1, "key": event_key or "processed"}]
-    update_card["button_list"] = rebuilt_buttons
-    bot.consumed_template_card_actions.add(action_token)
-    await enqueue_message(bot, key, event_text, None, silent_lease_failure=True)
+    if repeatable_event:
+        update_card = build_refresh_progress_template_card(original_card, task_id)
+    else:
+        update_card = dict(original_card)
+        update_card["card_type"] = "button_interaction"
+        update_card["task_id"] = task_id or f"processed-{uid()}"
+        main_title = dict(update_card.get("main_title") or {})
+        original_title = str(main_title.get("title") or "").strip()
+        main_title["title"] = original_title or "已确认"
+        if not str(main_title.get("desc") or "").strip():
+            main_title["desc"] = event_text
+        update_card["main_title"] = main_title
+        rebuilt_buttons = []
+        for item in original_card.get("button_list") or []:
+            if not isinstance(item, dict):
+                continue
+            current = dict(item)
+            if str(current.get("key") or "").strip() == event_key:
+                current["style"] = 1
+                current["text"] = str(current.get("text") or "").strip() or event_text
+            rebuilt_buttons.append(current)
+        if not rebuilt_buttons:
+            rebuilt_buttons = [{"text": event_text, "style": 1, "key": event_key or "processed"}]
+        update_card["button_list"] = rebuilt_buttons
+        bot.consumed_template_card_actions.add(action_token)
+        await enqueue_message(bot, key, event_text, None, silent_lease_failure=True)
+    save_template_card_delivery_meta(bot, update_card["task_id"], chat_key=key, template_card=update_card)
     try:
         response = await send_ws_payload_with_ack(
             bot,
@@ -2929,7 +3082,10 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
             5,
         )
         if response.get("errcode") not in (None, 0):
-            raise BridgeError(502, f"template card update failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+            raise BridgeError(
+                502,
+                f"template card update failed: {response.get('errcode')} {response.get('errmsg', '')}".strip(),
+            )
         add_event_log(
             bot,
             "template_card.updated",
@@ -4292,6 +4448,58 @@ def build_proactive_template_card_payload(key: str, template_card: dict[str, Any
     }
 
 
+def build_response_url_message_body(chat_key: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+    msgtype = str(payload_data.get("msgtype") or "").strip()
+    if msgtype == "markdown":
+        resolved_mention_user_id = proactive_chat_mention_user_id(chat_key, payload_data.get("mentionUserId"))
+        markdown = {
+            "content": limit_proactive_text(
+                prepend_group_user_mention(str(payload_data.get("content") or ""), resolved_mention_user_id)
+            )
+        }
+        feedback_id = str(payload_data.get("feedbackId") or "").strip()
+        if feedback_id:
+            markdown["feedback"] = {"id": validate_feedback_id(feedback_id)}
+        return {"msgtype": "markdown", "markdown": markdown}
+    if msgtype == "template_card":
+        card = enrich_template_card_for_delivery(chat_key, dict(payload_data["templateCard"] or {}), unique_token=uid())
+        feedback_id = str(payload_data.get("feedbackId") or "").strip()
+        if feedback_id:
+            feedback = dict(card.get("feedback") or {})
+            feedback["id"] = validate_feedback_id(feedback_id)
+            card["feedback"] = feedback
+        return {"msgtype": "template_card", "template_card": card}
+    raise BridgeError(400, f"unsupported msgtype for response_url send: {msgtype}")
+
+
+async def send_reply_url_message(bot: BotState, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+    state = get_reply_url_state(bot, req_id)
+    if not state:
+        raise BridgeError(404, f"reply response_url not found or expired: {req_id}")
+    if HTTP_SESSION is None:
+        raise BridgeError(500, "http session not ready")
+    response_url = str(state["responseUrl"])
+    chat_key = str(state.get("chatKey") or "").strip()
+    body = build_response_url_message_body(chat_key, payload_data)
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    async with HTTP_SESSION.post(response_url, json=body, timeout=timeout) as response:
+        if response.status != 200:
+            raise BridgeError(502, f"response_url send failed: HTTP {response.status}")
+        result = await response.json(content_type=None)
+    errcode = int(result.get("errcode", 0))
+    if errcode != 0:
+        raise BridgeError(502, f"response_url send failed: {errcode} {result.get('errmsg', '')}".strip())
+    bot.reply_urls[req_id]["consumed"] = True
+    write_reply_url_state(bot)
+    if str(payload_data.get("msgtype") or "").strip() == "template_card":
+        delivered_card = dict(body.get("template_card") or {})
+        task_id = str(delivered_card.get("task_id") or "").strip()
+        if task_id:
+            save_template_card_delivery_meta(bot, task_id, chat_key=chat_key, template_card=delivered_card)
+        return {"ok": True, "chatKey": chat_key, "msgtype": "template_card", "cardType": str(delivered_card.get("card_type") or ""), "taskId": task_id or None}
+    return {"ok": True, "chatKey": chat_key, "msgtype": "markdown"}
+
+
 def build_template_card_update_payload(req_id: str, template_card: dict[str, Any]) -> dict[str, Any]:
     return {
         "cmd": "aibot_respond_update_msg",
@@ -4318,6 +4526,112 @@ def template_card_event_text(event: dict[str, Any], fallback: str) -> str:
     return fallback
 
 
+def progress_percent_from_event_key(event_key: str) -> Optional[int]:
+    match = PROGRESS_EVENT_KEY_RE.fullmatch(str(event_key or "").strip())
+    if not match:
+        return None
+    return max(0, min(100, int(match.group(1))))
+
+
+def apply_progress_template_card_update(update_card: dict[str, Any], percent: int, event_text: str) -> None:
+    title = f"进度 {percent}/100"
+    status = "done" if percent >= 100 else "running"
+    main_title = dict(update_card.get("main_title") or {})
+    main_title["title"] = title
+    main_title["desc"] = f"已更新到 {percent}%"
+    update_card["main_title"] = main_title
+    update_card["sub_title_text"] = f"最近一次操作：{event_text}。当前状态：{status}。"
+
+    rebuilt_contents = []
+    matched_progress = False
+    matched_status = False
+    for item in update_card.get("horizontal_content_list") or []:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        keyname = str(current.get("keyname") or "").strip()
+        if keyname in {"当前进度", "进度", "Current Progress"}:
+            current["value"] = f"{percent}%"
+            matched_progress = True
+        elif keyname in {"状态", "Status"}:
+            current["value"] = status
+            matched_status = True
+        rebuilt_contents.append(current)
+    if not matched_progress:
+        rebuilt_contents.insert(0, {"keyname": "当前进度", "value": f"{percent}%"})
+    if not matched_status:
+        rebuilt_contents.append({"keyname": "状态", "value": status})
+    update_card["horizontal_content_list"] = rebuilt_contents
+
+
+def is_repeatable_template_card_event_key(event_key: str) -> bool:
+    return str(event_key or "").strip() in REPEATABLE_TEMPLATE_CARD_EVENT_KEYS
+
+
+def extract_progress_percent_from_card(template_card: dict[str, Any]) -> int:
+    candidates = (
+        str(((template_card.get("main_title") or {}).get("desc")) or "").strip(),
+        str(template_card.get("sub_title_text") or "").strip(),
+    )
+    for text in candidates:
+        match = re.search(r"(\d{1,3})%", text)
+        if not match:
+            continue
+        try:
+            return max(0, min(int(match.group(1)), 100))
+        except ValueError:
+            continue
+    return 0
+
+
+def render_template_card_progress_bar(progress: int) -> str:
+    clamped = max(0, min(int(progress), 100))
+    filled = clamped // 10
+    return "[" + ("#" * filled) + ("." * (10 - filled)) + "]"
+
+
+def build_refresh_progress_template_card(original_card: dict[str, Any], task_id: str, *, step: int = 10) -> dict[str, Any]:
+    current_progress = extract_progress_percent_from_card(original_card)
+    next_progress = min(100, current_progress + max(1, int(step)))
+    status_text = "已完成" if next_progress >= 100 else "进行中"
+    now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    update_card = dict(original_card or {})
+    update_card["card_type"] = "button_interaction"
+    update_card["task_id"] = task_id or str(update_card.get("task_id") or "").strip() or f"progress-{uid()}"
+
+    main_title = dict(update_card.get("main_title") or {})
+    main_title["title"] = str(main_title.get("title") or "").strip() or "进度刷新卡片演示"
+    main_title["desc"] = f"当前进度: {next_progress}%"
+    update_card["main_title"] = main_title
+    update_card["sub_title_text"] = (
+        f"进度条: {render_template_card_progress_bar(next_progress)} {next_progress}%\n"
+        f"状态: {status_text}\n"
+        f"最近更新时间: {now_text}"
+    )
+
+    rebuilt_buttons = []
+    for item in original_card.get("button_list") or []:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        key = str(current.get("key") or "").strip()
+        if key == "refresh_progress":
+            current["text"] = "刷新进度"
+            current["style"] = 1
+        elif key == "view_status":
+            current["text"] = "查看状态"
+            current["style"] = 0
+        rebuilt_buttons.append(current)
+    if not rebuilt_buttons:
+        rebuilt_buttons = [
+            {"text": "刷新进度", "style": 1, "key": "refresh_progress"},
+            {"text": "查看状态", "style": 0, "key": "view_status"},
+        ]
+    update_card["button_list"] = rebuilt_buttons
+    return update_card
+
+
 def register_template_card_button_texts(bot: BotState, template_card: dict[str, Any]) -> None:
     if not isinstance(template_card, dict):
         return
@@ -4337,12 +4651,38 @@ def register_template_card_button_texts(bot: BotState, template_card: dict[str, 
         bot.template_card_button_texts[task_id] = button_texts
 
 
+def save_template_card_delivery_meta(
+    bot: BotState,
+    task_id: str,
+    *,
+    chat_key: str,
+    template_card: dict[str, Any],
+    sent_at_ms: Optional[int] = None,
+) -> None:
+    task_text = str(task_id or "").strip()
+    if not task_text:
+        return
+    current = dict(bot.template_card_delivery_meta.get(task_text) or {})
+    current.update(
+        {
+            "taskId": task_text,
+            "chatKey": chat_key,
+            "templateCard": dict(template_card or {}),
+            "sentAtMs": int(sent_at_ms if sent_at_ms is not None else now_ms()),
+        }
+    )
+    bot.template_card_delivery_meta[task_text] = current
+    register_template_card_button_texts(bot, {**dict(template_card or {}), "task_id": task_text})
+    write_template_card_state(bot)
 
-def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, dict[str, Any]]:
+
+
+def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, dict[str, Any], Optional[str]]:
     chat_key_value = data.get("chatKey") or data.get("chat_key")
     bot_name = data.get("botName") or data.get("bot_name")
     target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
     session_id = data.get("sessionId") or data.get("session_id")
+    reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip() or None
     msgtype = str(data.get("msgtype") or "").strip()
     if not msgtype:
         raise BridgeError(400, "msgtype required")
@@ -4388,7 +4728,7 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
                 bot = require_unique_bot_for_chat_key(validated_chat_key, bot_name)
             if not bot.ws or bot.ws.closed:
                 raise BridgeError(503, "bot not connected")
-            return bot, validated_chat_key, payload_data
+            return bot, validated_chat_key, payload_data, reply_req_id
         except BridgeError as exc:
             last_error = exc
             if not session_id:
@@ -4406,7 +4746,7 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
             resolved_chat_key = str(record["chatKey"])
             if not bot.ws or bot.ws.closed:
                 raise BridgeError(503, "bot not connected")
-            return bot, resolved_chat_key, payload_data
+            return bot, resolved_chat_key, payload_data, reply_req_id
         except BridgeError as exc:
             if last_error is None:
                 raise
@@ -4415,21 +4755,58 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
     if last_error is not None:
         raise last_error
 
-    raise BridgeError(400, "chatKey or sessionId required")
+    if reply_req_id:
+        matching_bots = []
+        if target_config_id:
+            bot = resolve_loaded_target_bot(target_config_id, bot_name)
+            if get_reply_url_state(bot, reply_req_id):
+                matching_bots.append(bot)
+        else:
+            for candidate in BOTS.values():
+                if bot_instance_is_stale(candidate):
+                    continue
+                if get_reply_url_state(candidate, reply_req_id):
+                    if bot_name and candidate.config["name"] != bot_name:
+                        continue
+                    matching_bots.append(candidate)
+            if len(matching_bots) > 1:
+                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
+        if not matching_bots:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        bot = matching_bots[0]
+        state = get_reply_url_state(bot, reply_req_id)
+        if not state:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        return bot, str(state.get("chatKey") or ""), payload_data, reply_req_id
+
+    raise BridgeError(400, "chatKey or sessionId or replyReqId required")
 
 
 async def submit_send_message_request(data: dict[str, Any], source: str = "api") -> dict[str, Any]:
-    bot, resolved_chat_key, payload_data = resolve_message_send_request(data)
+    bot, resolved_chat_key, payload_data, reply_req_id = resolve_message_send_request(data)
+    if reply_req_id:
+        return await send_reply_url_message(bot, reply_req_id, payload_data)
+    sent_template_card: Optional[dict[str, Any]] = None
     if payload_data["msgtype"] == "template_card":
         payload = build_proactive_template_card_payload(resolved_chat_key, payload_data["templateCard"])
         payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
-        register_template_card_button_texts(bot, ((payload.get("body") or {}).get("template_card") or {}))
+        sent_template_card = dict(((payload.get("body") or {}).get("template_card") or {}))
+        register_template_card_button_texts(bot, sent_template_card)
     else:
         payload = build_proactive_chat_payload(resolved_chat_key, payload_data["content"], payload_data.get("mentionUserId"))
         payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
     response = await send_ws_payload_with_ack(bot, payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
     if response.get("errcode") not in (None, 0):
         raise BridgeError(502, f"message send failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+    if sent_template_card is not None:
+        task_id = str(sent_template_card.get("task_id") or "").strip()
+        if task_id:
+            save_template_card_delivery_meta(
+                bot,
+                task_id,
+                chat_key=resolved_chat_key,
+                template_card=sent_template_card,
+            )
     add_log(bot, f"[{resolved_chat_key}] message request accepted via {source}: {payload_data['msgtype']}")
     add_event_log(
         bot,
@@ -4441,6 +4818,10 @@ async def submit_send_message_request(data: dict[str, Any], source: str = "api")
     result = {"ok": True, "chatKey": resolved_chat_key, "msgtype": payload_data["msgtype"]}
     if payload_data["msgtype"] == "template_card":
         result["cardType"] = str(payload_data["templateCard"].get("card_type") or "")
+        if sent_template_card is not None:
+            task_id = str(sent_template_card.get("task_id") or "").strip()
+            if task_id:
+                result["taskId"] = task_id
     return result
 
 
@@ -4602,7 +4983,13 @@ def normalize_schedule_definition(record: Optional[dict[str, Any]]) -> Optional[
         "botName": str(record.get("botName") or "").strip() or None,
         "sessionId": str(record.get("sessionId") or "").strip() or None,
         "chatKey": str(record["chatKey"]),
+        "replyReqId": str(record.get("replyReqId") or "").strip() or None,
         "message": str(record["message"]),
+        "msgtype": str(record.get("msgtype") or "markdown").strip() or "markdown",
+        "content": str(record.get("content") or "").strip() or None,
+        "templateCard": validate_template_card_payload(record.get("templateCard"), require_interaction_task_id=False)
+        if (record.get("msgtype") or "markdown").strip() == "template_card"
+        else None,
         "mode": mode,
         "cron": str(record.get("cron") or "").strip() or None,
         "timezone": str(record.get("timezone") or "UTC").strip() or "UTC",
@@ -4848,6 +5235,7 @@ def validate_schedule_misfire_policy(policy: str) -> str:
 def resolve_schedule_target(data: dict[str, Any]) -> dict[str, Any]:
     session_id = str(data.get("sessionId") or data.get("session_id") or "").strip()
     chat_key_value = str(data.get("chatKey") or data.get("chat_key") or "").strip()
+    reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip()
     bot_name = str(data.get("botName") or data.get("bot_name") or "").strip() or None
     target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
     last_error: Optional[BridgeError] = None
@@ -4897,7 +5285,37 @@ def resolve_schedule_target(data: dict[str, Any]) -> dict[str, Any]:
     if last_error is not None:
         raise last_error
 
-    raise BridgeError(400, "sessionId or chatKey required")
+    if reply_req_id:
+        matching_bots = []
+        if target_config_id:
+            bot = resolve_loaded_target_bot(target_config_id, bot_name)
+            if get_reply_url_state(bot, reply_req_id):
+                matching_bots.append(bot)
+        else:
+            for candidate in BOTS.values():
+                if bot_instance_is_stale(candidate):
+                    continue
+                if get_reply_url_state(candidate, reply_req_id):
+                    if bot_name and candidate.config["name"] != bot_name:
+                        continue
+                    matching_bots.append(candidate)
+            if len(matching_bots) > 1:
+                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
+        if not matching_bots:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        bot = matching_bots[0]
+        state = get_reply_url_state(bot, reply_req_id)
+        if not state:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        return {
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "sessionId": None,
+            "chatKey": str(state.get("chatKey") or ""),
+            "replyReqId": reply_req_id,
+        }
+
+    raise BridgeError(400, "sessionId or chatKey or replyReqId required")
 
 
 def build_scheduled_message_job(definition: dict[str, Any], run_at_ms: int) -> dict[str, Any]:
@@ -4909,15 +5327,33 @@ def build_scheduled_message_job(definition: dict[str, Any], run_at_ms: int) -> d
         "sessionId": definition.get("sessionId"),
         "chatKey": definition["chatKey"],
         "message": definition["message"],
+        "replyReqId": definition.get("replyReqId"),
+        "msgtype": definition.get("msgtype") or "markdown",
+        "content": definition.get("content"),
+        "templateCard": definition.get("templateCard"),
         "runAt": run_at_ms,
         "createdAt": now_ms(),
     }
 
 
 def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optional[int] = None) -> dict[str, Any]:
+    msgtype = str(data.get("msgtype") or "markdown").strip() or "markdown"
     message = str(data.get("message") or data.get("text") or "").strip()
-    if not message:
-        raise BridgeError(400, "message required")
+    content = str(data.get("content") or "").strip() or None
+    template_card = data.get("templateCard") or data.get("template_card")
+    if msgtype == "markdown":
+        if not message:
+            raise BridgeError(400, "message required")
+        content = content or message
+    elif msgtype == "template_card":
+        try:
+            template_card = validate_template_card_payload(template_card, require_interaction_task_id=False)
+        except ValueError as exc:
+            raise BridgeError(400, str(exc)) from exc
+        if not message:
+            message = "[template_card scheduled follow-up]"
+    else:
+        raise BridgeError(400, f"unsupported msgtype: {msgtype}")
 
     target = resolve_schedule_target(data)
     created_at = created_at_ms if created_at_ms is not None else now_ms()
@@ -4970,7 +5406,11 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
             "botName": target.get("botName"),
             "sessionId": target.get("sessionId"),
             "chatKey": target["chatKey"],
+            "replyReqId": target.get("replyReqId"),
             "message": message,
+            "msgtype": msgtype,
+            "content": content,
+            "templateCard": template_card,
             "mode": "cron",
             "cron": cron_expr or None,
             "timezone": timezone_name,
@@ -5517,7 +5957,8 @@ async def process_scheduled_messages_once() -> None:
             continue
         chat_key_value = str(job.get("chatKey") or "").strip()
         message = str(job.get("message") or "").strip()
-        if not chat_key_value or not message:
+        msgtype = str(job.get("msgtype") or "markdown").strip() or "markdown"
+        if not chat_key_value or (msgtype == "markdown" and not message):
             finalize_scheduled_message_job(pending_file, False)
             continue
         processing_file = pending_file
@@ -5552,16 +5993,34 @@ async def process_scheduled_messages_once() -> None:
                 requestId=job.get("requestId"),
             )
             continue
-        accepted = await enqueue_message(
-            bot,
-            chat_key_value,
-            message,
-            None,
-            silent_lease_failure=True,
-            scheduled_job_file=str(processing_file),
-            schedule_id=str(job.get("scheduleId") or "").strip() or None,
-            schedule_request_id=schedule_request_id or None,
-        )
+        if msgtype == "template_card":
+            try:
+                reply_req_id = str(job.get("replyReqId") or "").strip() or None
+                result = await submit_send_message_request(
+                    {
+                        "replyReqId": reply_req_id,
+                        "chatKey": None if reply_req_id else chat_key_value,
+                        "targetConfigId": str(job.get("botId") or "").strip() or None,
+                        "botName": str(job.get("botName") or "").strip() or None,
+                        "msgtype": "template_card",
+                        "templateCard": job.get("templateCard"),
+                    },
+                    "scheduled-message",
+                )
+                accepted = bool(result.get("ok"))
+            except BridgeError:
+                accepted = False
+        else:
+            accepted = await enqueue_message(
+                bot,
+                chat_key_value,
+                message,
+                None,
+                silent_lease_failure=True,
+                scheduled_job_file=str(processing_file),
+                schedule_id=str(job.get("scheduleId") or "").strip() or None,
+                schedule_request_id=schedule_request_id or None,
+            )
         if not accepted:
             continue
         job["enqueuedAt"] = now_ms()
@@ -6017,6 +6476,11 @@ def normalize_optional_path(value: Any, *, base_dir: Optional[Path] = None) -> s
     return str(path)
 
 
+def normalize_optional_string(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -6069,6 +6533,20 @@ def resolve_bot_secret(data: dict[str, Any], *, status_code: int, allow_inline_s
     if not allow_inline_secret and not secret_file:
         raise BridgeError(status_code, "plaintext secret is no longer supported; use secretFile")
     return secret, secret_file
+
+
+def resolve_optional_secret_file(data: dict[str, Any], *keys: str, status_code: int = 400) -> tuple[Optional[str], Optional[str]]:
+    path_value = None
+    for key in keys:
+        candidate = data.get(key)
+        if str(candidate or "").strip():
+            path_value = candidate
+            break
+    normalized_path = normalize_optional_path(path_value)
+    if not normalized_path:
+        return None, None
+    secret = read_text_file(normalized_path, label=keys[0], status_code=status_code)
+    return secret, normalized_path
 
 
 def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = False) -> dict[str, Any]:
@@ -6232,8 +6710,11 @@ def merge_bot_configs(
 def serialize_bot_config_for_disk(config: dict[str, Any]) -> dict[str, Any]:
     persisted = dict(config)
     persisted.pop("secret", None)
+    persisted.pop("appSecret", None)
     if not str(persisted.get("secretFile") or "").strip():
         persisted.pop("secretFile", None)
+    if not str(persisted.get("appSecretFile") or "").strip():
+        persisted.pop("appSecretFile", None)
     return persisted
 
 
@@ -6563,6 +7044,11 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
             if child.is_dir():
                 continue
             destination = bridge_home / child.name
+            try:
+                if child.resolve() == destination.resolve():
+                    continue
+            except FileNotFoundError:
+                pass
             ensure_dir_for(destination)
             shutil.copy2(child, destination)
 
@@ -6800,6 +7286,7 @@ async def stop_bot(
         await terminate_process(process)
     bot.sessions.clear()
     bot.status = "stopped"
+    write_template_card_state(bot)
     if persist_state and not bot_instance_is_stale(bot):
         upsert_persisted_bot_config(bot.config)
 
@@ -6818,6 +7305,7 @@ async def remove_bot(bot_id: str) -> None:
     finally:
         BOTS.pop(bot_id, None)
         PREPARED_PREVIOUS_BOT_CONFIGS.pop(bot_id, None)
+        delete_template_card_state(bot_id)
 
 
 async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
@@ -6825,6 +7313,10 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
     if WECOM_RAW_INBOUND_LOG_ENABLED:
         add_log(bot, f"raw inbound: {summarize_inbound_payload(message)}")
     req_id = ((message.get("headers") or {}).get("req_id"))
+    if req_id:
+        response_url = extract_response_url(message)
+        if response_url:
+            save_reply_url(bot, str(req_id), chat_key_for_bot(bot, message), response_url)
     if req_id and resolve_request_future(bot, req_id, message):
         if str(message.get("cmd") or "").strip().lower() == "ping":
             bot.last_heartbeat_ack_at_ms = bot.last_inbound_at_ms
@@ -7072,6 +7564,9 @@ async def start_bot(config: dict[str, Any]) -> BotState:
     if normalized["id"] in BOTS:
         await stop_bot(normalized["id"], persist_disable=False, reason="start_bot_replace")
     bot = BotState(config=normalized)
+    bot.template_card_delivery_meta = read_template_card_state(normalized["id"])
+    bot.reply_urls = read_reply_url_state(normalized["id"])
+    restore_template_card_runtime_state(bot)
     BOTS[normalized["id"]] = bot
     bot.stop_reason = None
     add_log(bot, "starting...")
