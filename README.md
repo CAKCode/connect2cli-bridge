@@ -1,4 +1,4 @@
-# WeCom Codex Bridge Python
+# WeCom Codex/Claude Code Bridge Python
 
 企业微信智能机器人与 `codex` CLI 之间的纯 Python 会话桥接服务，默认对接 `codex`，也支持兼容 `claude` backend。
 
