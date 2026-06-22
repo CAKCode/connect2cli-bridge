@@ -29,6 +29,7 @@ workspace/
 .workspace-bridge-runtime/
 .runtime/
 .shared-runtime/
+.claude-runtime/
 
 # Only keep WeCom-related skills in this repository.
 relate-skills/*

@@ -44,6 +44,11 @@ def make_bot(bridge_module, *, config_id="bot-1", name="codex1", remote_bot_id="
             "enabled": True,
             "welcome": "",
             "groupSessionMode": "per-user",
+            "agentBackend": "codex",
+            "agentCommand": None,
+            "agentRunAsUser": None,
+            "agentRunAsGroup": None,
+            "agentRuntimeRoot": None,
         }
     )
     bridge_module.BOTS[bot.config["id"]] = bot
@@ -1854,6 +1859,49 @@ def test_normalize_bot_config_accepts_matching_secret_and_secret_file(bridge_mod
 
     assert config["secret"] == "secret"
     assert config["secretFile"] == str(secret_file)
+
+
+def test_normalize_bot_config_accepts_agent_backend_and_command(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "claude1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "claude",
+            "agentCommand": "claude --model sonnet",
+            "enabled": True,
+        }
+    )
+
+    assert config["agentBackend"] == "claude"
+    assert config["agentCommand"] == "claude --model sonnet"
+
+
+def test_normalize_bot_config_accepts_agent_run_as_fields(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "claude1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "claude",
+            "agentRunAsUser": "nobody",
+            "agentRunAsGroup": "nogroup",
+            "agentRuntimeRoot": str(bridge_module.BASE_DIR / "claude-runtime"),
+            "enabled": True,
+        }
+    )
+
+    assert config["agentRunAsUser"] == "nobody"
+    assert config["agentRunAsGroup"] == "nogroup"
+    assert str(config["agentRuntimeRoot"]).endswith("claude-runtime")
 
 
 def test_start_bot_does_not_stop_existing_bot_when_new_config_is_invalid(bridge_module):
@@ -5435,6 +5483,18 @@ def test_api_add_bot_uses_stable_default_id(monkeypatch, bridge_module):
     assert body["id"] == bridge_module.default_bot_config_id("bot-id")
 
 
+def test_build_bridge_context_mentions_agent_backend(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.config["agentBackend"] = "claude"
+    bot.config["agentCommand"] = "claude --model sonnet"
+    sess = make_session(bridge_module, bot)
+
+    context = bridge_module.build_bridge_context(bot, sess, "single:test-user")
+
+    assert "agentBackend: claude" in context
+    assert "agentCommand: claude --model sonnet" in context
+
+
 def test_submit_send_message_request_sends_template_card(monkeypatch, bridge_module):
     bot = make_bot(bridge_module)
     bot.ws = SimpleNamespace(closed=False)
@@ -7947,7 +8007,7 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
     assert payloads[-1] == (True, "final answer")
     assert payloads[0] == (False, "运行状态：正在启动处理。")
     assert payloads[1] == (False, "运行状态：思考中，已运行 0s。")
-    assert captured["cwd"] == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user"))
+    assert str(captured["cwd"]) == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user"))
     assert captured["args"][-1] == "-"
     assert bytes(captured["stdin"].buffer).decode("utf-8") == "prompt"
     assert captured["stdin"].closed is True
@@ -8009,7 +8069,7 @@ async def test_run_codex_uses_workfile_as_cwd_in_sandbox_mode(bridge_module, mon
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
     expected_workfile_dir = str(bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve())
-    assert captured["cwd"] == expected_workfile_dir
+    assert str(captured["cwd"]) == expected_workfile_dir
     assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_workfile_dir
 
 
@@ -8056,7 +8116,7 @@ async def test_run_codex_uses_roomfile_as_cwd_for_group_session_in_sandbox_mode(
     await bridge_module.run_codex(bot, sess, "group:test-room", "prompt", "req-1", [])
 
     expected_roomfile_dir = str(bridge_module.get_roomfile_dir(bot.config["id"], "test-room").resolve())
-    assert captured["cwd"] == expected_roomfile_dir
+    assert str(captured["cwd"]) == expected_roomfile_dir
     assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_roomfile_dir
 
 
@@ -8139,6 +8199,37 @@ def test_build_codex_base_args_honors_codex_command_env(monkeypatch, bridge_modu
 
     assert args[:4] == ["/opt/codex/bin/codex", "--profile", "automation", "exec"]
     assert args[4] == "resume"
+
+
+def test_build_codex_base_args_supports_claude_backend(bridge_module):
+    args = bridge_module.build_codex_base_args(
+        Path("/tmp/out.jsonl"),
+        [],
+        resume=False,
+        backend="claude",
+        command="claude --model sonnet",
+    )
+
+    assert args[:4] == ["claude", "--model", "sonnet", "-p"]
+    assert "--verbose" in args
+    assert "--output-format" in args
+    assert "stream-json" in args
+    assert "--image" not in args
+
+
+def test_build_codex_base_args_supports_claude_resume(bridge_module):
+    args = bridge_module.build_codex_base_args(
+        Path("/tmp/out.jsonl"),
+        [],
+        resume=True,
+        backend="claude",
+        command="claude --model sonnet",
+        resume_thread_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+
+    assert args[:4] == ["claude", "--model", "sonnet", "-p"]
+    assert "--resume" in args
+    assert "550e8400-e29b-41d4-a716-446655440000" in args
 
 
 @pytest.mark.asyncio
@@ -8598,10 +8689,69 @@ async def test_reset_then_image_then_text_uses_fresh_exec_with_image_and_stdin_p
     assert str(image_path) in captured["args"]
     assert captured["args"][-1] == "-"
     prompt = bytes(captured["stdin"].buffer).decode("utf-8")
-    assert "Attachment 1: image" in prompt
+    assert "Attachment 1: image file available at" in prompt
+    assert "Read the local file directly if image analysis is needed." in prompt
     assert str(image_path) in prompt
     assert "User request:\n分析一下" in prompt
     assert captured["stdin"].closed is True
     assert captured["env"]["WECOM_BRIDGE_CHATFILE_DIR"]
     assert captured["env"]["TMPDIR"] == captured["env"]["WECOM_BRIDGE_CHATFILE_DIR"]
     assert sess.thread_id == "new-thread"
+
+
+@pytest.mark.asyncio
+async def test_run_codex_wraps_claude_with_setpriv_when_run_as_user_configured(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.config["agentBackend"] = "claude"
+    bot.config["agentCommand"] = "claude"
+    bot.config["agentRunAsUser"] = "nobody"
+    bot.config["agentRunAsGroup"] = "nogroup"
+    bot.config["agentRuntimeRoot"] = str(bridge_module.BASE_DIR / "claude-runtime")
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    captured = {}
+
+    async def fake_send_session_status(*args, **kwargs):
+        return True
+
+    async def fake_send_or_store_session_payload(*args, **kwargs):
+        return True
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_data(
+                (json.dumps({"type": "system", "subtype": "init", "session_id": "550e8400-e29b-41d4-a716-446655440000"}) + "\n").encode("utf-8")
+            )
+            self.stdout.feed_data((json.dumps({"type": "result", "result": "done"}) + "\n").encode("utf-8"))
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = FakeProcess()
+        captured["args"] = list(args)
+        captured["env"] = kwargs["env"]
+        captured["cwd"] = kwargs["cwd"]
+        captured["stdin"] = process.stdin
+        return process
+
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payload", fake_send_or_store_session_payload)
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
+
+    assert captured["args"][0] == "setpriv"
+    assert "--clear-groups" in captured["args"]
+    assert "claude" in captured["args"]
+    assert captured["env"]["CLAUDE_CONFIG_DIR"].endswith(".claude")

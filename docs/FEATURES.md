@@ -82,8 +82,17 @@ Implemented:
 
 - `codex exec`
 - `codex exec resume` as a runtime-scoped resume attempt
+- per-bot agent backend selection
+- per-bot command override for the selected backend
 - execution mode switch through `CODEX_EXEC_MODE`
 - global concurrency limit through `MAX_CONCURRENT_CODEX_RUNS`
+
+Currently supported backends:
+
+- `codex`
+  native `exec` and `exec resume`
+- `claude`
+  headless CLI execution with native `--resume <session-id>` plus bridge-managed continuity fallback when resume state is unavailable
 
 Modes:
 
@@ -98,6 +107,7 @@ Important boundary:
 
 - Codex auth is inherited from the runtime user's `CODEX_HOME`
 - the bridge does not manage Codex login for you
+- when a backend resume state is missing or unavailable, the bridge may fall back to recent local chat history for continuity
 
 ### 6. Workspace and file layout
 

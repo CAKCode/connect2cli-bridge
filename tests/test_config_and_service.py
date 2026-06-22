@@ -39,6 +39,30 @@ def test_load_app_config_reads_secret_file_and_paths(tmp_path: Path) -> None:
     assert config.source_dir == source_dir.resolve()
 
 
+def test_load_app_config_reads_agent_run_as_settings(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WECOM_AGENT_RUN_AS_USER": "nobody",
+            "WECOM_AGENT_RUN_AS_GROUP": "nogroup",
+            "WECOM_AGENT_RUNTIME_ROOT": str(tmp_path / "claude-runtime"),
+        }
+    )
+
+    assert config.agent_run_as_user == "nobody"
+    assert config.agent_run_as_group == "nogroup"
+    assert config.agent_runtime_root == (tmp_path / "claude-runtime").resolve()
+
+
 async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
     secret_file = tmp_path / ".secrets" / "bot.secret"
     source_dir = tmp_path / "repo"
@@ -243,6 +267,26 @@ def test_build_bot_from_app_config_returns_runtime_bot(tmp_path: Path) -> None:
 
     assert bot.bot_id == "bot-1"
     assert bot.source.source_dir == source_dir.resolve()
+
+
+def test_load_app_config_reads_agent_backend_and_command(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+
+    config = load_app_config(
+        {
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WECOM_AGENT_BACKEND": "claude",
+            "WECOM_AGENT_COMMAND": "claude --model sonnet",
+        }
+    )
+
+    assert config.agent_backend == "claude"
+    assert config.agent_command == "claude --model sonnet"
 
 
 def test_load_app_accepts_aiohttp_web_factory_signature(tmp_path: Path) -> None:

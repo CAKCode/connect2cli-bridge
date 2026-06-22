@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .agent_backends import normalize_agent_backend
 from .runtime import build_bot_config
 
 
@@ -57,6 +58,11 @@ class AppConfig:
     chatfile_root: Path
     codex_output_root: Path
     codex_exec_mode: str
+    agent_backend: str
+    agent_command: str | None
+    agent_run_as_user: str | None
+    agent_run_as_group: str | None
+    agent_runtime_root: Path | None
     file_send_roots: tuple[Path, ...]
     max_upload_size: int
     wecom_enabled: bool
@@ -91,6 +97,15 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         chatfile_root=chatfile_root,
         codex_output_root=codex_output_root,
         codex_exec_mode=(str(values.get("CODEX_EXEC_MODE") or "host").strip().lower() or "host"),
+        agent_backend=normalize_agent_backend(values.get("WECOM_AGENT_BACKEND") or values.get("AGENT_BACKEND") or "codex"),
+        agent_command=(str(values.get("WECOM_AGENT_COMMAND") or values.get("AGENT_COMMAND") or "").strip() or None),
+        agent_run_as_user=(str(values.get("WECOM_AGENT_RUN_AS_USER") or values.get("AGENT_RUN_AS_USER") or "").strip() or None),
+        agent_run_as_group=(str(values.get("WECOM_AGENT_RUN_AS_GROUP") or values.get("AGENT_RUN_AS_GROUP") or "").strip() or None),
+        agent_runtime_root=(
+            Path(str(values.get("WECOM_AGENT_RUNTIME_ROOT") or values.get("AGENT_RUNTIME_ROOT") or "")).expanduser().resolve()
+            if str(values.get("WECOM_AGENT_RUNTIME_ROOT") or values.get("AGENT_RUNTIME_ROOT") or "").strip()
+            else None
+        ),
         file_send_roots=file_send_roots,
         max_upload_size=max_upload_size,
         wecom_enabled=str(values.get("WECOM_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"},
@@ -111,6 +126,11 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=config.runtime_root,
         chatfile_root=config.chatfile_root,
         codex_exec_mode=config.codex_exec_mode,
+        agent_backend=config.agent_backend,
+        agent_command=config.agent_command,
+        agent_run_as_user=config.agent_run_as_user,
+        agent_run_as_group=config.agent_run_as_group,
+        agent_runtime_root=config.agent_runtime_root,
         file_send_roots=config.file_send_roots,
         max_upload_size=config.max_upload_size,
     )
@@ -122,6 +142,11 @@ def build_bot_from_app_config(config: AppConfig):
         runtime_root=bot.runtime_root,
         chatfile_root=bot.chatfile_root,
         codex_exec_mode=bot.codex_exec_mode,
+        agent_backend=bot.agent_backend,
+        agent_command=bot.agent_command,
+        agent_run_as_user=bot.agent_run_as_user,
+        agent_run_as_group=bot.agent_run_as_group,
+        agent_runtime_root=bot.agent_runtime_root,
         file_send_roots=bot.file_send_roots,
         max_upload_size=bot.max_upload_size,
         platform=bot.platform,

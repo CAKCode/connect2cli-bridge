@@ -584,6 +584,231 @@ async def test_execute_and_deliver_message_uses_runtime_thread_state_when_final_
     assert runtime.session_threads[message.chat_key] == "thread-new"
 
 
+async def test_stream_text_message_once_uses_claude_resume_without_local_history_duplication(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.buffer = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.buffer.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = None
+
+        async def communicate(self):
+            self.returncode = 0
+            return (
+                (
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "type": "system",
+                                    "subtype": "init",
+                                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            json.dumps({"type": "result", "result": "done"}, ensure_ascii=False),
+                        ]
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                b"",
+            )
+
+    bot = build_bot_from_app_config(config)
+    bot = replace(
+        bot,
+        agent_backend="claude",
+        agent_command="claude --permission-mode bypassPermissions",
+        agent_run_as_user=None,
+        agent_run_as_group=None,
+    )
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    runtime.session_threads["single:alice"] = "550e8400-e29b-41d4-a716-446655440000"
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    invocations: list[tuple[str, ...]] = []
+    stdin_buffers: list[str] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        process = FakeProcess()
+        invocations.append(tuple(args))
+        stdin_buffers.append(process.stdin.buffer.decode("utf-8", "ignore"))
+        return process
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    assert session_id.startswith("session-")
+    assert reply == "done"
+    assert invocations[0][0] == "claude"
+    assert "-p" in invocations[0]
+    assert "--resume" in invocations[0]
+    assert "550e8400-e29b-41d4-a716-446655440000" in invocations[0]
+
+
+async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_user(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    bot = build_bot_from_app_config(config)
+    bot = replace(
+        bot,
+        agent_backend="claude",
+        agent_command="claude",
+        agent_run_as_user="nobody",
+        agent_run_as_group="nogroup",
+        agent_runtime_root=(tmp_path / "claude-runtime").resolve(),
+    )
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    captured = {}
+
+    def fake_run_invocation(invocation):
+        captured["invocation"] = invocation
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"type": "result", "result": "done"}, ensure_ascii=False) + "\n",
+            stderr="",
+        )
+
+    original_run_invocation = execution_module.run_invocation
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        session_id, reply = await run_text_message_once(config, bot, message)
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    invocation = captured["invocation"]
+    assert session_id.startswith("session-")
+    assert reply == "done"
+    assert invocation.run_as_user == "nobody"
+    assert invocation.run_as_group == "nogroup"
+    assert invocation.env["CLAUDE_CONFIG_DIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
+    assert invocation.env["CODEX_HOME"].startswith(str((tmp_path / "claude-runtime").resolve()))
+    assert invocation.env["TMPDIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
+
+
+async def test_stream_text_message_once_falls_back_to_local_history_for_claude_when_resume_session_missing(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.buffer = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.buffer.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    bot = replace(
+        bot,
+        agent_backend="claude",
+        agent_command="claude --permission-mode bypassPermissions",
+        agent_run_as_user=None,
+        agent_run_as_group=None,
+    )
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    runtime.session_threads["single:alice"] = "550e8400-e29b-41d4-a716-446655440000"
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="current turn", raw_payload={})
+    runtime_session = SimpleNamespace(chat=[{"role": "user", "text": "older user turn"}, {"role": "bot", "text": "older bot turn"}])
+    runtime.sessions = {"single:alice": runtime_session}
+    invocations: list[tuple[str, ...]] = []
+    processes: list[FakeProcess] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        invocations.append(tuple(args))
+        if len(invocations) == 1:
+            process = FakeProcess(
+                stdout_text="",
+                stderr_text='{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"550e8400-e29b-41d4-a716-446655440000","errors":["No conversation found with session ID: 550e8400-e29b-41d4-a716-446655440000"]}',
+                returncode=1,
+            )
+        else:
+            process = FakeProcess(
+                stdout_text=json.dumps({"type": "result", "result": "done"}, ensure_ascii=False),
+                stderr_text="",
+                returncode=0,
+            )
+        processes.append(process)
+        return process
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    assert session_id.startswith("session-")
+    assert reply == "done"
+    assert len(invocations) == 2
+    assert "--resume" in invocations[0]
+    assert "--resume" not in invocations[1]
+    assert "[RecentConversation]" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+    assert "older user turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+    assert "older bot turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+
+
 async def test_send_or_cache_runtime_payload_uses_reply_state_cache_for_req_id(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config

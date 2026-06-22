@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .agent_backends import AgentBackend
+
 
 WorkspaceScope = Literal["user", "room"]
 SkillLayerName = Literal["global", "workspace"]
@@ -25,6 +27,11 @@ class BotConfig:
     runtime_root: Path
     chatfile_root: Path
     codex_exec_mode: Literal["sandboxed", "host"] = "host"
+    agent_backend: AgentBackend = "codex"
+    agent_command: str | None = None
+    agent_run_as_user: str | None = None
+    agent_run_as_group: str | None = None
+    agent_runtime_root: Path | None = None
     file_send_roots: tuple[Path, ...] = ()
     max_upload_size: int = 100 * 1024 * 1024
     platform: str = "wecom"
@@ -161,6 +168,8 @@ class RunnerInvocation:
     cwd: Path
     env: dict[str, str]
     prompt: str
+    run_as_user: str | None = None
+    run_as_group: str | None = None
 
 
 @dataclass(frozen=True)

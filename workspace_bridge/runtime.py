@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+from .agent_backends import normalize_agent_backend
 from .context import build_runtime_context, resolve_workspace_cwd
 from .layout import build_workspace_ref
 from .models import BotConfig, CodexLaunchSpec, SessionRecord, SourceConfig
@@ -36,6 +37,11 @@ def build_bot_config(
     runtime_root: Path | str,
     chatfile_root: Path | str,
     codex_exec_mode: str = "host",
+    agent_backend: str = "codex",
+    agent_command: str | None = None,
+    agent_run_as_user: str | None = None,
+    agent_run_as_group: str | None = None,
+    agent_runtime_root: Path | str | None = None,
     file_send_roots: tuple[Path, ...] = (),
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> BotConfig:
@@ -47,6 +53,13 @@ def build_bot_config(
         runtime_root=Path(runtime_root).expanduser().resolve(),
         chatfile_root=Path(chatfile_root).expanduser().resolve(),
         codex_exec_mode=(str(codex_exec_mode).strip().lower() or "host"),
+        agent_backend=normalize_agent_backend(agent_backend),
+        agent_command=(str(agent_command).strip() or None),
+        agent_run_as_user=(str(agent_run_as_user).strip() or None),
+        agent_run_as_group=(str(agent_run_as_group).strip() or None),
+        agent_runtime_root=(
+            Path(agent_runtime_root).expanduser().resolve() if str(agent_runtime_root or "").strip() else None
+        ),
         file_send_roots=tuple(Path(item).expanduser().resolve() for item in file_send_roots),
         max_upload_size=max(1, int(max_upload_size)),
         platform="wecom",
@@ -279,6 +292,7 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             session_id=session_id,
             chatfile_root=bot.chatfile_root,
             codex_exec_mode=bot.codex_exec_mode,
+            agent_backend=bot.agent_backend,
             file_send_roots=bot.file_send_roots,
             max_upload_size=bot.max_upload_size,
         )
@@ -307,7 +321,16 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             "WECOM_BRIDGE_BOT_NAME": bot.bot_name,
             "WECOM_BRIDGE_SESSION_ID": session.session_id,
             "WECOM_BRIDGE_CHAT_KEY": chat_key,
+            "WECOM_BRIDGE_AGENT_BACKEND": bot.agent_backend,
         }
+        if bot.agent_command:
+            env["WECOM_BRIDGE_AGENT_COMMAND"] = bot.agent_command
+        if bot.agent_run_as_user:
+            env["WECOM_BRIDGE_AGENT_RUN_AS_USER"] = bot.agent_run_as_user
+        if bot.agent_run_as_group:
+            env["WECOM_BRIDGE_AGENT_RUN_AS_GROUP"] = bot.agent_run_as_group
+        if bot.agent_runtime_root is not None:
+            env["WECOM_BRIDGE_AGENT_RUNTIME_ROOT"] = str(bot.agent_runtime_root)
         return CodexLaunchSpec(
             session=session,
             workspace=provisioned,

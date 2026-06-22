@@ -145,6 +145,90 @@ def test_build_runner_invocation_default_codex_argv_reads_prompt_from_stdin(tmp_
     assert "--dangerously-bypass-approvals-and-sandbox" in invocation.argv
 
 
+def test_build_runner_invocation_supports_claude_backend(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="claude",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        agent_backend="claude",
+    )
+    launch = prepare_session_run(bot, "single:alice")
+
+    invocation = build_runner_invocation(
+        launch,
+        prompt="hello",
+        output_file=tmp_path / "out.jsonl",
+    )
+
+    assert invocation.argv[0:2] == ("claude", "-p")
+    assert "--verbose" in invocation.argv
+    assert "--output-format" in invocation.argv
+    assert "stream-json" in invocation.argv
+    assert "--image" not in invocation.argv
+
+
+def test_build_runner_invocation_supports_claude_resume_session_id(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="claude",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        agent_backend="claude",
+    )
+    launch = prepare_session_run(bot, "single:alice")
+
+    invocation = build_runner_invocation(
+        launch,
+        prompt="hello",
+        output_file=tmp_path / "out.jsonl",
+        resume=True,
+        resume_thread_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+
+    assert invocation.argv[0:2] == ("claude", "-p")
+    assert "--resume" in invocation.argv
+    assert "550e8400-e29b-41d4-a716-446655440000" in invocation.argv
+
+
+def test_build_runner_invocation_carries_claude_run_as_identity(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="claude",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        agent_backend="claude",
+        agent_run_as_user="nobody",
+        agent_run_as_group="nogroup",
+        agent_runtime_root=tmp_path / "claude-runtime",
+    )
+    launch = prepare_session_run(bot, "single:alice")
+
+    invocation = build_runner_invocation(
+        launch,
+        prompt="hello",
+        output_file=tmp_path / "out.jsonl",
+    )
+
+    assert invocation.run_as_user == "nobody"
+    assert invocation.run_as_group == "nogroup"
+
+
 def test_build_runner_invocation_respects_code_command_override(tmp_path: Path, monkeypatch) -> None:
     bot, launch = prepare_launch(tmp_path)
     prompt = build_prompt(bot, launch, "hello")

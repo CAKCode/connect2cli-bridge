@@ -3,9 +3,11 @@
 import asyncio
 import base64
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import random
 import re
 import shutil
@@ -34,6 +36,22 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
+from workspace_bridge.agent_backends import (
+    build_agent_argv,
+    extract_agent_reply,
+    extract_agent_thread_id,
+    normalize_agent_backend,
+)
+from workspace_bridge.agent_runtime import (
+    apply_claude_runtime_env,
+    build_setpriv_prefix,
+    config_agent_run_as_group,
+    config_agent_run_as_user,
+    config_agent_runtime_root,
+    normalize_optional_text,
+    prepare_claude_runtime_root,
+    resolve_posix_identity,
+)
 from workspace_bridge.async_utils import run_blocking
 from workspace_bridge import codex_runtime
 from workspace_bridge.template_card_validation import (
@@ -175,6 +193,7 @@ SCHEDULE_DEFINITION_POLL_MS = int(os.environ.get("SCHEDULE_DEFINITION_POLL_MS", 
 SCHEDULE_DEFINITION_LEASE_TTL_MS = max(1000, int(os.environ.get("SCHEDULE_DEFINITION_LEASE_TTL_MS", 30000)))
 VALID_CODEX_EXEC_MODES = {"sandboxed", "host"}
 VALID_GROUP_SESSION_MODES = {"shared", "per-user"}
+VALID_AGENT_BACKENDS = {"codex", "claude"}
 
 EXTRA_FILE_ROOTS = [
     Path(item.strip()).resolve()
@@ -332,18 +351,65 @@ def resolve_codex_command() -> list[str]:
     return ["codex"]
 
 
-def build_codex_base_args(output_file: Path, image_paths: list[str], resume: bool) -> list[str]:
-    args = [*resolve_codex_command(), "exec"]
-    if resume:
-        args.append("resume")
-    args.extend(["--skip-git-repo-check", "--json", "-o", str(output_file)])
-    if codex_runs_in_sandbox():
-        args.append("--full-auto")
-    else:
-        args.append("--dangerously-bypass-approvals-and-sandbox")
-    for image_path in image_paths:
-        args.extend(["-i", image_path])
-    return args
+def normalize_agent_command(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def normalize_optional_run_as(value: Any) -> Optional[str]:
+    return normalize_optional_text(value)
+
+
+def bot_agent_backend(config: dict[str, Any]) -> str:
+    raw = config.get("agentBackend") or config.get("agent_backend") or "codex"
+    return normalize_agent_backend(str(raw))
+
+
+def bot_agent_command(config: dict[str, Any]) -> Optional[str]:
+    return normalize_agent_command(config.get("agentCommand") or config.get("agent_command"))
+
+
+def bot_agent_run_as_user(config: dict[str, Any]) -> Optional[str]:
+    return config_agent_run_as_user(config)
+
+
+def bot_agent_run_as_group(config: dict[str, Any]) -> Optional[str]:
+    return config_agent_run_as_group(config)
+
+
+def bot_agent_runtime_root(config: dict[str, Any]) -> Optional[Path]:
+    return config_agent_runtime_root(config, base_dir=BASE_DIR)
+
+
+def build_codex_base_args(
+    output_file: Path,
+    image_paths: list[str],
+    resume: bool,
+    *,
+    backend: str = "codex",
+    command: Optional[str] = None,
+    resume_thread_id: Optional[str] = None,
+    exec_mode: Optional[str] = None,
+) -> list[str]:
+    resolved_command = command
+    if normalize_agent_backend(backend) == "codex" and not normalize_agent_command(command):
+        env_command = str(os.environ.get("CODEX_COMMAND") or "").strip()
+        if env_command:
+            resolved_command = env_command
+        else:
+            resolved = shutil.which("codex")
+            if resolved:
+                resolved_command = resolved
+    argv = build_agent_argv(
+        normalize_agent_backend(backend),
+        resolved_command,
+        output_file,
+        resume=resume,
+        resume_thread_id=resume_thread_id,
+        image_paths=image_paths,
+        exec_mode=exec_mode or CODEX_EXEC_MODE,
+    )
+    return list(argv)
 
 
 async def write_process_prompt(process: asyncio.subprocess.Process, prompt: str) -> None:
@@ -1782,6 +1848,7 @@ def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[
         "ownerPid": normalize_optional_int(record.get("ownerPid")),
         "leaseExpiresAt": normalize_optional_int(record.get("leaseExpiresAt")),
         "activeScheduleId": str(record.get("activeScheduleId") or "").strip() or None,
+        "threadId": str(record.get("threadId") or "").strip() or None,
     }
 
 
@@ -2290,6 +2357,8 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
     allowed_file_roots = ", ".join(str(root) for root in get_allowed_file_roots(bot, key))
     user_id = chat_key_to_user_id(key) or "-"
     room_id = chat_key_to_room_id(key) or "-"
+    agent_backend = bot_agent_backend(bot.config)
+    agent_command = bot_agent_command(bot.config) or "-"
     execution_mode_note = (
         "Local network access is blocked inside the Codex sandbox for this bridge. "
         "Never probe localhost ports or use curl/python sockets to send files."
@@ -2306,6 +2375,8 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             f"userId: {user_id}",
             f"roomId: {room_id}",
             f"sessionId: {sess.session_id}",
+            f"agentBackend: {agent_backend}",
+            f"agentCommand: {agent_command}",
             f"executionMode: {CODEX_EXEC_MODE}",
             f"CWD_DIR: {runtime_cwd}",
             f"CHATFILE_DIR: {workspace_paths['chatfile']}",
@@ -2338,6 +2409,11 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             "Export send-back files under CHATFILE_DIR.",
             "User-global Codex skills should live in ~/.codex/skills.",
             "Personal Codex skills should live in CWD_DIR/.codex/skills.",
+            (
+                "If the selected backend lacks native bridge resume support, preserve continuity by using the recent bridge-local chat history included in the prompt."
+                if agent_backend != "codex"
+                else "Native Codex resume is enabled when a live bridge thread is available."
+            ),
             "[/BridgeContext]",
         ]
     )
@@ -2347,7 +2423,10 @@ def build_pending_media_context(pending_media: list[dict[str, Any]]) -> str:
     lines = []
     for idx, media in enumerate(pending_media, start=1):
         if media.get("kind") == "image":
-            lines.append(f"Attachment {idx}: image {media['path']}")
+            lines.append(
+                f"Attachment {idx}: image file available at {media['path']}. "
+                "Read the local file directly if image analysis is needed."
+            )
         else:
             lines.append(f"Attachment {idx}: file {media['fileName']} path {media['path']}")
     return "\n\n".join(lines)
@@ -3335,6 +3414,7 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
             session_id=record["sessionId"],
             work_dir=str(get_session_runtime_cwd(bot, key)),
             lock_file=Path(record["lockFile"]),
+            thread_id=str(record.get("threadId") or "").strip() or None,
         )
         bot.sessions[key] = sess
         add_log(bot, f"[{key}] new session")
@@ -3360,7 +3440,46 @@ def build_prompt(
     active_download_note = build_active_media_download_note(sess.pending_media_downloads)
     parts = [build_bridge_context(bot, sess, key), media_context, media_notes, active_download_note]
     parts = [part for part in parts if part]
-    return f"{chr(10).join(parts)}\n\nUser request:\n{text}"
+    prompt = f"{chr(10).join(parts)}\n\nUser request:\n{text}"
+    if bot_agent_backend(bot.config) in {"codex", "claude"}:
+        return prompt
+    history_lines: list[str] = []
+    for item in sess.chat[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        body = str(item.get("text") or "").strip()
+        if role not in {"user", "bot"} or not body:
+            continue
+        history_lines.append(f"{'User' if role == 'user' else 'Assistant'}: {body}")
+    if not history_lines:
+        return prompt
+    return (
+        f"{prompt}\n\n[RecentConversation]\n"
+        "Use this recent bridge-local chat history for continuity when native resume is unavailable.\n"
+        f"{chr(10).join(history_lines)}\n[/RecentConversation]"
+    )
+
+
+def build_compat_history_prompt(bot: BotState, sess: SessionState, prompt: str) -> str:
+    if bot_agent_backend(bot.config) == "codex":
+        return prompt
+    history_lines: list[str] = []
+    for item in sess.chat[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        body = str(item.get("text") or "").strip()
+        if role not in {"user", "bot"} or not body:
+            continue
+        history_lines.append(f"{'User' if role == 'user' else 'Assistant'}: {body}")
+    if not history_lines:
+        return prompt
+    return (
+        f"{prompt}\n\n[RecentConversation]\n"
+        "Use this recent bridge-local chat history for continuity when native resume is unavailable.\n"
+        f"{chr(10).join(history_lines)}\n[/RecentConversation]"
+    )
 
 
 def session_run_is_current(sess: SessionState, current_task: Optional[asyncio.Task], run_generation: Optional[int]) -> bool:
@@ -3437,6 +3556,8 @@ async def run_codex(
 ) -> None:
     semaphore = get_codex_run_semaphore()
     current_task = asyncio.current_task()
+    backend = bot_agent_backend(bot.config)
+    agent_command = bot_agent_command(bot.config)
     final = "(no output)"
     return_code = 1
     output_file: Optional[Path] = None
@@ -3474,13 +3595,16 @@ async def run_codex(
                 )
 
                 output_file = Path(tempfile.gettempdir()) / f"wecom-codex-py-{sess.session_id}-{int(time.time() * 1000)}.txt"
-                attempted_resume = bool(sess.thread_id)
-                if attempted_resume:
-                    args = build_codex_base_args(output_file, image_paths, resume=True)
-                    args.extend([sess.thread_id, "-"])
-                else:
-                    args = build_codex_base_args(output_file, image_paths, resume=False)
-                    args.append("-")
+                attempted_resume = backend in {"codex", "claude"} and bool(sess.thread_id)
+                effective_prompt = prompt if attempted_resume else build_compat_history_prompt(bot, sess, prompt)
+                args = build_codex_base_args(
+                    output_file,
+                    image_paths,
+                    resume=attempted_resume,
+                    backend=backend,
+                    command=agent_command,
+                    resume_thread_id=sess.thread_id if attempted_resume else None,
+                )
 
                 workspace_paths = await run_blocking(ensure_session_workspace_dirs, bot, key)
                 codex_home = await run_blocking(build_codex_home_for_subprocess, sess.session_id)
@@ -3496,6 +3620,7 @@ async def run_codex(
                         "WECOM_BRIDGE_BOT_CONFIG_ID": str(bot.config["id"]),
                         "WECOM_BRIDGE_SESSION_ID": sess.session_id,
                         "WECOM_BRIDGE_CHAT_KEY": key,
+                        "WECOM_BRIDGE_AGENT_BACKEND": backend,
                         "WECOM_BRIDGE_WORKDIR_DIR": str(workspace_paths["workDir"]),
                         "WECOM_BRIDGE_CWD_DIR": str(sess.work_dir),
                         "WECOM_BRIDGE_WORKSPACE_SKILL_DIR": str(get_workspace_codex_skills_dir(Path(sess.work_dir))),
@@ -3510,11 +3635,17 @@ async def run_codex(
                         "TEMP": str(workspace_paths["chatfile"]),
                     }
                 )
+                if agent_command:
+                    env["WECOM_BRIDGE_AGENT_COMMAND"] = agent_command
                 env = codex_runtime.prepare_codex_subprocess_env(env, command=args[0] if args else None)
+                argv_prefix: list[str] = []
+                process_cwd = Path(sess.work_dir)
+                if backend == "claude":
+                    argv_prefix, env, process_cwd = prepare_claude_bridge_runtime(bot, sess, key, env)
 
                 process = await asyncio.create_subprocess_exec(
-                    *args,
-                    cwd=sess.work_dir,
+                    *(argv_prefix + args),
+                    cwd=process_cwd,
                     env=env,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
@@ -3528,7 +3659,7 @@ async def run_codex(
                 process_started = True
                 sess.proc = process
                 sess.codex_runtime_status = None
-                add_log(bot, f"[{key}] codex {'resume' if sess.thread_id else 'exec'} started")
+                add_log(bot, f"[{key}] {backend} {'resume' if attempted_resume else 'exec'} started")
 
                 latest_message = ""
                 stderr_parts: list[str] = []
@@ -3558,16 +3689,12 @@ async def run_codex(
                     nonlocal latest_message
                     assert process.stdout is not None
                     async for line in iter_subprocess_lines(process.stdout, bot, key, "stdout"):
-                        try:
-                            event = json.loads(line.strip())
-                        except Exception:
-                            continue
-                        if event.get("type") == "thread.started" and event.get("thread_id"):
-                            sess.thread_id = event["thread_id"]
-                        if event.get("type") == "item.completed" and ((event.get("item") or {}).get("type") == "agent_message"):
-                            text = ((event.get("item") or {}).get("text") or "").strip()
-                            if text:
-                                latest_message = ANSI_RE.sub("", text)
+                        extracted_thread = extract_agent_thread_id(normalize_agent_backend(backend), line)
+                        if extracted_thread:
+                            sess.thread_id = extracted_thread
+                        extracted_reply = extract_agent_reply(normalize_agent_backend(backend), line)
+                        if extracted_reply:
+                            latest_message = ANSI_RE.sub("", extracted_reply)
 
                 async def read_stderr() -> None:
                     assert process.stderr is not None
@@ -3579,7 +3706,7 @@ async def run_codex(
                         if runtime_status:
                             update_codex_runtime_status(bot, sess, key, runtime_status, text)
                         stderr_parts.append(text)
-                        add_log(bot, f"[{key}] codex stderr: {text}")
+                        add_log(bot, f"[{key}] {backend} stderr: {text}")
 
                 ticker_task = asyncio.create_task(ticker())
                 stdout_task = asyncio.create_task(read_stdout())
@@ -3588,7 +3715,7 @@ async def run_codex(
                 try:
                     await send_session_status(bot, key, sess, req_id, build_thinking_status_text(0))
                     try:
-                        await write_process_prompt(process, prompt)
+                        await write_process_prompt(process, effective_prompt)
                     except Exception as exc:
                         prompt_write_error = exc
                     return_code = await process.wait()
@@ -3614,13 +3741,13 @@ async def run_codex(
                     allow_fresh_fallback
                     and attempted_resume
                     and re.search(
-                        r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found",
+                        r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found|No conversation found with session ID:",
                         resume_error_text,
                         re.I,
                     )
                 )
                 if resume_state_missing:
-                    add_log(bot, f"[{key}] codex resume state missing, fallback to fresh exec")
+                    add_log(bot, f"[{key}] {backend} resume state missing, fallback to fresh exec")
                     sess.proc = None
                     sess.thread_id = None
                     update_session_record(
@@ -3629,6 +3756,7 @@ async def run_codex(
                             **record,
                             "status": "starting",
                             "activeScheduleId": active_schedule_id,
+                            "threadId": None,
                         },
                     )
                     try:
@@ -3653,7 +3781,7 @@ async def run_codex(
                     pass
                 output_file = None
                 if not final:
-                    final = stderr_text or "(no output)"
+                    final = extract_agent_reply(normalize_agent_backend(backend), "") or stderr_text or "(no output)"
 
                 final = limit_stream_content(final)
                 break
@@ -3701,6 +3829,7 @@ async def run_codex(
                 "status": "idle" if return_code == 0 else "error",
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
+                "threadId": sess.thread_id,
             },
         )
         if return_code == 0:
@@ -3761,7 +3890,8 @@ async def run_codex(
         sess.pending_final_payloads = None
         restore_session_active_media(sess)
         error_text = f"Error: {'failed to start Codex' if not process_started else 'Codex run failed'}: {exc}"
-        add_log(bot, f"[{key}] codex task failed: {exc}")
+        error_text = f"Error: {'failed to start agent' if not process_started else 'agent run failed'}: {exc}"
+        add_log(bot, f"[{key}] {backend} task failed: {exc}")
         try:
             error_payloads = build_session_text_payloads(key, sess, req_id, error_text, True)
             if error_payloads:
@@ -3917,6 +4047,7 @@ def interrupt_session(
                 "status": "leased",
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
+                "threadId": sess.thread_id,
             },
         )
     else:
@@ -3931,6 +4062,7 @@ def interrupt_session(
                 "status": "idle",
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
+                "threadId": sess.thread_id,
             },
         )
 
@@ -4018,6 +4150,8 @@ def build_resume_candidates(bot: BotState, key: str) -> list[dict[str, Any]]:
             None,
         )
         thread_id = str(runtime_session.thread_id or "").strip() if runtime_session else ""
+        if not thread_id:
+            thread_id = str(record.get("threadId") or "").strip()
         candidate_key = str(record.get("chatKey") or "").strip()
         if not thread_id or not candidate_key or session_id in seen_session_ids:
             continue
@@ -6481,6 +6615,31 @@ def normalize_optional_string(value: Any) -> Optional[str]:
     return text or None
 
 
+def prepare_claude_bridge_runtime(
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    env: dict[str, str],
+) -> tuple[list[str], dict[str, str], Path]:
+    run_as_user = bot_agent_run_as_user(bot.config)
+    if not run_as_user:
+        return [], env, Path(sess.work_dir)
+    run_as_group = bot_agent_run_as_group(bot.config)
+    uid, gid = resolve_posix_identity(run_as_user, run_as_group)
+    runtime_root = bot_agent_runtime_root(bot.config) or (INSTANCE_RUNTIME_ROOT / "claude-runtime")
+    layout = prepare_claude_runtime_root(
+        runtime_root,
+        session_id=sess.session_id,
+        source_claude_root=Path("/root/.claude"),
+        uid=uid,
+        gid=gid,
+    )
+    wrapped_env = apply_claude_runtime_env(env, layout)
+    cwd = layout["project_dir"]
+    argv_prefix = build_setpriv_prefix(uid, gid)
+    return argv_prefix, wrapped_env, cwd
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -6554,6 +6713,7 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
     if not bot_id:
         raise BridgeError(400, "botId required")
     secret, secret_file = resolve_bot_secret(data, status_code=400, allow_inline_secret=allow_inline_secret)
+    agent_backend = normalize_agent_backend(data.get("agentBackend") or data.get("agent_backend") or "codex")
     normalized = {
         "id": data.get("id") or uid(),
         "name": (str(data.get("name") or "unnamed").strip() or "unnamed"),
@@ -6562,6 +6722,11 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
         "workDir": normalize_work_dir(data.get("workDir")),
         "welcome": str(data.get("welcome") or ""),
         "groupSessionMode": normalize_group_session_mode(data.get("groupSessionMode") or data.get("group_session_mode")),
+        "agentBackend": agent_backend,
+        "agentCommand": normalize_agent_command(data.get("agentCommand") or data.get("agent_command")),
+        "agentRunAsUser": normalize_optional_run_as(data.get("agentRunAsUser") or data.get("agent_run_as_user")),
+        "agentRunAsGroup": normalize_optional_run_as(data.get("agentRunAsGroup") or data.get("agent_run_as_group")),
+        "agentRuntimeRoot": normalize_optional_path(data.get("agentRuntimeRoot") or data.get("agent_runtime_root")) or None,
         "enabled": data.get("enabled", True) is not False,
         "restartToken": str(data.get("restartToken") or data.get("restart_token") or "").strip() or None,
     }
@@ -6641,6 +6806,12 @@ def load_env_bootstrap_bot_configs() -> list[dict[str, Any]]:
             "welcome": str(os.environ.get("WECOM_BOT_WELCOME") or ""),
             "groupSessionMode": str(os.environ.get("WECOM_BOT_GROUP_SESSION_MODE") or "per-user").strip()
             or "per-user",
+            "agentBackend": str(os.environ.get("WECOM_BOT_AGENT_BACKEND") or os.environ.get("AGENT_BACKEND") or "codex").strip()
+            or "codex",
+            "agentCommand": str(os.environ.get("WECOM_BOT_AGENT_COMMAND") or os.environ.get("AGENT_COMMAND") or "").strip() or None,
+            "agentRunAsUser": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_USER") or os.environ.get("AGENT_RUN_AS_USER") or "").strip() or None,
+            "agentRunAsGroup": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_GROUP") or os.environ.get("AGENT_RUN_AS_GROUP") or "").strip() or None,
+            "agentRuntimeRoot": str(os.environ.get("WECOM_BOT_AGENT_RUNTIME_ROOT") or os.environ.get("AGENT_RUNTIME_ROOT") or "").strip() or None,
             "enabled": env_bool("WECOM_BOT_ENABLED", True),
             "__idExplicit__": bool(explicit_id),
             "__secretSourceExplicit__": True,
@@ -6914,6 +7085,19 @@ def get_authoritative_bot_config(bot_id: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def clear_persisted_session_threads(bot_id: str) -> int:
+    cleared = 0
+    for record in session_records_for_bot(bot_id):
+        if not str(record.get("threadId") or "").strip():
+            continue
+        update_session_record(
+            str(record["sessionId"]),
+            lambda current: {**current, "threadId": None},
+        )
+        cleared += 1
+    return cleared
+
+
 def invalidate_bot_session_threads(bot_id: str) -> int:
     invalidated = 0
     bot = BOTS.get(bot_id)
@@ -6923,13 +7107,14 @@ def invalidate_bot_session_threads(bot_id: str) -> int:
                 continue
             sess.thread_id = None
             invalidated += 1
+    invalidated += clear_persisted_session_threads(bot_id)
     return invalidated
 
 
 def reset_bot_session_runtime_state(bot_id: str) -> int:
     bot = BOTS.get(bot_id)
     if not bot:
-        return 0
+        return clear_persisted_session_threads(bot_id)
     cleared = 0
     for sess in bot.sessions.values():
         had_state = bool(
@@ -7979,6 +8164,11 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "botId": bot.config["botId"],
         "workDir": bot.config["workDir"],
         "groupSessionMode": bot.config.get("groupSessionMode", "per-user"),
+        "agentBackend": bot.config.get("agentBackend", "codex"),
+        "agentCommand": bot.config.get("agentCommand"),
+        "agentRunAsUser": bot.config.get("agentRunAsUser"),
+        "agentRunAsGroup": bot.config.get("agentRunAsGroup"),
+        "agentRuntimeRoot": bot.config.get("agentRuntimeRoot"),
         "secretSource": bot_secret_source(bot.config),
         "status": bot.status,
         "healthy": health["healthy"],
@@ -8009,6 +8199,11 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "botId": config["botId"],
         "workDir": config["workDir"],
         "groupSessionMode": config.get("groupSessionMode", "per-user"),
+        "agentBackend": config.get("agentBackend", "codex"),
+        "agentCommand": config.get("agentCommand"),
+        "agentRunAsUser": config.get("agentRunAsUser"),
+        "agentRunAsGroup": config.get("agentRunAsGroup"),
+        "agentRuntimeRoot": config.get("agentRuntimeRoot"),
         "secretSource": bot_secret_source(config),
         "status": "disabled" if config.get("enabled") is False else "not_loaded",
         "healthy": False,

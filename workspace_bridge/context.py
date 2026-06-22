@@ -68,6 +68,7 @@ def build_runtime_context(
     session_id: str,
     chatfile_root: Path | str,
     codex_exec_mode: str = "host",
+    agent_backend: str = "codex",
     file_send_roots: tuple[Path, ...] = (),
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> WorkspaceRuntimeContext:
@@ -86,6 +87,7 @@ def build_runtime_context(
         "WECOM_BRIDGE_CHATFILE_DIR": str(chatfile_dir),
         "WECOM_BRIDGE_EXPORT_DIR": str(chatfile_dir),
         "WECOM_BRIDGE_EXEC_MODE": str(codex_exec_mode).strip().lower() or "host",
+        "WECOM_BRIDGE_AGENT_BACKEND": str(agent_backend).strip().lower() or "codex",
         "CODEX_HOME": str(codex_home_dir),
         "TMPDIR": str(chatfile_dir),
         "TMP": str(chatfile_dir),

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import re
 import time
 from pathlib import Path
 from dataclasses import replace
 
+from .agent_backends import extract_agent_reply, extract_agent_thread_id
+from .agent_runtime import (
+    apply_claude_runtime_env,
+    build_setpriv_prefix,
+    normalize_optional_text,
+    prepare_claude_runtime_root,
+    resolve_posix_identity,
+)
 from .async_utils import run_blocking
 from .prompting import build_prompt
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
@@ -21,35 +29,17 @@ from .wecom_upload import ws_send_json
 STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
 _RESUME_STATE_MISSING_RE = re.compile(
-    r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found",
+    r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found|No conversation found with session ID:",
     re.I,
 )
 
 
 def extract_codex_stdout_text(stdout: str) -> str:
-    latest = ""
-    for line in str(stdout or "").splitlines():
-        try:
-            payload = json.loads(line)
-        except Exception:
-            continue
-        item = payload.get("item") or {}
-        if payload.get("type") == "item.completed" and item.get("type") in {"agent_message", "agentmessage"}:
-            latest = str(item.get("text") or "").strip() or latest
-    return latest
+    return extract_agent_reply("codex", stdout)
 
 
 def extract_codex_thread_id(stdout: str) -> str | None:
-    for line in str(stdout or "").splitlines():
-        try:
-            payload = json.loads(line)
-        except Exception:
-            continue
-        if payload.get("type") == "thread.started":
-            thread_id = str(payload.get("thread_id") or "").strip()
-            if thread_id:
-                return thread_id
-    return None
+    return extract_agent_thread_id("codex", stdout)
 
 
 def resume_state_missing(text: str) -> bool:
@@ -91,6 +81,88 @@ def _resume_fallback_error_text(stderr_text: str, prompt_error: Exception | None
     if prompt_error is not None:
         parts.append(str(prompt_error).strip())
     return "\n".join(part for part in parts if part)
+
+
+def _agent_backend(config_or_bot) -> str:
+    return str(getattr(config_or_bot, "agent_backend", None) or getattr(getattr(config_or_bot, "config", None), "agent_backend", None) or "codex").strip().lower() or "codex"
+
+
+def _build_compat_history_prompt(bot_or_runtime, launch, message, prompt: str) -> str:
+    backend = _agent_backend(bot_or_runtime)
+    if backend == "codex":
+        return prompt
+
+    history_lines: list[str] = []
+    session_history = []
+    if hasattr(bot_or_runtime, "sessions"):
+        session = getattr(bot_or_runtime, "sessions", {}).get(message.chat_key)
+        if session is not None:
+            session_history = list(getattr(session, "chat", []) or [])
+    if not session_history and hasattr(bot_or_runtime, "active_message_tasks"):
+        session_history = []
+    if not session_history:
+        return prompt
+
+    for item in session_history[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if role not in {"user", "bot"} or not text:
+            continue
+        label = "User" if role == "user" else "Assistant"
+        history_lines.append(f"{label}: {text}")
+    if not history_lines:
+        return prompt
+
+    return (
+        f"{prompt}\n\n[RecentConversation]\n"
+        "Use this recent bridge-local chat history for continuity when native resume is unavailable.\n"
+        f"{chr(10).join(history_lines)}\n[/RecentConversation]"
+    )
+
+
+def _backend_supports_native_resume(backend: str) -> bool:
+    return backend in {"codex", "claude"}
+
+
+def _apply_claude_runtime_override(invocation, runtime_root: Path, session_id: str):
+    run_as_user = normalize_optional_text(invocation.run_as_user)
+    if not run_as_user:
+        return invocation
+    run_as_group = normalize_optional_text(invocation.run_as_group)
+    uid, gid = resolve_posix_identity(run_as_user, run_as_group)
+    layout = prepare_claude_runtime_root(
+        runtime_root,
+        session_id=session_id,
+        source_claude_root=Path("/root/.claude"),
+        uid=uid,
+        gid=gid,
+    )
+    env = apply_claude_runtime_env(invocation.env, layout)
+    cwd = layout["project_dir"]
+    return replace(invocation, cwd=cwd, env=env)
+
+
+def _read_backend_reply(backend: str, output_file: Path, stdout_text: str, stderr_text: str) -> str:
+    if output_file.exists():
+        file_text = output_file.read_text(encoding="utf-8").strip()
+        if file_text:
+            return file_text
+    return extract_agent_reply(backend, stdout_text) or stdout_text.strip() or stderr_text.strip() or "(no output)"
+
+
+def _read_backend_thread_id(backend: str, stdout_text: str) -> str | None:
+    return extract_agent_thread_id(backend, stdout_text)
+
+
+def _raise_for_backend_failed_returncode(backend: str, returncode: int, *, stdout_text: str, stderr_text: str) -> None:
+    if int(returncode) == 0:
+        return
+    detail = str(stderr_text or "").strip() or extract_agent_reply(backend, stdout_text) or str(stdout_text or "").strip()
+    if detail:
+        raise RuntimeError(f"{backend} exited with status {returncode}: {detail}")
+    raise RuntimeError(f"{backend} exited with status {returncode}")
 
 
 def _clear_cached_runtime_payload(runtime, req_id: str, *, final: bool) -> None:
@@ -247,6 +319,7 @@ async def flush_cached_runtime_payloads(runtime) -> None:
 
 async def run_text_message_once(config, bot, message, **kwargs):
     launch = await run_blocking(prepare_session_run, bot, message.chat_key)
+    backend = _agent_backend(bot)
     prompt = build_prompt(bot, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -262,27 +335,23 @@ async def run_text_message_once(config, bot, message, **kwargs):
                 launch_thread_id = _resolve_launch_thread_id(bot, launch, message)
             allow_fresh_fallback = True
             while True:
+                use_native_resume = bool(launch_thread_id) and _backend_supports_native_resume(backend)
+                effective_prompt = prompt if use_native_resume else _build_compat_history_prompt(bot, launch, message, prompt)
                 invocation_override = argv_override
-                attempted_resume = False
-                if invocation_override is None and launch_thread_id:
-                    attempted_resume = True
-                    invocation_override = (
-                        "codex",
-                        "exec",
-                        "resume",
-                        "--skip-git-repo-check",
-                        "--json",
-                        "-o",
-                        str(output_file),
-                        launch_thread_id,
-                        "-",
-                    )
+                attempted_resume = use_native_resume
                 invocation = build_runner_invocation(
                     launch,
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     output_file=output_file,
                     argv_override=invocation_override,
+                    resume=attempted_resume,
+                    resume_thread_id=launch_thread_id if attempted_resume else None,
                 )
+                if backend == "claude":
+                    runtime_root_override = Path(
+                        launch.env.get("WECOM_BRIDGE_AGENT_RUNTIME_ROOT") or (bot.runtime_root / "claude-runtime")
+                    ).expanduser().resolve()
+                    invocation = _apply_claude_runtime_override(invocation, runtime_root_override, launch.session.session_id)
                 result = await run_blocking(run_invocation, invocation)
                 stdout_text = str(result.stdout or "")
                 stderr_text = str(result.stderr or "")
@@ -302,7 +371,8 @@ async def run_text_message_once(config, bot, message, **kwargs):
                     output_file.unlink(missing_ok=True)
                     continue
                 try:
-                    _raise_for_failed_returncode(
+                    _raise_for_backend_failed_returncode(
+                        backend,
                         int(getattr(result, "returncode", 0) or 0),
                         stdout_text=stdout_text,
                         stderr_text=stderr_text,
@@ -310,8 +380,8 @@ async def run_text_message_once(config, bot, message, **kwargs):
                 except Exception:
                     _touch_session_failure(bot.runtime_root, launch.session.session_id)
                     raise
-                reply = _read_execution_reply(output_file, stdout_text, stderr_text)
-                next_thread_id = extract_codex_thread_id(stdout_text) or launch_thread_id
+                reply = _read_backend_reply(backend, output_file, stdout_text, stderr_text)
+                next_thread_id = _read_backend_thread_id(backend, stdout_text) or launch_thread_id
                 thread_state_sink = kwargs.get("thread_state_sink")
                 if callable(thread_state_sink):
                     thread_state_sink(message.chat_key, next_thread_id)
@@ -334,6 +404,7 @@ async def run_text_message_once(config, bot, message, **kwargs):
 
 async def stream_text_message_once(config, runtime, message, **kwargs):
     launch = await run_blocking(prepare_session_run, runtime.config, message.chat_key)
+    backend = _agent_backend(runtime)
     prompt = build_prompt(runtime.config, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -348,28 +419,23 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
             emit_status_updates = bool(kwargs.get("emit_status_updates", True))
             require_final_delivery = bool(kwargs.get("require_final_delivery", False))
             while True:
+                use_native_resume = bool(launch_thread_id) and _backend_supports_native_resume(backend)
+                effective_prompt = prompt if use_native_resume else _build_compat_history_prompt(runtime, launch, message, prompt)
                 invocation_override = argv_override
-                invocation = build_runner_invocation(launch, prompt=prompt, output_file=output_file, argv_override=invocation_override)
-                attempted_resume = False
-                if invocation_override is None and launch_thread_id:
-                    attempted_resume = True
-                    invocation_override = (
-                        "codex",
-                        "exec",
-                        "resume",
-                        "--skip-git-repo-check",
-                        "--json",
-                        "-o",
-                        str(output_file),
-                        launch_thread_id,
-                        "-",
-                    )
-                    invocation = build_runner_invocation(
-                        launch,
-                        prompt=prompt,
-                        output_file=output_file,
-                        argv_override=invocation_override,
-                    )
+                attempted_resume = use_native_resume
+                invocation = build_runner_invocation(
+                    launch,
+                    prompt=effective_prompt,
+                    output_file=output_file,
+                    argv_override=invocation_override,
+                    resume=attempted_resume,
+                    resume_thread_id=launch_thread_id if attempted_resume else None,
+                )
+                if backend == "claude":
+                    runtime_root_override = Path(
+                        launch.env.get("WECOM_BRIDGE_AGENT_RUNTIME_ROOT") or (runtime.config.runtime_root / "claude-runtime")
+                    ).expanduser().resolve()
+                    invocation = _apply_claude_runtime_override(invocation, runtime_root_override, launch.session.session_id)
                 process = await asyncio.create_subprocess_exec(
                     *invocation.argv,
                     cwd=invocation.cwd,
@@ -402,7 +468,7 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                 try:
                     if process.stdin is not None:
                         try:
-                            process.stdin.write(prompt.encode("utf-8"))
+                            process.stdin.write(effective_prompt.encode("utf-8"))
                             await process.stdin.drain()
                         except Exception as exc:
                             prompt_write_error = exc
@@ -452,7 +518,8 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                     _touch_session_failure(runtime.config.runtime_root, launch.session.session_id)
                     raise prompt_write_error
                 try:
-                    _raise_for_failed_returncode(
+                    _raise_for_backend_failed_returncode(
+                        backend,
                         int(getattr(process, "returncode", 0) or 0),
                         stdout_text=text,
                         stderr_text=stderr_text,
@@ -460,8 +527,8 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                 except Exception:
                     _touch_session_failure(runtime.config.runtime_root, launch.session.session_id)
                     raise
-                reply = _read_execution_reply(output_file, text, stderr_text)
-                next_thread_id = extract_codex_thread_id(text) or launch_thread_id
+                reply = _read_backend_reply(backend, output_file, text, stderr_text)
+                next_thread_id = _read_backend_thread_id(backend, text) or launch_thread_id
                 if next_thread_id:
                     runtime.session_threads[message.chat_key] = next_thread_id
                 else:
