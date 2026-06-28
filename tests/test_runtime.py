@@ -4,6 +4,7 @@ import workspace_bridge.context as context_module
 import workspace_bridge.models as models_module
 from workspace_bridge.runtime import (
     build_bot_config,
+    cleanup_outdated_session_artifacts,
     cleanup_orphan_session_codex_homes,
     cleanup_stale_session_codex_homes,
     list_session_records,
@@ -21,17 +22,26 @@ def write_skill(root: Path, name: str, body: str) -> None:
 
 
 def test_stable_session_id_is_deterministic() -> None:
-    first = stable_session_id("bot-1", "single:alice", "/tmp/repo")
-    second = stable_session_id("bot-1", "single:alice", "/tmp/repo")
+    first = stable_session_id("bot-1", "single:alice", "/tmp/repo", "team-a", "team")
+    second = stable_session_id("bot-1", "single:alice", "/tmp/repo", "team-a", "team")
 
     assert first == second
 
 
 def test_stable_session_id_changes_when_source_dir_changes() -> None:
-    first = stable_session_id("bot-1", "single:alice", "/tmp/repo-a")
-    second = stable_session_id("bot-1", "single:alice", "/tmp/repo-b")
+    first = stable_session_id("bot-1", "single:alice", "/tmp/repo-a", "team-a", "team")
+    second = stable_session_id("bot-1", "single:alice", "/tmp/repo-b", "team-a", "team")
 
     assert first != second
+
+
+def test_stable_session_id_changes_when_workspace_identity_changes() -> None:
+    first = stable_session_id("bot-1", "single:alice", "/tmp/repo", "team-a", "team")
+    second = stable_session_id("bot-1", "single:alice", "/tmp/repo", "team-b", "team")
+    third = stable_session_id("bot-1", "single:alice", "/tmp/repo", "team-a", "personal")
+
+    assert first != second
+    assert first != third
 
 
 def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: Path) -> None:
@@ -56,7 +66,7 @@ def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: P
     write_skill(launch.workspace.workspace.skill_dir, "deploy", "# deploy")
     launch = prepare_session_run(bot, "single:alice")
 
-    assert launch.cwd == launch.runtime_context.project_dir
+    assert launch.cwd == launch.runtime_context.cwd_dir
     assert launch.session.bot_id == "bot-1"
     assert launch.session.bot_name == "codex"
     assert launch.session.chat_key == "single:alice"
@@ -67,11 +77,12 @@ def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: P
     assert launch.session.workfile_dir == launch.runtime_context.workfile_dir
     assert launch.runtime_context.codex_exec_mode == "host"
     assert launch.runtime_context.effective_skill_names == ("deploy",)
+    assert bot.workspace_mode == "team"
 
     stored = load_session_record(runtime_root, launch.session.session_id)
     assert stored is not None
     assert stored.workspace_id == launch.session.workspace_id
-    assert stored.project_dir == launch.cwd
+    assert stored.cwd_dir == launch.cwd
     assert stored.workfile_dir == launch.runtime_context.workfile_dir
 
 
@@ -128,6 +139,124 @@ def test_prepare_session_run_reuses_stable_session_id_for_same_chat(tmp_path: Pa
     assert first.session.session_id == second.session.session_id
     assert first.session.workspace_id == second.session.workspace_id
     assert first.cwd == second.cwd
+
+
+def test_prepare_session_run_changes_session_id_when_workspace_identity_changes(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
+    source_dir.mkdir()
+    global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    team_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+        workspace_mode="team",
+    )
+    personal_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+        workspace_mode="personal",
+    )
+    other_namespace_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-b",
+        chatfile_root=chatfile_root,
+        workspace_mode="team",
+    )
+
+    team_launch = prepare_session_run(team_bot, "single:alice")
+    personal_launch = prepare_session_run(personal_bot, "single:alice")
+    other_namespace_launch = prepare_session_run(other_namespace_bot, "single:alice")
+
+    assert team_launch.session.session_id != personal_launch.session.session_id
+    assert team_launch.session.session_id != other_namespace_launch.session.session_id
+
+
+def test_cleanup_outdated_session_artifacts_removes_records_and_runtime_for_old_workspace_identity(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    global_skill_dir = tmp_path / "global-skills"
+    source_dir.mkdir()
+    global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    old_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+        workspace_mode="team",
+    )
+    new_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+        workspace_mode="personal",
+    )
+
+    old_launch = prepare_session_run(old_bot, "single:alice")
+    old_chatfile = old_launch.runtime_context.chatfile_dir
+    old_chatfile.mkdir(parents=True, exist_ok=True)
+    (old_chatfile / "artifact.txt").write_text("artifact", encoding="utf-8")
+    old_codex_home = session_codex_home_root(runtime_root) / old_launch.session.session_id
+    old_codex_home.mkdir(parents=True, exist_ok=True)
+    (old_codex_home / "state.txt").write_text("state", encoding="utf-8")
+
+    removed = cleanup_outdated_session_artifacts(new_bot)
+
+    assert removed == 1
+    assert load_session_record(runtime_root, old_launch.session.session_id) is None
+    assert not old_chatfile.exists()
+    assert not old_codex_home.exists()
+
+
+def test_prepare_session_run_reuses_personal_workfile_across_bots_in_same_namespace(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    first_bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex-a",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+    )
+    second_bot = build_bot_config(
+        bot_id="bot-2",
+        bot_name="codex-b",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        workspace_namespace="team-a",
+        chatfile_root=chatfile_root,
+    )
+
+    first = prepare_session_run(first_bot, "single:alice")
+    second = prepare_session_run(second_bot, "single:alice")
+
+    assert first.runtime_context.workfile_dir == second.runtime_context.workfile_dir
+    assert first.runtime_context.chatfile_dir != second.runtime_context.chatfile_dir
 
 
 def test_prepare_session_run_uses_workspace_skills(tmp_path: Path, monkeypatch) -> None:
@@ -238,6 +367,29 @@ def test_prepare_session_run_preserves_host_exec_mode(tmp_path: Path) -> None:
     assert launch.env["WECOM_BRIDGE_EXEC_MODE"] == "host"
 
 
+def test_prepare_session_run_defaults_claude_to_personal_workspace_mode(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="claude",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        agent_backend="claude",
+    )
+
+    launch = prepare_session_run(bot, "single:alice")
+
+    assert bot.workspace_mode == "personal"
+    assert launch.cwd == source_dir.resolve()
+    assert launch.runtime_context.workfile_dir is not None
+    assert launch.env["WECOM_BRIDGE_WORKSPACE_MODE"] == "personal"
+    assert launch.env["WECOM_BRIDGE_WORKDIR_DIR"] == str(source_dir.resolve())
+
+
 def test_cleanup_orphan_session_codex_homes_removes_unregistered_runtime_dirs(tmp_path: Path) -> None:
     runtime_root = tmp_path / "runtime"
     homes_root = session_codex_home_root(runtime_root)
@@ -268,11 +420,11 @@ def test_cleanup_stale_session_codex_homes_removes_only_expired_dirs(tmp_path: P
     now_ms = 1_000_000
     old_ms = now_ms - (30 * 60 * 1000) - 1
     (sessions_root / "session-stale.json").write_text(
-        '{"sessionId":"session-stale","botId":"bot-1","botName":"default","chatKey":"single:stale","workspaceId":"w1","workspaceScope":"user","projectDir":"/tmp/p1","chatfileDir":"/tmp/c1","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (old_ms, old_ms, old_ms),
+        '{"sessionId":"session-stale","botId":"bot-1","botName":"default","chatKey":"single:stale","workspaceId":"w1","workspaceScope":"user","cwdDir":"/tmp/p1","chatfileDir":"/tmp/c1","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (old_ms, old_ms, old_ms),
         encoding="utf-8",
     )
     (sessions_root / "session-fresh.json").write_text(
-        '{"sessionId":"session-fresh","botId":"bot-1","botName":"default","chatKey":"single:fresh","workspaceId":"w2","workspaceScope":"user","projectDir":"/tmp/p2","chatfileDir":"/tmp/c2","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (now_ms, now_ms, now_ms),
+        '{"sessionId":"session-fresh","botId":"bot-1","botName":"default","chatKey":"single:fresh","workspaceId":"w2","workspaceScope":"user","cwdDir":"/tmp/p2","chatfileDir":"/tmp/c2","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (now_ms, now_ms, now_ms),
         encoding="utf-8",
     )
 
@@ -293,7 +445,7 @@ def test_cleanup_stale_session_codex_homes_keeps_active_session_dirs(tmp_path: P
     now_ms = 1_000_000
     old_ms = now_ms - (30 * 60 * 1000) - 1
     (sessions_root / "session-active.json").write_text(
-        '{"sessionId":"session-active","botId":"bot-1","botName":"default","chatKey":"single:active","workspaceId":"w1","workspaceScope":"user","projectDir":"/tmp/p1","chatfileDir":"/tmp/c1","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (old_ms, old_ms, old_ms),
+        '{"sessionId":"session-active","botId":"bot-1","botName":"default","chatKey":"single:active","workspaceId":"w1","workspaceScope":"user","cwdDir":"/tmp/p1","chatfileDir":"/tmp/c1","createdAt":%d,"updatedAt":%d,"lastRunAt":%d}' % (old_ms, old_ms, old_ms),
         encoding="utf-8",
     )
 

@@ -877,7 +877,7 @@ async def test_workfile_dir_is_allowed_for_send_file_when_allowlisted(tmp_path) 
             "WECOM_BOT_ID": "bot-1",
             "WECOM_BOT_SECRET_FILE": str(secret_file),
             "WECOM_BOT_SOURCE_DIR": str(source_dir),
-            "FILE_SEND_ROOTS": str(tmp_path / "runtime" / "workspaces" / "users"),
+            "FILE_SEND_ROOTS": str(tmp_path / "runtime" / "workspaces" / "bot-1" / "users"),
         }
     )
     bot = build_bot_from_app_config(config)

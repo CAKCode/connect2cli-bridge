@@ -14,6 +14,7 @@ def make_runtime() -> WeComBotRuntime:
         bot_secret=None,
         source=SourceConfig(source_id="src-1", source_dir=__import__("pathlib").Path(".")),
         runtime_root=__import__("pathlib").Path("."),
+        workspace_namespace="bot-1",
         chatfile_root=__import__("pathlib").Path("."),
         codex_exec_mode="sandboxed",
     )

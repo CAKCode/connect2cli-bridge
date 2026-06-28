@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import json
 import re
 import time
 from pathlib import Path
@@ -10,7 +10,6 @@ from dataclasses import replace
 from .agent_backends import extract_agent_reply, extract_agent_thread_id
 from .agent_runtime import (
     apply_claude_runtime_env,
-    build_setpriv_prefix,
     normalize_optional_text,
     prepare_claude_runtime_root,
     resolve_posix_identity,
@@ -140,8 +139,7 @@ def _apply_claude_runtime_override(invocation, runtime_root: Path, session_id: s
         gid=gid,
     )
     env = apply_claude_runtime_env(invocation.env, layout)
-    cwd = layout["project_dir"]
-    return replace(invocation, cwd=cwd, env=env)
+    return replace(invocation, env=env)
 
 
 def _read_backend_reply(backend: str, output_file: Path, stdout_text: str, stderr_text: str) -> str:
@@ -211,7 +209,7 @@ def _finalize_deferred_job_delivery(runtime, cache_key: str) -> None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             schedule_id = str(payload.get("schedule_id") or payload.get("scheduleId") or "") or None
-        except Exception:
+        except (OSError, ValueError, UnicodeDecodeError):
             schedule_id = None
         if schedule_id:
             advance_schedule_definition_after_success(runtime.config.runtime_root, schedule_id)

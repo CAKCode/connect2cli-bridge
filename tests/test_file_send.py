@@ -48,7 +48,7 @@ def test_validate_file_for_send_accepts_chatfile_export(tmp_path: Path) -> None:
 
 def test_validate_file_for_send_rejects_project_dir_file(tmp_path: Path) -> None:
     _config, _bot, launch = make_runtime(tmp_path)
-    file_path = launch.runtime_context.project_dir / "report.txt"
+    file_path = launch.runtime_context.cwd_dir / "report.txt"
     file_path.write_text("hello", encoding="utf-8")
 
     try:
@@ -197,7 +197,7 @@ async def test_service_send_file_endpoint_rejects_invalid_json_body(tmp_path: Pa
 async def test_service_send_file_endpoint_rejects_non_allowlisted_file(tmp_path: Path) -> None:
     config, _bot, launch = make_runtime(tmp_path)
     app = create_app(config)
-    file_path = launch.runtime_context.project_dir / "result.txt"
+    file_path = launch.runtime_context.cwd_dir / "result.txt"
     file_path.write_text("done", encoding="utf-8")
 
     class JsonRequest:

@@ -24,6 +24,7 @@ def make_runtime() -> WeComBotRuntime:
         bot_secret=None,
         source=SourceConfig(source_id="src-1", source_dir=__import__("pathlib").Path(".")),
         runtime_root=__import__("pathlib").Path("."),
+        workspace_namespace="bot-1",
         chatfile_root=__import__("pathlib").Path("."),
         codex_exec_mode="sandboxed",
     )
@@ -71,6 +72,7 @@ async def test_flush_cached_runtime_payloads_marks_deferred_job_done_after_succe
         bot_secret=runtime.config.bot_secret,
         source=runtime.config.source,
         runtime_root=tmp_path,
+        workspace_namespace=runtime.config.workspace_namespace,
         chatfile_root=runtime.config.chatfile_root,
         codex_exec_mode=runtime.config.codex_exec_mode,
     )
@@ -106,6 +108,7 @@ async def test_flush_cached_runtime_payloads_clears_stale_schedule_failed_marker
         bot_secret=runtime.config.bot_secret,
         source=runtime.config.source,
         runtime_root=tmp_path,
+        workspace_namespace=runtime.config.workspace_namespace,
         chatfile_root=runtime.config.chatfile_root,
         codex_exec_mode=runtime.config.codex_exec_mode,
     )
@@ -144,6 +147,7 @@ async def test_flush_cached_runtime_payloads_advances_schedule_before_removing_p
         bot_secret=runtime.config.bot_secret,
         source=runtime.config.source,
         runtime_root=tmp_path,
+        workspace_namespace=runtime.config.workspace_namespace,
         chatfile_root=runtime.config.chatfile_root,
         codex_exec_mode=runtime.config.codex_exec_mode,
     )

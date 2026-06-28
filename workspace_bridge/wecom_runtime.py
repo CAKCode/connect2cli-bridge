@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import suppress
 from dataclasses import replace
 
 import aiohttp
@@ -11,7 +10,14 @@ from aiohttp import WSMsgType
 from .async_utils import run_blocking
 from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
 from .reply_state import cleanup_reply_state
-from .runtime import list_session_records, prepare_session_run, remove_session_codex_home, stable_session_id, update_session_record
+from .runtime import (
+    list_session_records,
+    prepare_session_run,
+    remove_session_chatfile,
+    remove_session_codex_home,
+    stable_session_id,
+    update_session_record,
+)
 from .runtime import store_reply_url_state
 from .wecom_protocol import (
     build_subscribe_payload,
@@ -215,7 +221,13 @@ async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
         current_task = asyncio.current_task()
         if (current_task is not None and current_task in runtime.suppressed_failure_tasks) or _interrupt_error_suppressed(exc):
             return
-        session_id = stable_session_id(runtime.config.bot_id, parsed.chat_key, runtime.config.source.source_dir)
+        session_id = stable_session_id(
+            runtime.config.bot_id,
+            parsed.chat_key,
+            runtime.config.source.source_dir,
+            runtime.config.workspace_namespace,
+            runtime.config.workspace_mode,
+        )
         runtime.last_status = "message_failed"
         runtime.last_error = str(exc)
         update_session_record(
@@ -247,7 +259,13 @@ async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
         or (active_schedule_task is not None and not active_schedule_task.done())
         or parsed.chat_key in runtime.active_schedule_runs
     ):
-        busy_session_id = stable_session_id(runtime.config.bot_id, parsed.chat_key, runtime.config.source.source_dir)
+        busy_session_id = stable_session_id(
+            runtime.config.bot_id,
+            parsed.chat_key,
+            runtime.config.source.source_dir,
+            runtime.config.workspace_namespace,
+            runtime.config.workspace_mode,
+        )
         if runtime.ws is None and ws is not None:
             original_ws = runtime.ws
             runtime.ws = ws
@@ -320,7 +338,13 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
     text = strip_text_mentions(parsed.content, runtime.config.bot_name)
     command_text = normalize_bridge_command_text(parsed.content, runtime.config.bot_name)
     parsed = type(parsed)(req_id=parsed.req_id, chat_key=parsed.chat_key, content=text, raw_payload=parsed.raw_payload)
-    command_session_id = stable_session_id(runtime.config.bot_id, parsed.chat_key, runtime.config.source.source_dir)
+    command_session_id = stable_session_id(
+        runtime.config.bot_id,
+        parsed.chat_key,
+        runtime.config.source.source_dir,
+        runtime.config.workspace_namespace,
+        runtime.config.workspace_mode,
+    )
     if command_text == "/bridge-status":
         await ws_send_json(
             runtime,
@@ -381,8 +405,15 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
                 await active_task
         if process is not None:
             await _wait_for_process_exit(process)
-        session_id = stable_session_id(runtime.config.bot_id, parsed.chat_key, runtime.config.source.source_dir)
+        session_id = stable_session_id(
+            runtime.config.bot_id,
+            parsed.chat_key,
+            runtime.config.source.source_dir,
+            runtime.config.workspace_namespace,
+            runtime.config.workspace_mode,
+        )
         await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
+        await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
         req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
         for req_id in req_ids:
             cleanup_reply_state(runtime, req_id)

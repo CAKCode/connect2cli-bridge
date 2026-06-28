@@ -55,8 +55,10 @@ class AppConfig:
     bind_port: int
     runtime_root: Path
     source_dir: Path
+    workspace_namespace: str
     chatfile_root: Path
     codex_output_root: Path
+    workspace_mode: str
     codex_exec_mode: str
     agent_backend: str
     agent_command: str | None
@@ -94,8 +96,10 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         bind_port=bind_port,
         runtime_root=runtime_root,
         source_dir=source_dir,
+        workspace_namespace=(str(values.get("WORKSPACE_NAMESPACE") or values.get("WECOM_WORKSPACE_NAMESPACE") or require_env(values, "WECOM_BOT_ID")).strip()),
         chatfile_root=chatfile_root,
         codex_output_root=codex_output_root,
+        workspace_mode=(str(values.get("WECOM_BOT_WORKSPACE_MODE") or values.get("WECOM_WORKSPACE_MODE") or "").strip().lower() or ""),
         codex_exec_mode=(str(values.get("CODEX_EXEC_MODE") or "host").strip().lower() or "host"),
         agent_backend=normalize_agent_backend(values.get("WECOM_AGENT_BACKEND") or values.get("AGENT_BACKEND") or "codex"),
         agent_command=(str(values.get("WECOM_AGENT_COMMAND") or values.get("AGENT_COMMAND") or "").strip() or None),
@@ -124,7 +128,9 @@ def build_bot_from_app_config(config: AppConfig):
         bot_name=config.bot_name,
         source_dir=config.source_dir,
         runtime_root=config.runtime_root,
+        workspace_namespace=config.workspace_namespace,
         chatfile_root=config.chatfile_root,
+        workspace_mode=config.workspace_mode,
         codex_exec_mode=config.codex_exec_mode,
         agent_backend=config.agent_backend,
         agent_command=config.agent_command,
@@ -140,7 +146,9 @@ def build_bot_from_app_config(config: AppConfig):
         bot_secret=config.bot_secret,
         source=bot.source,
         runtime_root=bot.runtime_root,
+        workspace_namespace=bot.workspace_namespace,
         chatfile_root=bot.chatfile_root,
+        workspace_mode=bot.workspace_mode,
         codex_exec_mode=bot.codex_exec_mode,
         agent_backend=bot.agent_backend,
         agent_command=bot.agent_command,

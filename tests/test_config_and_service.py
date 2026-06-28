@@ -63,6 +63,26 @@ def test_load_app_config_reads_agent_run_as_settings(tmp_path: Path) -> None:
     assert config.agent_runtime_root == (tmp_path / "claude-runtime").resolve()
 
 
+def test_load_app_config_reads_workspace_mode(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WECOM_BOT_WORKSPACE_MODE": "team",
+        }
+    )
+
+    assert config.workspace_mode == "team"
+
+
 async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
     secret_file = tmp_path / ".secrets" / "bot.secret"
     source_dir = tmp_path / "repo"
@@ -117,7 +137,7 @@ async def test_service_health_and_prepare_session(tmp_path: Path) -> None:
     assert prepared_payload["ok"] is True
     assert prepared_payload["workspaceId"].startswith("user:")
     assert prepared_payload["workspaceScope"] == "user"
-    assert prepared_payload["cwd"].endswith("/project")
+    assert prepared_payload["cwd"].endswith("/workfile")
     assert prepared_payload["workfileDir"].endswith("/workfile")
     assert prepared_payload["roomfileDir"] is None
     assert prepared_payload["ownerUserId"] == "alice"
@@ -195,6 +215,50 @@ async def test_service_prepare_exposes_group_user_workspace_metadata(tmp_path: P
     assert prepared_payload["roomfileDir"].endswith("/roomfile")
     assert prepared_payload["ownerUserId"] == "alice"
     assert prepared_payload["ownerRoomId"] == "room-1"
+
+
+async def test_service_prepare_reuses_shared_personal_workspace_across_bots(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+    first = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default-a",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WORKSPACE_NAMESPACE": "team-a",
+        }
+    )
+    second = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default-b",
+            "WECOM_BOT_ID": "bot-2",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WORKSPACE_NAMESPACE": "team-a",
+        }
+    )
+    first_app = create_app(first)
+    second_app = create_app(second)
+
+    class JsonRequest:
+        def __init__(self, app):
+            self.app = app
+
+        async def json(self):
+            return {"chatKey": "single:alice", "message": "hello"}
+
+    route_a = next(route for route in first_app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/prepare")
+    route_b = next(route for route in second_app.router.routes() if route.method == "POST" and route.resource.canonical == "/api/prepare")
+    payload_a = json.loads((await route_a.handler(JsonRequest(first_app))).text)
+    payload_b = json.loads((await route_b.handler(JsonRequest(second_app))).text)
+
+    assert payload_a["workfileDir"] == payload_b["workfileDir"]
+    assert payload_a["sessionId"] != payload_b["sessionId"]
 
 
 async def test_service_prepare_rejects_invalid_json_and_missing_fields(tmp_path: Path) -> None:
@@ -332,6 +396,7 @@ async def test_service_startup_cleans_orphan_session_codex_homes(tmp_path: Path,
     app = create_app(config)
     calls = {"orphan": [], "stale": []}
 
+    monkeypatch.setattr(service_module, "cleanup_outdated_session_artifacts", lambda bot: 0)
     monkeypatch.setattr(service_module, "cleanup_orphan_session_codex_homes", lambda runtime_root: calls["orphan"].append(runtime_root) or 0)
     monkeypatch.setattr(
         service_module,

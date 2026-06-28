@@ -121,16 +121,24 @@ Implemented:
 
 Effective runtime layout centers around:
 
-- `workspace/<bot>/users/<user>/workfile`
-- `workspace/<bot>/rooms/<room>/roomfile`
-- `workspace/<bot>/sessions/<chat-key>/chatfile`
-- `project/.codex/skills` for `workspace_bridge`
+- `workspace/<workspace-namespace>/users/<user>/workfile`
+- `workspace/<workspace-namespace>/rooms/<room>/roomfile`
+- `chatfile/<session-id>/`
+- `workfile/.codex/skills` or `roomfile/.codex/skills` for `workspace_bridge`
 
 Behavior:
 
-- Codex usually runs with `workfile` as `cwd`
-- pure room-shared sessions run with `roomfile` as `cwd`
+- `workspaceMode=team` usually runs with `workfile` as `cwd`
+- pure room-shared `workspaceMode=team` sessions run with `roomfile` as `cwd`
+- `workspaceMode=personal` runs directly in bot `workDir`
 - temporary directories are redirected to the current session `chatfile`
+- for `claude` backend with private runtime enabled, only Claude config, temp, and `CODEX_HOME` move to `claude-runtime/sessions/<session-id>/`; the real `cwd` still follows `workspaceMode`
+
+Namespace and alias notes:
+
+- Bots with the same `workspaceNamespace` share user and room workspaces
+- `chatKey` may still carry the raw WeCom `USER_ID`
+- if a user alias exists under `.user-aliases/<workspaceNamespace>/`, the on-disk user workspace uses the aliased user directory name
 
 ### 7. File ingestion and outbound file delivery
 

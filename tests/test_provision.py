@@ -20,12 +20,12 @@ def test_provision_workspace_bootstraps_project_and_metadata(tmp_path: Path) -> 
     source_dir.mkdir()
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
     (source_dir / ".git").mkdir()
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
 
     provisioned = provision_workspace(workspace)
 
     assert provisioned.project_ready is True
-    assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "repo"
+    assert (workspace.cwd_dir / "README.md").read_text(encoding="utf-8") == "repo"
     metadata = load_workspace_metadata(workspace)
     assert metadata is not None
     assert metadata["workspaceId"] == workspace.workspace_id
@@ -38,13 +38,13 @@ def test_provision_workspace_bootstraps_project_even_with_skill_dir_precreated(t
     source_dir = tmp_path / "repo"
     source_dir.mkdir()
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
-    workspace.project_dir.mkdir(parents=True, exist_ok=True)
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    workspace.cwd_dir.mkdir(parents=True, exist_ok=True)
     workspace.skill_dir.mkdir(parents=True, exist_ok=True)
 
     provision_workspace(workspace)
 
-    assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "repo"
+    assert (workspace.cwd_dir / "README.md").read_text(encoding="utf-8") == "repo"
 
 
 def test_provision_workspace_keeps_existing_project_files(tmp_path: Path) -> None:
@@ -52,13 +52,13 @@ def test_provision_workspace_keeps_existing_project_files(tmp_path: Path) -> Non
     source_dir = tmp_path / "repo"
     source_dir.mkdir()
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
-    workspace.project_dir.mkdir(parents=True, exist_ok=True)
-    (workspace.project_dir / "README.md").write_text("custom", encoding="utf-8")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    workspace.cwd_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.cwd_dir / "README.md").write_text("custom", encoding="utf-8")
 
     provision_workspace(workspace)
 
-    assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "custom"
+    assert (workspace.cwd_dir / "README.md").read_text(encoding="utf-8") == "custom"
 
 
 def test_provision_workspace_skips_runtime_root_copy_to_avoid_recursive_project(tmp_path: Path) -> None:
@@ -69,12 +69,12 @@ def test_provision_workspace_skips_runtime_root_copy_to_avoid_recursive_project(
     (source_dir / "README.md").write_text("repo", encoding="utf-8")
     nested_runtime_file = runtime_root / "marker.txt"
     nested_runtime_file.write_text("runtime", encoding="utf-8")
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
 
     provision_workspace(workspace)
 
-    assert (workspace.project_dir / "README.md").read_text(encoding="utf-8") == "repo"
-    assert not (workspace.project_dir / ".workspace-bridge-runtime").exists()
+    assert (workspace.cwd_dir / "README.md").read_text(encoding="utf-8") == "repo"
+    assert not (workspace.cwd_dir / ".workspace-bridge-runtime").exists()
 
 
 def test_provision_workspace_refreshes_source_revision_when_head_changes(tmp_path: Path) -> None:
@@ -88,7 +88,7 @@ def test_provision_workspace_refreshes_source_revision_when_head_changes(tmp_pat
     (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     main_ref = refs_dir / "main"
     main_ref.write_text("rev-1\n", encoding="utf-8")
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
 
     first = provision_workspace(workspace)
     main_ref.write_text("rev-2\n", encoding="utf-8")
@@ -102,7 +102,7 @@ def test_workspace_lock_creates_lock_file(tmp_path: Path) -> None:
     runtime_root = tmp_path / "runtime"
     source_dir = tmp_path / "repo"
     source_dir.mkdir()
-    workspace = build_workspace_ref(runtime_root, source_dir, "single:alice")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
 
     with workspace_lock(workspace):
         assert workspace.lock_file.exists()
@@ -117,7 +117,7 @@ def test_build_runtime_context_uses_workspace_skills(tmp_path: Path, monkeypatch
     global_skill_dir.mkdir()
     monkeypatch.setattr(models_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
     monkeypatch.setattr(context_module, "DEFAULT_GLOBAL_SKILL_DIR", global_skill_dir.resolve())
-    workspace = build_workspace_ref(runtime_root, source_dir, "group-user:room-1:alice")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "group-user:room-1:alice")
     provision_workspace(workspace)
     write_skill(workspace.skill_dir, "deploy", "# workspace")
     write_skill(workspace.skill_dir, "lint", "# workspace lint")
@@ -129,15 +129,51 @@ def test_build_runtime_context_uses_workspace_skills(tmp_path: Path, monkeypatch
         chatfile_root=chatfile_root,
     )
 
-    assert context.project_dir == workspace.project_dir
+    assert context.cwd_dir == workspace.cwd_dir
     assert context.chatfile_dir.is_dir()
     assert context.export_dir == context.chatfile_dir
     assert context.workfile_dir == workspace.workfile_dir
     assert context.roomfile_dir == workspace.roomfile_dir
     assert context.allowed_file_roots == (context.chatfile_dir.resolve(),)
     assert context.effective_skill_names == ("deploy", "lint")
-    assert context.env["WECOM_BRIDGE_PROJECT_DIR"] == str(workspace.project_dir)
+    assert context.env["WECOM_BRIDGE_PROJECT_DIR"] == str(workspace.cwd_dir)
+    assert context.env["WECOM_BRIDGE_WORKSPACE_MODE"] == "team"
     assert context.env["WECOM_BRIDGE_WORKFILE_DIR"] == str(workspace.workfile_dir)
     assert context.env["WECOM_BRIDGE_ROOMFILE_DIR"] == str(workspace.roomfile_dir)
     assert context.env["WECOM_BRIDGE_USER_ID"] == "alice"
     assert context.env["WECOM_BRIDGE_ROOM_ID"] == "room-1"
+
+
+def test_provision_workspace_migrates_legacy_workfile_without_overwrite(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    legacy = runtime_root / "workspace" / "team-a" / "users" / "alice" / "workfile"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    workspace.workfile_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.workfile_dir / "keep.txt").write_text("new", encoding="utf-8")
+
+    provision_workspace(workspace)
+
+    assert (workspace.workfile_dir / "from-legacy.txt").read_text(encoding="utf-8") == "legacy"
+    assert (workspace.workfile_dir / "keep.txt").read_text(encoding="utf-8") == "new"
+    assert (workspace.workfile_dir / ".workspace-layout-migration.json").exists()
+
+
+def test_provision_workspace_skips_bootstrap_and_legacy_migration_in_personal_mode(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "README.md").write_text("repo", encoding="utf-8")
+    legacy = runtime_root / "workspace" / "team-a" / "users" / "alice" / "workfile"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    workspace = build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice", workspace_mode="personal")
+
+    provision_workspace(workspace)
+
+    assert workspace.cwd_dir == source_dir.resolve()
+    assert (source_dir / "README.md").read_text(encoding="utf-8") == "repo"
+    assert not (workspace.project_dir / "from-legacy.txt").exists()

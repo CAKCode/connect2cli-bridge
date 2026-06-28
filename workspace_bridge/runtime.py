@@ -17,9 +17,17 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def stable_session_id(bot_id: str, chat_key: str, source_dir: Path | str) -> str:
+def stable_session_id(
+    bot_id: str,
+    chat_key: str,
+    source_dir: Path | str,
+    workspace_namespace: str | None = None,
+    workspace_mode: str | None = None,
+) -> str:
     source = Path(source_dir).expanduser().resolve()
-    digest = hashlib.sha1(f"{bot_id}\n{chat_key}\n{source}".encode("utf-8")).hexdigest()[:16]
+    namespace = str(workspace_namespace or bot_id).strip() or str(bot_id).strip()
+    mode = str(workspace_mode or "").strip().lower().replace("_", "-") or "team"
+    digest = hashlib.sha1(f"{bot_id}\n{chat_key}\n{source}\n{namespace}\n{mode}".encode("utf-8")).hexdigest()[:16]
     return f"session-{digest}"
 
 
@@ -35,7 +43,9 @@ def build_bot_config(
     bot_name: str,
     source_dir: Path | str,
     runtime_root: Path | str,
+    workspace_namespace: str | None = None,
     chatfile_root: Path | str,
+    workspace_mode: str | None = None,
     codex_exec_mode: str = "host",
     agent_backend: str = "codex",
     agent_command: str | None = None,
@@ -45,15 +55,23 @@ def build_bot_config(
     file_send_roots: tuple[Path, ...] = (),
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> BotConfig:
+    normalized_backend = normalize_agent_backend(agent_backend)
+    normalized_workspace_mode = str(workspace_mode or "").strip().lower().replace("_", "-")
+    if not normalized_workspace_mode:
+        normalized_workspace_mode = "personal" if normalized_backend == "claude" else "team"
+    if normalized_workspace_mode not in {"team", "personal"}:
+        raise ValueError(f"invalid workspace_mode: {workspace_mode}")
     return BotConfig(
         bot_id=str(bot_id).strip(),
         bot_name=str(bot_name).strip(),
         bot_secret=None,
         source=make_source_config(source_dir),
         runtime_root=Path(runtime_root).expanduser().resolve(),
+        workspace_namespace=(str(workspace_namespace or bot_id).strip() or str(bot_id).strip()),
         chatfile_root=Path(chatfile_root).expanduser().resolve(),
+        workspace_mode=normalized_workspace_mode,
         codex_exec_mode=(str(codex_exec_mode).strip().lower() or "host"),
-        agent_backend=normalize_agent_backend(agent_backend),
+        agent_backend=normalized_backend,
         agent_command=(str(agent_command).strip() or None),
         agent_run_as_user=(str(agent_run_as_user).strip() or None),
         agent_run_as_group=(str(agent_run_as_group).strip() or None),
@@ -88,6 +106,12 @@ def reply_url_state_file(runtime_root: Path | str, bot_id: str) -> Path:
 
 def remove_session_codex_home(runtime_root: Path | str, session_id: str) -> None:
     root = session_codex_home_root(runtime_root) / session_id
+    if root.exists():
+        __import__("shutil").rmtree(root, ignore_errors=True)
+
+
+def remove_session_chatfile(chatfile_root: Path | str, session_id: str) -> None:
+    root = Path(chatfile_root).expanduser().resolve() / session_id
     if root.exists():
         __import__("shutil").rmtree(root, ignore_errors=True)
 
@@ -168,7 +192,7 @@ def load_session_record(runtime_root: Path | str, session_id: str) -> SessionRec
         chat_key=str(payload["chatKey"]),
         workspace_id=str(payload["workspaceId"]),
         workspace_scope=str(payload["workspaceScope"]),
-        project_dir=Path(payload["projectDir"]).resolve(),
+        cwd_dir=Path(payload["cwdDir"]).resolve(),
         chatfile_dir=Path(payload["chatfileDir"]).resolve(),
         workfile_dir=Path(payload["workfileDir"]).resolve() if payload.get("workfileDir") else None,
         roomfile_dir=Path(payload["roomfileDir"]).resolve() if payload.get("roomfileDir") else None,
@@ -189,7 +213,7 @@ def store_session_record(runtime_root: Path | str, session: SessionRecord) -> Se
             "chatKey": session.chat_key,
             "workspaceId": session.workspace_id,
             "workspaceScope": session.workspace_scope,
-            "projectDir": str(session.project_dir),
+            "cwdDir": str(session.cwd_dir),
             "chatfileDir": str(session.chatfile_dir),
             "workfileDir": str(session.workfile_dir) if session.workfile_dir else None,
             "roomfileDir": str(session.roomfile_dir) if session.roomfile_dir else None,
@@ -267,6 +291,27 @@ def cleanup_stale_session_codex_homes(
     return removed
 
 
+def cleanup_outdated_session_artifacts(bot: BotConfig) -> int:
+    removed = 0
+    chatfile_root = Path(bot.chatfile_root).expanduser().resolve()
+    current_records = list_session_records(bot.runtime_root, bot.bot_id)
+    for record in current_records:
+        expected_session_id = stable_session_id(
+            bot.bot_id,
+            record.chat_key,
+            bot.source.source_dir,
+            bot.workspace_namespace,
+            bot.workspace_mode,
+        )
+        if record.session_id == expected_session_id:
+            continue
+        remove_session_codex_home(bot.runtime_root, record.session_id)
+        remove_session_chatfile(chatfile_root, record.session_id)
+        session_record_file(bot.runtime_root, record.session_id).unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 def update_session_record(
     runtime_root: Path | str,
     session_id: str,
@@ -282,9 +327,22 @@ def update_session_record(
 
 
 def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
-    workspace_ref = build_workspace_ref(bot.runtime_root, bot.source.source_dir, chat_key)
+    workspace_ref = build_workspace_ref(
+        bot.runtime_root,
+        bot.workspace_namespace,
+        bot.source.source_dir,
+        chat_key,
+        workspace_mode=bot.workspace_mode,
+        agent_backend=bot.agent_backend,
+    )
     with workspace_lock(workspace_ref):
-        session_id = stable_session_id(bot.bot_id, chat_key, bot.source.source_dir)
+        session_id = stable_session_id(
+            bot.bot_id,
+            chat_key,
+            bot.source.source_dir,
+            bot.workspace_namespace,
+            bot.workspace_mode,
+        )
         provisioned = provision_workspace(workspace_ref)
         runtime_context = build_runtime_context(
             workspace_ref,
@@ -305,7 +363,7 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             chat_key=chat_key,
             workspace_id=workspace_ref.workspace_id,
             workspace_scope=workspace_ref.scope,
-            project_dir=runtime_context.project_dir,
+            cwd_dir=runtime_context.cwd_dir,
             chatfile_dir=runtime_context.chatfile_dir,
             workfile_dir=runtime_context.workfile_dir,
             roomfile_dir=runtime_context.roomfile_dir,

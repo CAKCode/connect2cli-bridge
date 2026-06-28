@@ -8,6 +8,7 @@ from .agent_backends import AgentBackend
 
 
 WorkspaceScope = Literal["user", "room"]
+WorkspaceMode = Literal["team", "personal"]
 SkillLayerName = Literal["global", "workspace"]
 DEFAULT_GLOBAL_SKILL_DIR = (Path.home() / ".codex" / "skills").expanduser().resolve()
 
@@ -25,7 +26,9 @@ class BotConfig:
     bot_secret: str | None
     source: SourceConfig
     runtime_root: Path
+    workspace_namespace: str
     chatfile_root: Path
+    workspace_mode: WorkspaceMode = "team"
     codex_exec_mode: Literal["sandboxed", "host"] = "host"
     agent_backend: AgentBackend = "codex"
     agent_command: str | None = None
@@ -74,12 +77,13 @@ class WeComBotRuntime:
 class WorkspaceRef:
     workspace_id: str
     scope: WorkspaceScope
+    namespace: str
     owner_user_id: str | None
     owner_room_id: str | None
     chat_key: str
     source_dir: Path
-    source_key: str
     root_dir: Path
+    cwd_dir: Path
     project_dir: Path
     skill_dir: Path
     state_dir: Path
@@ -123,7 +127,7 @@ class ResolvedSkillSpace:
 @dataclass(frozen=True)
 class WorkspaceRuntimeContext:
     workspace: WorkspaceRef
-    project_dir: Path
+    cwd_dir: Path
     chatfile_dir: Path
     export_dir: Path
     workfile_dir: Path | None
@@ -143,7 +147,7 @@ class SessionRecord:
     chat_key: str
     workspace_id: str
     workspace_scope: WorkspaceScope
-    project_dir: Path
+    cwd_dir: Path
     chatfile_dir: Path
     workfile_dir: Path | None
     roomfile_dir: Path | None

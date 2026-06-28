@@ -43,6 +43,7 @@ def make_bot(bridge_module, *, config_id="bot-1", name="codex1", remote_bot_id="
             "workDir": work_dir,
             "enabled": True,
             "welcome": "",
+            "workspaceMode": "team",
             "groupSessionMode": "per-user",
             "agentBackend": "codex",
             "agentCommand": None,
@@ -97,6 +98,86 @@ def test_create_session_record_does_not_persist_workdir(bridge_module):
     persisted = bridge_module.read_json_file(bridge_module.get_registry_session_file(record["sessionId"]), None)
     assert persisted is not None
     assert "workDir" not in persisted
+
+
+def test_normalize_bot_config_preserves_workspace_namespace(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret.txt", "secret\n")
+
+    normalized = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "workspaceNamespace": "personal-main",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["workspaceNamespace"] == "personal-main"
+
+
+def test_normalize_bot_config_defaults_workspace_namespace_to_generated_id(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-default.txt", "secret\n")
+
+    normalized = bridge_module.normalize_bot_config(
+        {
+            "name": "codex1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["id"]
+    assert normalized["workspaceNamespace"] == normalized["id"]
+
+
+def test_normalize_bot_config_defaults_workspace_mode_by_backend_for_new_configs(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-workspace-mode.txt", "secret\n")
+
+    codex_config = bridge_module.normalize_bot_config(
+        {
+            "name": "codex1",
+            "botId": "remote-bot-codex",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "codex",
+        }
+    )
+    claude_config = bridge_module.normalize_bot_config(
+        {
+            "name": "claude1",
+            "botId": "remote-bot-claude",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "claude",
+        }
+    )
+
+    assert codex_config["workspaceMode"] == "team"
+    assert claude_config["workspaceMode"] == "personal"
+
+
+def test_normalize_persisted_bot_config_defaults_missing_workspace_mode_to_team(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted.txt", "secret\n")
+
+    normalized = bridge_module.normalize_persisted_bot_config(
+        {
+            "id": "bot-1",
+            "name": "claude1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "claude",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+    )
+
+    assert normalized["workspaceMode"] == "team"
 
 
 def test_recycle_session_removes_idle_session_from_memory(bridge_module):
@@ -385,6 +466,147 @@ async def test_start_bot_clears_session_runtime_state_when_workdir_changes(bridg
     assert sess.queue == []
 
 
+@pytest.mark.asyncio
+async def test_start_bot_recreates_session_record_when_workspace_identity_changes(bridge_module, monkeypatch):
+    old_work_dir = bridge_module.BASE_DIR / "old-workdir"
+    new_work_dir = bridge_module.BASE_DIR / "new-workdir"
+    old_work_dir.mkdir(parents=True, exist_ok=True)
+    new_work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, config_id="bot-1", work_dir=str(old_work_dir))
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    old_session_id = record["sessionId"]
+    old_lock_file = Path(record["lockFile"])
+    bridge_module.ensure_dir_for(old_lock_file)
+    old_lock_file.write_text("{}", encoding="utf-8")
+    old_chatfile = bridge_module.get_chatfile_dir(old_session_id)
+    old_chatfile.mkdir(parents=True, exist_ok=True)
+    (old_chatfile / "stale.txt").write_text("stale", encoding="utf-8")
+    old_codex_home = bridge_module.get_session_codex_home_root(old_session_id)
+    old_codex_home.mkdir(parents=True, exist_ok=True)
+    (old_codex_home / "state.txt").write_text("state", encoding="utf-8")
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal", **_kwargs):
+        return None
+
+    monkeypatch.setattr(bridge_module, "stop_bot", fake_stop_bot)
+
+    await bridge_module.start_bot(
+        {
+            "id": bot.config["id"],
+            "name": bot.config["name"],
+            "botId": bot.config["botId"],
+            "secret": "secret",
+            "workDir": str(new_work_dir),
+            "enabled": True,
+            "welcome": "",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    new_record = bridge_module.create_session_record(bridge_module.BOTS["bot-1"], "single:test-user")
+
+    assert new_record["sessionId"] != old_session_id
+    assert bridge_module.read_session_record_by_id(old_session_id) is None
+    assert not old_lock_file.exists()
+    assert not old_chatfile.exists()
+    assert not old_codex_home.exists()
+
+
+@pytest.mark.asyncio
+async def test_start_bot_rebinds_schedule_definition_session_id_when_workspace_identity_changes(bridge_module, monkeypatch):
+    old_work_dir = bridge_module.BASE_DIR / "old-workdir"
+    new_work_dir = bridge_module.BASE_DIR / "new-workdir"
+    old_work_dir.mkdir(parents=True, exist_ok=True)
+    new_work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, config_id="bot-1", work_dir=str(old_work_dir))
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    old_session_id = record["sessionId"]
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": old_session_id,
+            "chatKey": "single:test-user",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal", **_kwargs):
+        return None
+
+    monkeypatch.setattr(bridge_module, "stop_bot", fake_stop_bot)
+
+    await bridge_module.start_bot(
+        {
+            "id": bot.config["id"],
+            "name": bot.config["name"],
+            "botId": bot.config["botId"],
+            "secret": "secret",
+            "workDir": str(new_work_dir),
+            "enabled": True,
+            "welcome": "",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    updated = bridge_module.read_schedule_definition(definition["scheduleId"])
+    assert updated is not None
+    assert updated["sessionId"] != old_session_id
+
+
+@pytest.mark.asyncio
+async def test_start_bot_rebinds_scheduled_job_session_id_when_workspace_identity_changes(bridge_module, monkeypatch):
+    old_work_dir = bridge_module.BASE_DIR / "old-workdir"
+    new_work_dir = bridge_module.BASE_DIR / "new-workdir"
+    old_work_dir.mkdir(parents=True, exist_ok=True)
+    new_work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, config_id="bot-1", work_dir=str(old_work_dir))
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    old_session_id = record["sessionId"]
+    processing = bridge_module.SCHEDULE_PROCESSING_ROOT / "job-workspace-switch.json"
+    bridge_module.ensure_dir(processing.parent)
+    bridge_module.write_json_atomic(
+        processing,
+        {
+            "requestId": "job-workspace-switch",
+            "scheduleId": "sched-1",
+            "botId": bot.config["id"],
+            "sessionId": old_session_id,
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal", **_kwargs):
+        return None
+
+    monkeypatch.setattr(bridge_module, "stop_bot", fake_stop_bot)
+
+    await bridge_module.start_bot(
+        {
+            "id": bot.config["id"],
+            "name": bot.config["name"],
+            "botId": bot.config["botId"],
+            "secret": "secret",
+            "workDir": str(new_work_dir),
+            "enabled": True,
+            "welcome": "",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    updated = bridge_module.read_json_file(processing, None)
+    assert updated is not None
+    assert updated["sessionId"] != old_session_id
+
+
 def test_build_bridge_context_mentions_skill_dirs(bridge_module):
     work_dir = bridge_module.BASE_DIR / "repo"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -619,6 +841,12 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "BRIDGE_BIND=127.0.0.1:19399\n"
         "WORK_DIR=/tmp/from-dotenv\n"
         "BRIDGE_TOKEN=token-from-dotenv\n"
+        "WECOM_BOT_WORKSPACE_MODE=personal\n"
+        "WECOM_BOT_AGENT_BACKEND=claude\n"
+        'WECOM_BOT_AGENT_COMMAND="claude --model sonnet"\n'
+        "WECOM_BOT_AGENT_RUN_AS_USER=claudebot\n"
+        "WECOM_BOT_AGENT_RUN_AS_GROUP=claudew\n"
+        "WECOM_BOT_AGENT_RUNTIME_ROOT=/tmp/claude-runtime\n"
         "LOCAL_FILE_SEND_POLL_MS=4321\n"
         "LOCAL_FILE_SEND_RESULT_RETENTION_MS=654321\n"
         "PROACTIVE_TEXT_MAX_CHARS=987\n",
@@ -630,7 +858,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
             "sh",
             "-c",
             '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
-            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'WECOM_BOT_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_BOT_AGENT_BACKEND\')); print(os.getenv(\'WECOM_BOT_AGENT_COMMAND\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_USER\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_GROUP\')); print(os.getenv(\'WECOM_BOT_AGENT_RUNTIME_ROOT\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
             "sh",
             str(script_dir),
         ],
@@ -642,10 +870,31 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
     assert result.stdout.strip().splitlines() == [
         "/tmp/from-dotenv",
         "token-from-dotenv",
+        "personal",
+        "claude",
+        "claude --model sonnet",
+        "claudebot",
+        "claudew",
+        "/tmp/claude-runtime",
         "4321",
         "654321",
         "987",
     ]
+
+
+def test_load_env_bootstrap_bot_configs_reads_workspace_mode_from_single_bot_env(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "single-bot.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_AGENT_BACKEND", "claude")
+    monkeypatch.setenv("WECOM_BOT_WORKSPACE_MODE", "personal")
+
+    configs = bridge_module.load_env_bootstrap_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["workspaceMode"] == "personal"
+    assert configs[0]["agentBackend"] == "claude"
 
 
 def test_start_bot_invalidates_persisted_threads_when_workdir_changes(bridge_module):
@@ -694,9 +943,177 @@ def test_start_bot_invalidates_persisted_threads_when_workdir_changes(bridge_mod
         )
     )
 
+    assert bridge_module.read_session_record_by_id("sess-1") is None
+
+
+def test_start_bot_invalidates_persisted_threads_when_workspace_mode_changes(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-workspace-mode.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-1",
+                "name": "claude1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "personal-main",
+                "workspaceMode": "team",
+                "agentBackend": "claude",
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "threadId": "thread-old",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        }
+    )
+    bridge_module.write_session_record(record)
+
+    asyncio.run(
+        bridge_module.start_bot(
+            {
+                "id": "bot-1",
+                "name": "claude1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "personal-main",
+                "workspaceMode": "personal",
+                "agentBackend": "claude",
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        )
+    )
+
+    assert bridge_module.read_session_record_by_id("sess-1") is None
+    recreated = bridge_module.create_session_record(bridge_module.BOTS["bot-1"], "single:test-user")
+    assert recreated["sessionId"] != "sess-1"
+
+
+def test_start_bot_invalidates_persisted_threads_when_workspace_namespace_changes(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-workspace-namespace.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "personal-main",
+                "workspaceMode": "team",
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "threadId": "thread-old",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        }
+    )
+    bridge_module.write_session_record(record)
+
+    asyncio.run(
+        bridge_module.start_bot(
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "other-main",
+                "workspaceMode": "team",
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        )
+    )
+
+    assert bridge_module.read_session_record_by_id("sess-1") is None
+    recreated = bridge_module.create_session_record(bridge_module.BOTS["bot-1"], "single:test-user")
+    assert recreated["sessionId"] != "sess-1"
+
+
+def test_reset_bot_session_runtime_state_clears_persisted_threads_for_loaded_bot(bridge_module):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR))
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "threadId": "thread-old",
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        }
+    )
+    bridge_module.write_session_record(record)
+    sess = bridge_module.SessionState(
+        session_id="sess-1",
+        work_dir=str(bridge_module.BASE_DIR),
+        lock_file=Path(record["lockFile"]),
+        thread_id="thread-old",
+    )
+    bot.sessions["single:test-user"] = sess
+
+    cleared = bridge_module.reset_bot_session_runtime_state(bot.config["id"])
+
     persisted = bridge_module.read_session_record_by_id("sess-1")
-    assert persisted is not None
-    assert persisted.get("threadId") is None
+    assert cleared >= 1
+    assert sess.thread_id is None
+    assert persisted is None
+
+
+def test_reset_bot_session_runtime_state_clears_persisted_running_schedule_state(bridge_module):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR))
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "threadId": None,
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "running",
+            "ownerInstance": "other-instance",
+            "ownerPid": 1234,
+            "leaseExpiresAt": bridge_module.now_ms() + 60000,
+            "activeScheduleId": "sch-1",
+        }
+    )
+    bridge_module.write_session_record(record)
+
+    cleared = bridge_module.reset_bot_session_runtime_state(bot.config["id"])
+
+    persisted = bridge_module.read_session_record_by_id("sess-1")
+    assert cleared >= 1
+    assert persisted is None
 
 
 def test_prepare_and_start_bot_invalidates_threads_when_bootstrap_workdir_changes(bridge_module, monkeypatch):
@@ -740,9 +1157,67 @@ def test_prepare_and_start_bot_invalidates_threads_when_bootstrap_workdir_change
     configs = bridge_module.prepare_bot_configs()
     asyncio.run(bridge_module.start_bot(configs[0]))
 
-    persisted = bridge_module.read_session_record_by_id("sess-1")
-    assert persisted is not None
-    assert persisted.get("threadId") is None
+    assert bridge_module.read_session_record_by_id("sess-1") is None
+
+
+def test_prepare_and_start_bot_rebinds_schedule_definition_session_id_when_bootstrap_workspace_identity_changes(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-bootstrap-schedule.secret", "secret\n")
+    old_work_dir = bridge_module.BASE_DIR / "old-workdir"
+    new_work_dir = bridge_module.BASE_DIR / "new-workdir"
+    old_work_dir.mkdir(parents=True, exist_ok=True)
+    new_work_dir.mkdir(parents=True, exist_ok=True)
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(old_work_dir),
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+    bridge_module.write_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "threadId": "thread-old",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        }
+    )
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": "sess-1",
+            "chatKey": "single:test-user",
+            "botId": "bot-1",
+            "botName": "codex1",
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    monkeypatch.setenv("WECOM_BOT_NAME", "codex1")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(new_work_dir))
+
+    configs = bridge_module.prepare_bot_configs()
+    asyncio.run(bridge_module.start_bot(configs[0]))
+
+    updated = bridge_module.read_schedule_definition(definition["scheduleId"])
+    assert updated is not None
+    assert updated["sessionId"] != "sess-1"
 
 
 def test_prepare_bot_configs_rejects_duplicate_wecom_bot_ids(bridge_module):
@@ -809,6 +1284,7 @@ def test_prepare_bot_configs_bootstraps_single_bot_from_env(bridge_module, monke
     monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
     monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
     monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_WORKSPACE_NAMESPACE", "personal-main")
     monkeypatch.setenv("WECOM_BOT_GROUP_SESSION_MODE", "shared")
 
     configs = bridge_module.prepare_bot_configs()
@@ -819,6 +1295,7 @@ def test_prepare_bot_configs_bootstraps_single_bot_from_env(bridge_module, monke
     assert configs[0]["botId"] == "bot-id"
     assert configs[0]["secret"] == "secret"
     assert configs[0]["workDir"] == str(bridge_module.BASE_DIR)
+    assert configs[0]["workspaceNamespace"] == "personal-main"
     assert configs[0]["groupSessionMode"] == "shared"
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
     expected = bridge_module.serialize_bot_config_for_disk(configs[0])
@@ -1350,7 +1827,7 @@ def test_get_session_workspace_paths_for_single_chat(bridge_module):
     paths = bridge_module.get_session_workspace_paths(bot, "single:test-user")
 
     assert paths["workDir"] == Path(bot.config["workDir"]).resolve()
-    assert paths["chatfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "sessions" / "single_test-user" / "chatfile"
+    assert paths["chatfile"] == bridge_module.CHATFILE_ROOT / paths["chatfile"].name
     assert paths["workfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "users" / "test-user" / "workfile"
     assert paths["roomfile"] is None
 
@@ -1369,7 +1846,7 @@ def test_get_session_workspace_paths_for_group_user_chat(bridge_module):
 
     paths = bridge_module.get_session_workspace_paths(bot, "group-user:group-1:user-a")
 
-    assert paths["chatfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "sessions" / "group_user_group-1_user-a" / "chatfile"
+    assert paths["chatfile"] == bridge_module.CHATFILE_ROOT / paths["chatfile"].name
     assert paths["workfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "users" / "user-a" / "workfile"
     assert paths["roomfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "rooms" / "group-1" / "roomfile"
 
@@ -1379,7 +1856,7 @@ def test_get_session_workspace_paths_for_group_shared_chat(bridge_module):
 
     paths = bridge_module.get_session_workspace_paths(bot, "group:group-1")
 
-    assert paths["chatfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "sessions" / "group_group-1" / "chatfile"
+    assert paths["chatfile"] == bridge_module.CHATFILE_ROOT / paths["chatfile"].name
     assert paths["workfile"] is None
     assert paths["roomfile"] == bridge_module.WORKSPACE_ROOT / bot.config["id"] / "rooms" / "group-1" / "roomfile"
 
@@ -1390,6 +1867,17 @@ def test_get_session_runtime_cwd_uses_workfile_for_single_chat(bridge_module):
     runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "single:test-user")
 
     assert runtime_cwd == bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
+
+
+def test_get_session_runtime_cwd_uses_workdir_for_personal_mode(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+
+    runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "single:test-user")
+
+    assert runtime_cwd == work_dir.resolve()
 
 
 def test_ensure_session_workspace_dirs_bootstraps_workfile_from_workdir(bridge_module):
@@ -1407,6 +1895,19 @@ def test_ensure_session_workspace_dirs_bootstraps_workfile_from_workdir(bridge_m
     assert (paths["workfile"] / "tracked.txt").read_text(encoding="utf-8") == "hello"
     assert not (paths["workfile"] / ".git").exists()
     assert not (paths["workfile"] / "__pycache__").exists()
+
+
+def test_ensure_session_workspace_dirs_skips_bootstrap_in_personal_mode(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-bootstrap"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "tracked.txt").write_text("hello", encoding="utf-8")
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    assert not (paths["workfile"] / "tracked.txt").exists()
 
 
 def test_ensure_session_workspace_dirs_bootstraps_non_git_project_tree(bridge_module):
@@ -1452,6 +1953,57 @@ def test_ensure_session_workspace_dirs_writes_bootstrap_marker(bridge_module):
     assert payload["source"] == str(work_dir.resolve())
 
 
+def test_ensure_session_workspace_dirs_migrates_legacy_workfile_without_overwrite(bridge_module):
+    bot = make_bot(bridge_module)
+    legacy = bridge_module.get_legacy_workfile_dir(bot.config["id"], "test-user")
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    target = bridge_module.get_workfile_dir(bot.config["id"], "test-user")
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("new", encoding="utf-8")
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    assert (paths["workfile"] / "from-legacy.txt").read_text(encoding="utf-8") == "legacy"
+    assert (paths["workfile"] / "keep.txt").read_text(encoding="utf-8") == "new"
+    assert (paths["workfile"] / ".workspace-layout-migration.json").exists()
+
+
+def test_ensure_session_workspace_dirs_migrates_legacy_alias_workfile_without_overwrite(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.write_user_alias(bot.config["id"], "wo-user", "friendly-user")
+    legacy = bridge_module.get_legacy_workfile_dir(bot.config["id"], "friendly-user")
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "from-legacy-alias.txt").write_text("legacy", encoding="utf-8")
+    target = bridge_module.get_workfile_dir(bot.config["id"], "friendly-user")
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("new", encoding="utf-8")
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:wo-user")
+
+    assert paths["workfile"] is not None
+    assert (paths["workfile"] / "from-legacy-alias.txt").read_text(encoding="utf-8") == "legacy"
+    assert (paths["workfile"] / "keep.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_ensure_session_workspace_dirs_migrates_legacy_roomfile_without_overwrite(bridge_module):
+    bot = make_bot(bridge_module)
+    legacy = bridge_module.get_legacy_roomfile_dir(bot.config["id"], "group-1")
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    target = bridge_module.get_roomfile_dir(bot.config["id"], "group-1")
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("new", encoding="utf-8")
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "group:group-1")
+
+    assert paths["roomfile"] is not None
+    assert (paths["roomfile"] / "from-legacy.txt").read_text(encoding="utf-8") == "legacy"
+    assert (paths["roomfile"] / "keep.txt").read_text(encoding="utf-8") == "new"
+    assert (paths["roomfile"] / ".workspace-layout-migration.json").exists()
+
+
 def test_get_session_runtime_cwd_uses_workfile_for_group_user_chat(bridge_module):
     bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo"))
 
@@ -1466,6 +2018,19 @@ def test_get_session_runtime_cwd_uses_roomfile_for_group_shared_chat(bridge_modu
     runtime_cwd = bridge_module.get_session_runtime_cwd(bot, "group:group-1")
 
     assert runtime_cwd == bridge_module.get_roomfile_dir(bot.config["id"], "group-1").resolve()
+
+
+def test_build_bridge_context_mentions_workspace_mode_and_workdir(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-context"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+
+    context = bridge_module.build_bridge_context(bot, sess, "single:test-user")
+
+    assert "workspaceMode: personal" in context
+    assert f"WORKDIR_DIR: {Path(bot.config['workDir']).resolve()}" in context
 
 
 def test_validate_file_for_upload_only_allows_chatfile_by_default(bridge_module):
@@ -3724,6 +4289,12 @@ def test_remove_bot_cleans_persisted_state_and_artifacts(bridge_module):
             {"id": "keep-bot", "name": "keep"},
         ],
     )
+    workspace_root = bridge_module.get_workspace_namespace_dir(bot.config["id"])
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    (workspace_root / "keep.txt").write_text("workspace", encoding="utf-8")
+    alias_dir = bridge_module.get_user_alias_dir(bot.config["id"])
+    alias_dir.mkdir(parents=True, exist_ok=True)
+    (alias_dir / "alias.json").write_text("{}", encoding="utf-8")
 
     asyncio.run(bridge_module.remove_bot(bot.config["id"]))
 
@@ -3739,8 +4310,70 @@ def test_remove_bot_cleans_persisted_state_and_artifacts(bridge_module):
     assert not bridge_module.get_schedule_definition_lock_file(definition["scheduleId"]).exists()
     assert not pending.exists()
     assert not orphan_done.exists()
+    assert not workspace_root.exists()
+    assert not alias_dir.exists()
     stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
-    assert stored == [{"id": "keep-bot", "name": "keep"}]
+    assert stored == [{"id": "keep-bot", "name": "keep", "workspaceNamespace": "keep-bot", "workspaceMode": "team"}]
+
+
+def test_remove_bot_does_not_delete_shared_workspace_namespace_used_by_other_bots(bridge_module):
+    shared_namespace = "personal-main"
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "shared-workspace.secret", "secret\n")
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    first.config["workspaceNamespace"] = shared_namespace
+    second.config["workspaceNamespace"] = shared_namespace
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-a",
+                "name": first.config["name"],
+                "botId": first.config["botId"],
+                "secretFile": str(secret_file),
+                "workDir": first.config["workDir"],
+                "workspaceNamespace": shared_namespace,
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            },
+            {
+                "id": "bot-b",
+                "name": second.config["name"],
+                "botId": second.config["botId"],
+                "secretFile": str(secret_file),
+                "workDir": second.config["workDir"],
+                "workspaceNamespace": shared_namespace,
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            },
+        ],
+    )
+    shared_workfile = bridge_module.get_workfile_dir(shared_namespace, "test-user")
+    shared_workfile.mkdir(parents=True, exist_ok=True)
+    (shared_workfile / "keep.txt").write_text("keep", encoding="utf-8")
+    shared_alias_dir = bridge_module.get_user_alias_dir(shared_namespace)
+    shared_alias_dir.mkdir(parents=True, exist_ok=True)
+    (shared_alias_dir / "alias.json").write_text("{}", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot("bot-a"))
+
+    assert shared_workfile.exists()
+    assert (shared_workfile / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert shared_alias_dir.exists()
+    stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert stored == [
+        {
+            "id": "bot-b",
+            "name": second.config["name"],
+            "botId": second.config["botId"],
+            "secretFile": str(secret_file),
+            "workDir": second.config["workDir"],
+            "workspaceNamespace": shared_namespace,
+            "groupSessionMode": "per-user",
+            "workspaceMode": "team",
+            "enabled": True,
+        }
+    ]
 
 
 def test_migrate_legacy_runtime_state_only_copies_missing_files(bridge_module):
@@ -5481,6 +6114,56 @@ def test_api_add_bot_uses_stable_default_id(monkeypatch, bridge_module):
 
     assert body["ok"] is True
     assert body["id"] == bridge_module.default_bot_config_id("bot-id")
+
+
+def test_api_add_bot_preserves_existing_workspace_mode_when_updating_existing_bot(monkeypatch, bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "api-add-bot.secret", "secret\n")
+    existing = {
+        "id": "custom-id",
+        "name": "claude-existing",
+        "botId": "bot-id",
+        "secretFile": str(secret_file),
+        "workDir": str(bridge_module.BASE_DIR),
+        "workspaceNamespace": "personal-main",
+        "workspaceMode": "personal",
+        "groupSessionMode": "per-user",
+        "agentBackend": "claude",
+        "agentCommand": "claude --model sonnet",
+        "enabled": True,
+    }
+    bridge_module.write_json_atomic(bridge_module.DATA_FILE, [existing])
+    payload = {
+        "botId": "bot-id",
+        "name": "claude-existing-renamed",
+        "secretFile": str(secret_file),
+        "workDir": str(bridge_module.BASE_DIR),
+    }
+    captured = {}
+
+    async def fake_read_json_body(_request):
+        return payload
+
+    async def fake_require_api_access(_request):
+        return None
+
+    async def fake_start_bot(config):
+        captured["config"] = config
+        return bridge_module.BotState(config=config)
+
+    monkeypatch.setattr(bridge_module, "read_json_body", fake_read_json_body)
+    monkeypatch.setattr(bridge_module, "require_api_access", fake_require_api_access)
+    monkeypatch.setattr(bridge_module, "start_bot", fake_start_bot)
+
+    response = asyncio.run(bridge_module.api_add_bot(SimpleNamespace()))
+    body = json.loads(response.text)
+
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["id"] == "custom-id"
+    assert captured["config"]["workspaceMode"] == "personal"
+    assert captured["config"]["agentBackend"] == "claude"
+    assert captured["config"]["agentCommand"] == "claude --model sonnet"
+    assert captured["config"]["workspaceNamespace"] == "personal-main"
 
 
 def test_build_bridge_context_mentions_agent_backend(bridge_module):
@@ -8019,6 +8702,7 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
     assert captured["env"]["WECOM_BRIDGE_BOT_NAME"] == bot.config["name"]
     assert captured["env"]["WECOM_BRIDGE_BOT_CONFIG_ID"] == bot.config["id"]
     assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == workfile_dir
+    assert captured["env"]["WECOM_BRIDGE_WORKSPACE_MODE"] == "team"
     assert captured["env"]["WECOM_BRIDGE_WORKSPACE_SKILL_DIR"] == str(Path(workfile_dir) / ".codex" / "skills")
     assert captured["env"]["WECOM_BRIDGE_CHATFILE_DIR"] == chatfile_dir
     assert captured["env"]["WECOM_BRIDGE_EXPORT_DIR"] == chatfile_dir
@@ -8118,6 +8802,55 @@ async def test_run_codex_uses_roomfile_as_cwd_for_group_session_in_sandbox_mode(
     expected_roomfile_dir = str(bridge_module.get_roomfile_dir(bot.config["id"], "test-room").resolve())
     assert str(captured["cwd"]) == expected_roomfile_dir
     assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_roomfile_dir
+
+
+@pytest.mark.asyncio
+async def test_run_codex_uses_workdir_as_cwd_for_personal_workspace_mode(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR / "repo-personal-run"))
+    Path(bot.config["workDir"]).mkdir(parents=True, exist_ok=True)
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            event = {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}
+            self.stdout.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cwd"] = kwargs["cwd"]
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    async def fake_send_session_status(*args, **kwargs):
+        return True
+
+    async def fake_send_or_store_session_payload(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(bridge_module, "CODEX_EXEC_MODE", "sandboxed")
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payload", fake_send_or_store_session_payload)
+
+    await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
+
+    expected_work_dir = str(Path(bot.config["workDir"]).resolve())
+    assert str(captured["cwd"]) == expected_work_dir
+    assert captured["env"]["WECOM_BRIDGE_CWD_DIR"] == expected_work_dir
+    assert captured["env"]["WECOM_BRIDGE_WORKSPACE_MODE"] == "personal"
+    assert captured["env"]["WECOM_BRIDGE_WORKSPACE_SKILL_DIR"] == str(Path(expected_work_dir) / ".codex" / "skills")
 
 
 def test_build_codex_home_for_subprocess_preserves_global_skills(bridge_module):
@@ -8754,4 +9487,8 @@ async def test_run_codex_wraps_claude_with_setpriv_when_run_as_user_configured(b
     assert captured["args"][0] == "setpriv"
     assert "--clear-groups" in captured["args"]
     assert "claude" in captured["args"]
+    assert str(captured["cwd"]) == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve())
     assert captured["env"]["CLAUDE_CONFIG_DIR"].endswith(".claude")
+    assert captured["env"]["WECOM_BRIDGE_WORKFILE_DIR"] == str(
+        bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
+    )

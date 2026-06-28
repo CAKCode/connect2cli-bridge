@@ -140,6 +140,4 @@ def apply_claude_runtime_env(
     updated["CODEX_HOME"] = str(layout["codex_home_dir"])
     updated["WECOM_BRIDGE_CHATFILE_DIR"] = str(layout["chatfile_dir"])
     updated["WECOM_BRIDGE_EXPORT_DIR"] = str(layout["chatfile_dir"])
-    updated["WECOM_BRIDGE_WORKFILE_DIR"] = str(layout["workfile_dir"])
-    updated["WECOM_BRIDGE_ROOMFILE_DIR"] = str(layout["roomfile_dir"])
     return updated

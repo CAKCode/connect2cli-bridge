@@ -10,13 +10,14 @@ def find_nested_runtime_dirs(runtime_root: Path | str) -> list[Path]:
     if not workspace_root.exists():
         return []
     matches: list[Path] = []
-    for path in workspace_root.rglob("project/.workspace-bridge-runtime"):
-        resolved = path.resolve()
-        if resolved == root:
-            continue
-        if any(str(resolved).startswith(f"{existing}{Path('/')}") for existing in matches):
-            continue
-        matches.append(resolved)
+    for pattern in ("workfile/.workspace-bridge-runtime", "roomfile/.workspace-bridge-runtime", "project/.workspace-bridge-runtime"):
+        for path in workspace_root.rglob(pattern):
+            resolved = path.resolve()
+            if resolved == root:
+                continue
+            if any(str(resolved).startswith(f"{existing}{Path('/')}") for existing in matches):
+                continue
+            matches.append(resolved)
     matches.sort()
     return matches
 

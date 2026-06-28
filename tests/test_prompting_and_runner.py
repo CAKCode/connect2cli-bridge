@@ -69,7 +69,9 @@ def test_build_bridge_context_mentions_project_dir_and_skills(tmp_path: Path) ->
     context = build_bridge_context(bot, launch)
 
     assert "executionMode: host" in context
+    assert "workspaceMode: team" in context
     assert "PROJECT_DIR:" in context
+    assert "WORKDIR_DIR:" in context
     assert "CWD_DIR:" in context
     assert "SOURCE_DIR:" in context
     assert "WORKSPACE_SKILL_DIR:" in context
@@ -79,7 +81,7 @@ def test_build_bridge_context_mentions_project_dir_and_skills(tmp_path: Path) ->
     assert "localSendMessageCommand:" in context
     assert "localScheduleMessageCommand:" in context
     assert "allowedFileSendRoots:" in context
-    assert "Run in PROJECT_DIR." in context
+    assert "Run in CWD_DIR." in context
     assert "Use localSendFileCommand for file replies." in context
 
 
@@ -127,7 +129,37 @@ def test_build_runner_invocation_uses_launch_cwd_and_env(tmp_path: Path) -> None
 
     assert invocation.cwd == launch.cwd
     assert invocation.env["WECOM_BRIDGE_PROJECT_DIR"] == str(launch.cwd)
+    assert invocation.env["WECOM_BRIDGE_WORKSPACE_MODE"] == "team"
     assert invocation.prompt == prompt
+
+
+def test_build_runner_invocation_uses_source_dir_for_personal_workspace_mode(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="claude",
+        source_dir=source_dir,
+        runtime_root=runtime_root,
+        chatfile_root=chatfile_root,
+        agent_backend="claude",
+    )
+    launch = prepare_session_run(bot, "single:alice")
+
+    invocation = build_runner_invocation(
+        launch,
+        prompt="hello",
+        output_file=tmp_path / "out.jsonl",
+        argv_override=(sys.executable, "-c", "print('ok')"),
+    )
+
+    assert launch.cwd == source_dir.resolve()
+    assert invocation.cwd == source_dir.resolve()
+    assert invocation.env["WECOM_BRIDGE_PROJECT_DIR"] == str(source_dir.resolve())
+    assert invocation.env["WECOM_BRIDGE_WORKDIR_DIR"] == str(source_dir.resolve())
+    assert invocation.env["WECOM_BRIDGE_WORKSPACE_MODE"] == "personal"
 
 
 def test_build_runner_invocation_default_codex_argv_reads_prompt_from_stdin(tmp_path: Path) -> None:
@@ -318,7 +350,6 @@ def test_run_codex_session_cli_dry_run_outputs_launch_payload(tmp_path: Path) ->
     chatfile_root = tmp_path / "chatfiles"
     output_file = tmp_path / "out.jsonl"
     source_dir.mkdir()
-    workspace_skill_dir = runtime_root / "workspaces" / "users" / "alice" / "src_6f8d00c7fc11" / "project" / ".codex" / "skills" # placeholder not used
     script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
 
     result = subprocess.run(
@@ -350,6 +381,6 @@ def test_run_codex_session_cli_dry_run_outputs_launch_payload(tmp_path: Path) ->
     )
 
     payload = json.loads(result.stdout)
-    assert payload["cwd"].endswith("/project")
+    assert payload["cwd"].endswith("/workfile")
     assert payload["workspaceId"].startswith("user:")
     assert "prompt" in payload

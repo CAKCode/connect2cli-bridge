@@ -14,10 +14,17 @@ def main() -> int:
     parser.add_argument("--runtime-root", required=True)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--chat-key", required=True)
+    parser.add_argument("--workspace-mode", choices=("team", "personal"), default="team")
     parser.add_argument("--ensure-dirs", action="store_true")
     args = parser.parse_args()
 
-    workspace = build_workspace_ref(args.runtime_root, args.source_dir, args.chat_key)
+    workspace = build_workspace_ref(
+        args.runtime_root,
+        "default",
+        args.source_dir,
+        args.chat_key,
+        workspace_mode=args.workspace_mode,
+    )
     if args.ensure_dirs:
         ensure_workspace_dirs(workspace)
     skill_space = resolve_skill_space(DEFAULT_GLOBAL_SKILL_DIR, workspace.skill_dir)
@@ -30,6 +37,7 @@ def main() -> int:
         "sourceDir": str(workspace.source_dir),
         "rootDir": str(workspace.root_dir),
         "projectDir": str(workspace.project_dir),
+        "cwdDir": str(workspace.cwd_dir),
         "skillDir": str(workspace.skill_dir),
         "stateDir": str(workspace.state_dir),
         "effectiveSkills": {

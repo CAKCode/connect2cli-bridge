@@ -687,6 +687,7 @@ async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_
         agent_run_as_group="nogroup",
         agent_runtime_root=(tmp_path / "claude-runtime").resolve(),
     )
+    launch = execution_module.prepare_session_run(bot, "single:alice")
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     captured = {}
 
@@ -713,6 +714,8 @@ async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_
     assert invocation.env["CLAUDE_CONFIG_DIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
     assert invocation.env["CODEX_HOME"].startswith(str((tmp_path / "claude-runtime").resolve()))
     assert invocation.env["TMPDIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
+    assert invocation.cwd == launch.cwd
+    assert invocation.env["WECOM_BRIDGE_WORKFILE_DIR"] == str(launch.runtime_context.workfile_dir)
 
 
 async def test_stream_text_message_once_falls_back_to_local_history_for_claude_when_resume_session_missing(tmp_path: Path) -> None:
@@ -1855,6 +1858,47 @@ async def test_stream_text_message_once_updates_last_run_at_on_failure(tmp_path:
     assert before is not None and after is not None
     assert after.last_run_at is not None
     assert int(after.last_run_at) >= int(before.updated_at)
+
+
+async def test_bridge_reset_removes_workspace_bridge_chatfile_and_codex_home(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.wecom_protocol import build_text_response_payload
+    from workspace_bridge.runtime import prepare_session_run, session_codex_home_root
+    from workspace_bridge import wecom_runtime as runtime_module
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = FakeWS()
+    launch = prepare_session_run(bot, "single:alice")
+    chatfile_dir = launch.runtime_context.chatfile_dir
+    chatfile_dir.mkdir(parents=True, exist_ok=True)
+    (chatfile_dir / "artifact.txt").write_text("artifact", encoding="utf-8")
+    codex_home = session_codex_home_root(bot.runtime_root) / launch.session.session_id
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "state.txt").write_text("state", encoding="utf-8")
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgtype": "text",
+            "text": {"content": "/bridge-reset"},
+            "from": {"userid": "alice"},
+        },
+    }
+
+    await runtime_module.handle_wecom_payload(config, runtime, runtime.ws, payload, runtime_module._dispatch_message)
+
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+    assert runtime.ws.sent[-1] == build_text_response_payload("req-1", launch.session.session_id, "Session reset.", final=True)
 
 
 async def test_stream_text_message_once_streams_latest_message_during_run(tmp_path: Path) -> None:

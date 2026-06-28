@@ -14,9 +14,10 @@ from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
 from .layout import build_workspace_ref, parse_chat_key
 from .messaging import get_messaging_provider
-from .models import OutboundMessage, TemplateCardUpdateRequest, WeComBotRuntime, WeComTextMessage
+from .models import OutboundMessage, TemplateCardUpdateRequest, WeComBotRuntime
 from .reply_state import cleanup_reply_state
 from .runtime import (
+    cleanup_outdated_session_artifacts,
     cleanup_orphan_session_codex_homes,
     cleanup_stale_session_codex_homes,
     load_reply_url_state,
@@ -289,7 +290,6 @@ async def api_send_message(request) -> web.Response:
             template_card = validate_template_card_payload(template_card, require_interaction_task_id=False)
         except ValueError as exc:
             raise web.HTTPBadRequest(text=str(exc)) from exc
-        card_type = str(template_card.get("card_type") or "").strip()
         feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
         if feedback_id is not None:
             try:
@@ -383,8 +383,21 @@ async def api_list_schedules(request) -> web.Response:
         {
             "scheduleId": item.schedule_id,
             "chatKey": item.chat_key,
-            "sessionId": stable_session_id(bot_id, item.chat_key, request.app[APP_CONFIG_KEY].source_dir),
-            "workspaceId": build_workspace_ref(request.app[APP_CONFIG_KEY].runtime_root, source_dir, item.chat_key).workspace_id,
+            "sessionId": stable_session_id(
+                bot_id,
+                item.chat_key,
+                request.app[APP_CONFIG_KEY].source_dir,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
+                request.app[APP_CONFIG_KEY].workspace_mode,
+            ),
+            "workspaceId": build_workspace_ref(
+                request.app[APP_CONFIG_KEY].runtime_root,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
+                source_dir,
+                item.chat_key,
+                workspace_mode=request.app[APP_CONFIG_KEY].workspace_mode,
+                agent_backend=request.app[APP_CONFIG_KEY].agent_backend,
+            ).workspace_id,
             "message": item.message,
             "cron": item.cron,
             "timezone": item.timezone_name,
@@ -449,11 +462,16 @@ async def api_create_schedule(request) -> web.Response:
                 request.app[APP_CONFIG_KEY].bot_id,
                 definition.chat_key,
                 request.app[APP_CONFIG_KEY].source_dir,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
+                request.app[APP_CONFIG_KEY].workspace_mode,
             ),
             "workspaceId": build_workspace_ref(
                 request.app[APP_CONFIG_KEY].runtime_root,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
                 request.app[APP_CONFIG_KEY].source_dir,
                 definition.chat_key,
+                workspace_mode=request.app[APP_CONFIG_KEY].workspace_mode,
+                agent_backend=request.app[APP_CONFIG_KEY].agent_backend,
             ).workspace_id,
             "message": definition.message,
             "cron": definition.cron,
@@ -484,11 +502,16 @@ async def api_get_schedule(request) -> web.Response:
                 request.app[APP_CONFIG_KEY].bot_id,
                 definition.chat_key,
                 request.app[APP_CONFIG_KEY].source_dir,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
+                request.app[APP_CONFIG_KEY].workspace_mode,
             ),
             "workspaceId": build_workspace_ref(
                 request.app[APP_CONFIG_KEY].runtime_root,
+                request.app[APP_CONFIG_KEY].workspace_namespace,
                 request.app[APP_CONFIG_KEY].source_dir,
                 definition.chat_key,
+                workspace_mode=request.app[APP_CONFIG_KEY].workspace_mode,
+                agent_backend=request.app[APP_CONFIG_KEY].agent_backend,
             ).workspace_id,
             "message": definition.message,
             "cron": definition.cron,
@@ -609,6 +632,7 @@ def create_app(config: AppConfig) -> web.Application:
     app.router.add_delete("/api/schedules/{schedule_id}", api_delete_schedule)
 
     async def on_startup(app_: web.Application) -> None:
+        cleanup_outdated_session_artifacts(bot)
         cleanup_orphan_session_codex_homes(config.runtime_root)
         cleanup_stale_session_codex_homes(
             config.runtime_root,

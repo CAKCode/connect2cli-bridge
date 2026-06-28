@@ -1,4 +1,4 @@
-# WeCom Codex Bridge Python
+# WeCom Workspace Bridge（codex & claude code）
 
 Pure Python bridge service between WeCom bots and the `codex` CLI.
 
@@ -77,6 +77,7 @@ WECOM_BOT_NAME=default
 WECOM_BOT_ID=YOUR_BOT_ID
 WECOM_BOT_SECRET_FILE=/run/secrets/wecom_default_secret
 WECOM_BOT_WORK_DIR=/home/jenkins
+WECOM_BOT_WORKSPACE_MODE=team
 WECOM_BOT_GROUP_SESSION_MODE=per-user
 WECOM_BOT_ENABLED=true
 ```
@@ -87,6 +88,10 @@ Notes:
 - if neither is configured, `/api/*` is limited to localhost
 - plaintext bot `secret` is no longer supported; use `secretFile`
 - `WECOM_BOT_WORK_DIR` is the bot's shared project root, not the exact Codex `cwd`
+- `WECOM_BOT_WORKSPACE_MODE` supports `team` and `personal`
+  - `team`: default for new `codex` bots; user chats use `workfile`, room-shared chats use `roomfile`
+  - `personal`: default for new `claude` bots; all chats run directly in `workDir`
+- If an env value contains spaces, such as `WECOM_BOT_AGENT_COMMAND=claude --model sonnet`, quote it in `.env`
 
 ### 4. Start the service
 
@@ -112,21 +117,22 @@ curl -s http://127.0.0.1:9299/
 
 Important runtime paths:
 
-- `workspace/<bot>/users/<user>/workfile`
+- `workspace/<workspace-namespace>/users/<user>/workfile`
   long-lived per-user workspace
-- `workspace/<bot>/rooms/<room>/roomfile`
+- `workspace/<workspace-namespace>/rooms/<room>/roomfile`
   shared room workspace
-- `workspace/<bot>/sessions/<chat-key>/chatfile`
+- `chatfile/<session-id>/`
   session-level file exchange area
 - `~/.codex/skills/<skill>/SKILL.md`
   user-global skills
 - `<workfile or roomfile>/.codex/skills/<skill>/SKILL.md`
   workspace-local skills
 
-When the bridge starts Codex:
+When the bridge starts an agent:
 
-- default `cwd` is `workfile`
-- room-shared sessions use `roomfile`
+- `workspaceMode=team` uses `workfile` as the default `cwd`
+- room-shared `workspaceMode=team` sessions use `roomfile`
+- `workspaceMode=personal` runs every session directly in `workDir`
 - both `sandboxed` and `host` keep this `cwd` selection and do not force a fallback to `workDir`
 - `TMPDIR`, `TMP`, and `TEMP` point to the current session `chatfile`
 - auth state still comes from the runtime user's `CODEX_HOME`
@@ -187,6 +193,7 @@ Example:
     "botId": "BOT_A",
     "secretFile": "/run/secrets/bot_a.secret",
     "workDir": "/home/jenkins",
+    "workspaceMode": "team",
     "groupSessionMode": "per-user",
     "enabled": true
   }
@@ -225,9 +232,12 @@ curl -s -X POST http://127.0.0.1:9299/api/bots \
     "botId": "YOUR_BOT_ID",
     "secretFile": "/run/secrets/wecom_bot_secret",
     "workDir": "/home/jenkins",
+    "workspaceMode": "team",
     "groupSessionMode": "per-user"
   }'
 ```
+
+If the submitted `botId` already exists, `POST /api/bots` updates that bot in place and preserves any fields you omit from the request body.
 
 ## Local Commands
 

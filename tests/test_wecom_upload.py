@@ -35,6 +35,7 @@ def make_bot_runtime(tmp_path: Path) -> WeComBotRuntime:
         bot_secret="secret-value",
         source=SourceConfig(source_id="src-1", source_dir=source_dir),
         runtime_root=tmp_path / "runtime",
+        workspace_namespace="bot-1",
         chatfile_root=tmp_path / "chatfiles",
         codex_exec_mode="sandboxed",
     )

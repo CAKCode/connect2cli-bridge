@@ -3,11 +3,9 @@
 import asyncio
 import base64
 import fcntl
-import grp
 import hashlib
 import json
 import os
-import pwd
 import random
 import re
 import shutil
@@ -193,6 +191,7 @@ SCHEDULE_DEFINITION_POLL_MS = int(os.environ.get("SCHEDULE_DEFINITION_POLL_MS", 
 SCHEDULE_DEFINITION_LEASE_TTL_MS = max(1000, int(os.environ.get("SCHEDULE_DEFINITION_LEASE_TTL_MS", 30000)))
 VALID_CODEX_EXEC_MODES = {"sandboxed", "host"}
 VALID_GROUP_SESSION_MODES = {"shared", "per-user"}
+VALID_WORKSPACE_MODES = {"personal", "team"}
 VALID_AGENT_BACKENDS = {"codex", "claude"}
 
 EXTRA_FILE_ROOTS = [
@@ -1368,6 +1367,27 @@ def workspace_slug(value: Any, fallback: str = "unknown") -> str:
     return slug or fallback
 
 
+def workspace_namespace_for_bot(config: dict[str, Any]) -> str:
+    return workspace_slug(config.get("workspaceNamespace") or config.get("workspace_namespace") or config.get("id"))
+
+
+def workspace_namespace_for_bot_id(bot_id: str) -> str:
+    for bot in BOTS.values():
+        if str(bot.config.get("id") or "").strip() == str(bot_id or "").strip():
+            return workspace_namespace_for_bot(bot.config)
+    persisted = next(
+        (
+            item
+            for item in read_persisted_bot_configs()
+            if str(item.get("id") or "").strip() == str(bot_id or "").strip()
+        ),
+        None,
+    )
+    if persisted:
+        return workspace_namespace_for_bot(persisted)
+    return workspace_slug(bot_id)
+
+
 def chat_key_to_user_id(key: str) -> Optional[str]:
     text = str(key or "").strip()
     if text.startswith("single:"):
@@ -1402,12 +1422,29 @@ def chat_key_to_workspace_slug(key: str) -> str:
     return workspace_slug(text)
 
 
-def get_bot_workspace_dir(bot_id: str) -> Path:
-    return WORKSPACE_ROOT / workspace_slug(bot_id)
+def get_workspace_namespace_dir(namespace: str) -> Path:
+    return WORKSPACE_ROOT / workspace_slug(namespace)
 
 
-def get_exact_session_workspace_dir(bot_id: str, key: str) -> Path:
-    return get_bot_workspace_dir(bot_id) / "sessions" / chat_key_to_workspace_slug(key)
+def get_chatfile_dir(*args: str) -> Path:
+    if len(args) == 1:
+        return CHATFILE_ROOT / workspace_slug(args[0])
+    if len(args) == 2:
+        bot_id, key = args
+        record = read_session_record_by_key(str(bot_id), str(key))
+        if record is None:
+            bot = BOTS.get(str(bot_id))
+            if bot is not None:
+                record = get_or_create_session_record(bot, str(key))
+        if record is None:
+            raise BridgeError(404, f"session not found for chat key: {key}")
+        return CHATFILE_ROOT / workspace_slug(str(record["sessionId"]))
+    raise TypeError("get_chatfile_dir expects session_id or (bot_id, chat_key)")
+
+
+def get_chatfile_dir_for_key(bot: BotState, key: str) -> Path:
+    record = get_or_create_session_record(bot, key)
+    return get_chatfile_dir(str(record["sessionId"]))
 
 
 def build_chat_key_with_user_id(key: str, user_id: str) -> str:
@@ -1424,79 +1461,110 @@ def build_chat_key_with_user_id(key: str, user_id: str) -> str:
     return text
 
 
-def alias_chat_key(bot_id: str, key: str) -> Optional[str]:
+def alias_chat_key(alias_scope: str, key: str) -> Optional[str]:
     raw_user_id = chat_key_to_user_id(key)
     if not raw_user_id:
         return None
-    alias = read_user_alias(bot_id, raw_user_id)
+    alias = read_user_alias(alias_scope, raw_user_id)
     if not alias or alias == raw_user_id:
         return None
     return build_chat_key_with_user_id(key, alias)
 
 
-def candidate_chat_keys_for_lookup(bot_id: str, key: str) -> list[str]:
+def candidate_chat_keys_for_lookup(alias_scope: str, key: str) -> list[str]:
     candidates = [key]
-    alias_key = alias_chat_key(bot_id, key)
+    alias_key = alias_chat_key(alias_scope, key)
     if alias_key and alias_key not in candidates:
         candidates.append(alias_key)
     return candidates
 
 
-def resolve_session_storage_key(bot_id: str, key: str) -> str:
-    exact_dir = get_exact_session_workspace_dir(bot_id, key)
-    if exact_dir.exists() or get_registry_key_file(bot_id, key).exists():
-        return key
-    alias_key = alias_chat_key(bot_id, key)
-    if alias_key:
-        alias_dir = get_exact_session_workspace_dir(bot_id, alias_key)
-        if alias_dir.exists() or get_registry_key_file(bot_id, alias_key).exists():
-            return alias_key
-    return key
+def get_user_workspace_dir(namespace: str, user_id: str) -> Path:
+    return get_workspace_namespace_dir(namespace) / "users" / workspace_slug(user_id)
 
 
-def get_session_workspace_dir(bot_id: str, key: str) -> Path:
-    return get_exact_session_workspace_dir(bot_id, resolve_session_storage_key(bot_id, key))
+def get_workfile_dir(namespace: str, user_id: str) -> Path:
+    return get_user_workspace_dir(namespace, user_id) / "workfile"
 
 
-def get_chatfile_dir(bot_id: str, key: str) -> Path:
-    return get_session_workspace_dir(bot_id, key) / "chatfile"
+def get_room_workspace_dir(namespace: str, room_id: str) -> Path:
+    return get_workspace_namespace_dir(namespace) / "rooms" / workspace_slug(room_id)
 
 
-def get_user_workspace_dir(bot_id: str, user_id: str) -> Path:
-    return get_bot_workspace_dir(bot_id) / "users" / workspace_slug(user_id)
+def get_roomfile_dir(namespace: str, room_id: str) -> Path:
+    return get_room_workspace_dir(namespace, room_id) / "roomfile"
 
 
-def get_workfile_dir(bot_id: str, user_id: str) -> Path:
-    return get_user_workspace_dir(bot_id, user_id) / "workfile"
+def get_legacy_bot_workspace_dir(bot_id: str) -> Path:
+    return WORKSPACE_ROOT / workspace_slug(bot_id)
 
 
-def get_room_workspace_dir(bot_id: str, room_id: str) -> Path:
-    return get_bot_workspace_dir(bot_id) / "rooms" / workspace_slug(room_id)
+def get_legacy_user_workspace_dir(bot_id: str, user_id: str) -> Path:
+    return get_legacy_bot_workspace_dir(bot_id) / "users" / workspace_slug(user_id)
 
 
-def get_roomfile_dir(bot_id: str, room_id: str) -> Path:
-    return get_room_workspace_dir(bot_id, room_id) / "roomfile"
+def get_legacy_workfile_dir(bot_id: str, user_id: str) -> Path:
+    return get_legacy_user_workspace_dir(bot_id, user_id) / "workfile"
 
 
-def get_session_workspace_paths(bot: BotState, key: str) -> dict[str, Optional[Path]]:
-    bot_id = str(bot.config["id"])
-    user_id = resolve_workspace_user_id(bot_id, chat_key_to_user_id(key))
+def get_legacy_room_workspace_dir(bot_id: str, room_id: str) -> Path:
+    return get_legacy_bot_workspace_dir(bot_id) / "rooms" / workspace_slug(room_id)
+
+
+def get_legacy_roomfile_dir(bot_id: str, room_id: str) -> Path:
+    return get_legacy_room_workspace_dir(bot_id, room_id) / "roomfile"
+
+
+def get_session_workspace_paths(bot: BotState, key: str, *, session_id: Optional[str] = None) -> dict[str, Optional[Path]]:
+    namespace = workspace_namespace_for_bot(bot.config)
+    user_id = resolve_workspace_user_id(namespace, chat_key_to_user_id(key))
     room_id = chat_key_to_room_id(key)
     work_dir = Path(str(bot.config.get("workDir") or DEFAULT_WORK_DIR)).expanduser().resolve()
+    resolved_session_id = str(session_id or "").strip()
+    if not resolved_session_id:
+        record = read_session_record_by_key(str(bot.config["id"]), key) or get_or_create_session_record(bot, key)
+        resolved_session_id = str((record or {}).get("sessionId") or "").strip()
     return {
         "workDir": work_dir,
-        "chatfile": get_chatfile_dir(bot_id, key),
-        "workfile": get_workfile_dir(bot_id, user_id) if user_id else None,
-        "roomfile": get_roomfile_dir(bot_id, room_id) if room_id else None,
+        "chatfile": get_chatfile_dir(resolved_session_id) if resolved_session_id else None,
+        "workfile": get_workfile_dir(namespace, user_id) if user_id else None,
+        "roomfile": get_roomfile_dir(namespace, room_id) if room_id else None,
     }
 
 
-def get_session_runtime_cwd(bot: BotState, key: str) -> Path:
-    paths = get_session_workspace_paths(bot, key)
-    if paths["workfile"] is not None:
-        return paths["workfile"].resolve()
-    if paths["roomfile"] is not None:
-        return paths["roomfile"].resolve()
+def default_workspace_mode_for_backend(backend: str) -> str:
+    return "personal" if normalize_agent_backend(backend) == "claude" else "team"
+
+
+def normalize_workspace_mode(value: Any, *, default_backend: str = "codex", fallback_for_missing: Optional[str] = None) -> str:
+    mode = str(value or "").strip().lower().replace("_", "-")
+    if not mode:
+        mode = fallback_for_missing or default_workspace_mode_for_backend(default_backend)
+    aliases = {
+        "workspace": "team",
+        "workfile": "team",
+        "project": "personal",
+        "workdir": "personal",
+        "work-dir": "personal",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in VALID_WORKSPACE_MODES:
+        raise BridgeError(400, f"workspaceMode must be one of: {', '.join(sorted(VALID_WORKSPACE_MODES))}")
+    return mode
+
+
+def bot_workspace_mode(config: dict[str, Any]) -> str:
+    raw = config.get("workspaceMode") or config.get("workspace_mode")
+    return normalize_workspace_mode(raw, default_backend=bot_agent_backend(config), fallback_for_missing="team")
+
+
+def get_session_runtime_cwd(bot: BotState, key: str, *, session_id: Optional[str] = None) -> Path:
+    paths = get_session_workspace_paths(bot, key, session_id=session_id)
+    if bot_workspace_mode(bot.config) == "team":
+        if paths["workfile"] is not None:
+            return paths["workfile"].resolve()
+        if paths["roomfile"] is not None:
+            return paths["roomfile"].resolve()
     return paths["workDir"].resolve()
 
 
@@ -1645,24 +1713,77 @@ def bootstrap_workspace_from_workdir(source_root: Path, target_root: Optional[Pa
     )
 
 
-def ensure_session_workspace_dirs(bot: BotState, key: str) -> dict[str, Optional[Path]]:
-    paths = get_session_workspace_paths(bot, key)
+def ensure_session_workspace_dirs(bot: BotState, key: str, *, session_id: Optional[str] = None) -> dict[str, Optional[Path]]:
+    paths = get_session_workspace_paths(bot, key, session_id=session_id)
     for path in (paths["chatfile"], paths["workfile"], paths["roomfile"]):
         if path is not None:
             ensure_dir(path)
-    for path in (paths["workfile"], paths["roomfile"]):
-        bootstrap_workspace_from_workdir(paths["workDir"], path)
-    ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key)))
+    if bot_workspace_mode(bot.config) == "team":
+        migrate_legacy_workspace_paths(bot, key, paths)
+        for path in (paths["workfile"], paths["roomfile"]):
+            bootstrap_workspace_from_workdir(paths["workDir"], path)
+    ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key, session_id=session_id)))
     return paths
 
 
-def ensure_session_workspace_dirs_light(bot: BotState, key: str) -> dict[str, Optional[Path]]:
-    paths = get_session_workspace_paths(bot, key)
+def ensure_session_workspace_dirs_light(bot: BotState, key: str, *, session_id: Optional[str] = None) -> dict[str, Optional[Path]]:
+    paths = get_session_workspace_paths(bot, key, session_id=session_id)
     for path in (paths["chatfile"], paths["workfile"], paths["roomfile"]):
         if path is not None:
             ensure_dir(path)
-    ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key)))
+    if bot_workspace_mode(bot.config) == "team":
+        migrate_legacy_workspace_paths(bot, key, paths)
+    ensure_dir(get_workspace_codex_skills_dir(get_session_runtime_cwd(bot, key, session_id=session_id)))
     return paths
+
+
+def ensure_session_workspace_dirs_light_for_session(bot: BotState, key: str, session_id: str) -> dict[str, Optional[Path]]:
+    try:
+        paths = ensure_session_workspace_dirs_light(bot, key, session_id=session_id)
+    except TypeError as exc:
+        if "session_id" not in str(exc):
+            raise
+        paths = ensure_session_workspace_dirs_light(bot, key)
+    if paths.get("chatfile") is None:
+        chatfile_dir = get_chatfile_dir(session_id)
+        ensure_dir(chatfile_dir)
+        paths = {**paths, "chatfile": chatfile_dir}
+    return paths
+
+
+def workspace_migration_marker_file(target_root: Path) -> Path:
+    return target_root / ".workspace-layout-migration.json"
+
+
+def migrate_legacy_workspace_dir(source_root: Optional[Path], target_root: Optional[Path]) -> None:
+    if source_root is None or target_root is None:
+        return
+    if not source_root.exists() or not source_root.is_dir():
+        return
+    marker_file = workspace_migration_marker_file(target_root)
+    if marker_file.exists():
+        return
+    ensure_dir(target_root)
+    copy_missing_tree_contents(source_root, target_root)
+    write_json_atomic(
+        marker_file,
+        {
+            "source": str(source_root.resolve()),
+            "target": str(target_root.resolve()),
+            "migratedAt": now_ms(),
+        },
+    )
+
+
+def migrate_legacy_workspace_paths(bot: BotState, key: str, paths: dict[str, Optional[Path]]) -> None:
+    bot_id = str(bot.config["id"])
+    user_id = chat_key_to_user_id(key)
+    room_id = chat_key_to_room_id(key)
+    if paths.get("workfile") is not None and user_id:
+        for candidate_user_id in candidate_user_aliases(workspace_namespace_for_bot(bot.config), user_id):
+            migrate_legacy_workspace_dir(get_legacy_workfile_dir(bot_id, candidate_user_id), paths["workfile"])
+    if paths.get("roomfile") is not None and room_id:
+        migrate_legacy_workspace_dir(get_legacy_roomfile_dir(bot_id, room_id), paths["roomfile"])
 
 
 def get_workspace_codex_skills_dir(workspace_dir: Path) -> Path:
@@ -1677,32 +1798,32 @@ def get_session_codex_home_root(session_id: str) -> Path:
     return (get_bridge_codex_home_root() / "sessions" / workspace_slug(session_id)).resolve()
 
 
-def get_user_alias_dir(bot_id: str) -> Path:
-    return USER_ALIAS_ROOT / workspace_slug(bot_id)
+def get_user_alias_dir(alias_scope: str) -> Path:
+    return USER_ALIAS_ROOT / workspace_slug(alias_scope)
 
 
-def get_user_alias_file(bot_id: str, raw_user_id: str) -> Path:
-    return get_user_alias_dir(bot_id) / f"{quote(raw_user_id, safe='')}.json"
+def get_user_alias_file(alias_scope: str, raw_user_id: str) -> Path:
+    return get_user_alias_dir(alias_scope) / f"{quote(raw_user_id, safe='')}.json"
 
 
-def read_user_alias(bot_id: str, raw_user_id: Optional[str]) -> Optional[str]:
+def read_user_alias(alias_scope: str, raw_user_id: Optional[str]) -> Optional[str]:
     text = str(raw_user_id or "").strip()
     if not text:
         return None
-    payload = read_json_file(get_user_alias_file(bot_id, text), None)
+    payload = read_json_file(get_user_alias_file(alias_scope, text), None)
     if not isinstance(payload, dict):
         return None
     alias = str(payload.get("alias") or "").strip()
     return alias or None
 
 
-def write_user_alias(bot_id: str, raw_user_id: str, alias: str) -> None:
+def write_user_alias(alias_scope: str, raw_user_id: str, alias: str) -> None:
     normalized_raw = str(raw_user_id or "").strip()
     normalized_alias = str(alias or "").strip()
     if not normalized_raw or not normalized_alias:
         return
     write_json_atomic(
-        get_user_alias_file(bot_id, normalized_raw),
+        get_user_alias_file(alias_scope, normalized_raw),
         {"rawUserId": normalized_raw, "alias": normalized_alias, "updatedAt": now_ms()},
     )
 
@@ -1716,19 +1837,19 @@ def should_prefer_user_alias(value: str) -> bool:
     return False
 
 
-def resolve_workspace_user_id(bot_id: str, raw_user_id: Optional[str]) -> Optional[str]:
+def resolve_workspace_user_id(alias_scope: str, raw_user_id: Optional[str]) -> Optional[str]:
     text = str(raw_user_id or "").strip()
     if not text:
         return None
-    alias = read_user_alias(bot_id, text)
+    alias = read_user_alias(alias_scope, text)
     if alias:
         return alias
     return text
 
 
-def candidate_user_aliases(bot_id: str, raw_user_id: str) -> list[str]:
+def candidate_user_aliases(alias_scope: str, raw_user_id: str) -> list[str]:
     candidates: list[str] = []
-    historical = resolve_workspace_user_id(bot_id, raw_user_id)
+    historical = resolve_workspace_user_id(alias_scope, raw_user_id)
     if historical:
         candidates.append(historical)
     text = str(raw_user_id or "").strip()
@@ -1737,16 +1858,16 @@ def candidate_user_aliases(bot_id: str, raw_user_id: str) -> list[str]:
     return candidates
 
 
-def remember_workspace_user_alias(bot_id: str, raw_user_id: Optional[str]) -> Optional[str]:
+def remember_workspace_user_alias(alias_scope: str, raw_user_id: Optional[str]) -> Optional[str]:
     text = str(raw_user_id or "").strip()
     if not text:
         return None
-    alias = read_user_alias(bot_id, text)
+    alias = read_user_alias(alias_scope, text)
     if alias:
         return alias
     if should_prefer_user_alias(text):
         return text
-    write_user_alias(bot_id, text, text)
+    write_user_alias(alias_scope, text, text)
     return text
 
 
@@ -1902,7 +2023,8 @@ def build_session_key_entry(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_session_record_by_key_unlocked(bot_id: str, key: str) -> Optional[dict[str, Any]]:
-    for candidate_key in candidate_chat_keys_for_lookup(bot_id, key):
+    alias_scope = workspace_namespace_for_bot_id(bot_id)
+    for candidate_key in candidate_chat_keys_for_lookup(alias_scope, key):
         key_entry = read_session_key_entry(bot_id, candidate_key)
         if not key_entry:
             continue
@@ -1921,13 +2043,14 @@ def repair_session_record_by_key_unlocked(bot_id: str, key: str) -> Optional[dic
         return existing
 
     key_file = get_registry_key_file(bot_id, key)
-    for candidate_key in candidate_chat_keys_for_lookup(bot_id, key):
+    alias_scope = workspace_namespace_for_bot_id(bot_id)
+    for candidate_key in candidate_chat_keys_for_lookup(alias_scope, key):
         existing = find_session_record_by_bot_and_key(bot_id, candidate_key)
         if existing:
             write_json_atomic(key_file, build_session_key_entry(existing))
             return existing
 
-    for candidate_key in candidate_chat_keys_for_lookup(bot_id, key):
+    for candidate_key in candidate_chat_keys_for_lookup(alias_scope, key):
         candidate_key_file = get_registry_key_file(bot_id, candidate_key)
         raw_key_entry = read_json_file(candidate_key_file, None)
         stale_session_id = str((raw_key_entry or {}).get("sessionId") or "").strip() if isinstance(raw_key_entry, dict) else ""
@@ -2322,7 +2445,7 @@ def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
 def chat_key_for_bot(bot: BotState, message: dict[str, Any]) -> str:
     body = message.get("body") or {}
     raw_sender_user_id = message_sender_userid(message)
-    remember_workspace_user_alias(str(bot.config["id"]), raw_sender_user_id)
+    remember_workspace_user_alias(workspace_namespace_for_bot(bot.config), raw_sender_user_id)
     if body.get("chattype") == "group" and body.get("chatid"):
         if str(bot.config.get("groupSessionMode") or "per-user") == "per-user":
             return f"group-user:{body['chatid']}:{raw_sender_user_id}"
@@ -2351,10 +2474,10 @@ def validate_chat_key(key: Any, *, label: str = "chatKey") -> str:
 
 def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
     chat_type = "group" if chat_key_is_group(key) else "single"
-    workspace_paths = ensure_session_workspace_dirs_light(bot, key)
-    runtime_cwd = get_session_runtime_cwd(bot, key)
+    workspace_paths = ensure_session_workspace_dirs_light_for_session(bot, key, sess.session_id)
+    runtime_cwd = get_session_runtime_cwd(bot, key, session_id=sess.session_id)
     workspace_codex_skills_dir = get_workspace_codex_skills_dir(runtime_cwd)
-    allowed_file_roots = ", ".join(str(root) for root in get_allowed_file_roots(bot, key))
+    allowed_file_roots = ", ".join(str(root) for root in get_allowed_file_roots(bot, key, session_id=sess.session_id))
     user_id = chat_key_to_user_id(key) or "-"
     room_id = chat_key_to_room_id(key) or "-"
     agent_backend = bot_agent_backend(bot.config)
@@ -2377,8 +2500,10 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             f"sessionId: {sess.session_id}",
             f"agentBackend: {agent_backend}",
             f"agentCommand: {agent_command}",
+            f"workspaceMode: {bot_workspace_mode(bot.config)}",
             f"executionMode: {CODEX_EXEC_MODE}",
             f"CWD_DIR: {runtime_cwd}",
+            f"WORKDIR_DIR: {workspace_paths['workDir']}",
             f"CHATFILE_DIR: {workspace_paths['chatfile']}",
             f"WORKFILE_DIR: {workspace_paths['workfile'] or '-'}",
             f"ROOMFILE_DIR: {workspace_paths['roomfile'] or '-'}",
@@ -3370,7 +3495,7 @@ async def download_incoming_media(
         if len(data) > inbound_limit:
             raise BridgeError(413, f"{kind} too large after decrypt: {len(data)} bytes")
 
-    target_dir = ensure_session_workspace_dirs_light(bot, key)["chatfile"]
+    target_dir = ensure_session_workspace_dirs_light_for_session(bot, key, sess.session_id)["chatfile"]
     assert target_dir is not None
     ext = extension_from_url(url) or extension_from_content_type(response.get("contentType", ""), ".jpg" if kind == "image" else ".bin")
     file_name = sanitize_file_name(
@@ -3412,7 +3537,7 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
         record = get_or_create_session_record(bot, key)
         sess = SessionState(
             session_id=record["sessionId"],
-            work_dir=str(get_session_runtime_cwd(bot, key)),
+            work_dir=str(get_session_runtime_cwd(bot, key, session_id=record["sessionId"])),
             lock_file=Path(record["lockFile"]),
             thread_id=str(record.get("threadId") or "").strip() or None,
         )
@@ -3420,15 +3545,15 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
         add_log(bot, f"[{key}] new session")
         add_event_log(bot, "session.created", chatKey=key, sessionId=sess.session_id)
     sess = bot.sessions[key]
-    sess.work_dir = str(get_session_runtime_cwd(bot, key))
+    sess.work_dir = str(get_session_runtime_cwd(bot, key, session_id=sess.session_id))
     sess.last_active = time.time()
     return sess
 
 
 async def get_or_create_session_ready(bot: BotState, key: str) -> SessionState:
     sess = get_or_create_session(bot, key)
-    await run_blocking(ensure_session_workspace_dirs, bot, key)
-    sess.work_dir = str(get_session_runtime_cwd(bot, key))
+    await run_blocking(ensure_session_workspace_dirs, bot, key, session_id=sess.session_id)
+    sess.work_dir = str(get_session_runtime_cwd(bot, key, session_id=sess.session_id))
     return sess
 
 
@@ -3621,6 +3746,7 @@ async def run_codex(
                         "WECOM_BRIDGE_SESSION_ID": sess.session_id,
                         "WECOM_BRIDGE_CHAT_KEY": key,
                         "WECOM_BRIDGE_AGENT_BACKEND": backend,
+                        "WECOM_BRIDGE_WORKSPACE_MODE": bot_workspace_mode(bot.config),
                         "WECOM_BRIDGE_WORKDIR_DIR": str(workspace_paths["workDir"]),
                         "WECOM_BRIDGE_CWD_DIR": str(sess.work_dir),
                         "WECOM_BRIDGE_WORKSPACE_SKILL_DIR": str(get_workspace_codex_skills_dir(Path(sess.work_dir))),
@@ -3666,7 +3792,6 @@ async def run_codex(
                 run_started_at = time.monotonic()
 
                 async def ticker() -> None:
-                    nonlocal latest_message
                     if not req_id:
                         return
                     next_tick_at = time.monotonic() + STATUS_STREAM_INTERVAL_SEC
@@ -4431,8 +4556,11 @@ def is_path_inside(file_path: Path, root_path: Path) -> bool:
         return False
 
 
-def get_allowed_file_roots(bot: BotState, key: str) -> list[Path]:
-    workspace_paths = ensure_session_workspace_dirs_light(bot, key)
+def get_allowed_file_roots(bot: BotState, key: str, *, session_id: Optional[str] = None) -> list[Path]:
+    if session_id:
+        workspace_paths = ensure_session_workspace_dirs_light_for_session(bot, key, session_id)
+    else:
+        workspace_paths = ensure_session_workspace_dirs_light(bot, key)
     roots = [workspace_paths["chatfile"].resolve(), *EXTRA_FILE_ROOTS]
     deduped = []
     for root in roots:
@@ -4441,7 +4569,7 @@ def get_allowed_file_roots(bot: BotState, key: str) -> list[Path]:
     return deduped
 
 
-def validate_file_for_upload(bot: BotState, key: str, file_path: str) -> Path:
+def validate_file_for_upload(bot: BotState, key: str, file_path: str, *, session_id: Optional[str] = None) -> Path:
     resolved = Path(file_path).expanduser().resolve()
     if not resolved.exists():
         raise BridgeError(404, f"file not found: {resolved}")
@@ -4450,7 +4578,7 @@ def validate_file_for_upload(bot: BotState, key: str, file_path: str) -> Path:
     size = resolved.stat().st_size
     if size > MAX_UPLOAD_SIZE:
         raise BridgeError(413, f"file too large: {size} bytes (max {MAX_UPLOAD_SIZE})")
-    allowed_roots = get_allowed_file_roots(bot, key)
+    allowed_roots = get_allowed_file_roots(bot, key, session_id=session_id)
     if not any(is_path_inside(resolved, root) for root in allowed_roots):
         allowed = ", ".join(str(root) for root in allowed_roots)
         raise BridgeError(403, f"filePath is outside allowed roots: {allowed}")
@@ -4532,7 +4660,13 @@ def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path
                 bot = require_unique_bot_for_chat_key(validated_chat_key, bot_name)
             if not bot.ws or bot.ws.closed:
                 raise BridgeError(503, "bot not connected")
-            resolved_file = validate_file_for_upload(bot, validated_chat_key, file_path)
+            existing = read_session_record_by_key(str(bot.config["id"]), validated_chat_key)
+            resolved_file = validate_file_for_upload(
+                bot,
+                validated_chat_key,
+                file_path,
+                session_id=str((existing or {}).get("sessionId") or ""),
+            )
             return bot, validated_chat_key, resolved_file
         except BridgeError as exc:
             last_error = exc
@@ -4551,7 +4685,12 @@ def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path
             resolved_chat_key = record["chatKey"]
             if not bot.ws or bot.ws.closed:
                 raise BridgeError(503, "bot not connected")
-            resolved_file = validate_file_for_upload(bot, resolved_chat_key, file_path)
+            resolved_file = validate_file_for_upload(
+                bot,
+                resolved_chat_key,
+                file_path,
+                session_id=str(record["sessionId"]),
+            )
             return bot, resolved_chat_key, resolved_file
         except BridgeError as exc:
             if last_error is None:
@@ -6635,9 +6774,8 @@ def prepare_claude_bridge_runtime(
         gid=gid,
     )
     wrapped_env = apply_claude_runtime_env(env, layout)
-    cwd = layout["project_dir"]
     argv_prefix = build_setpriv_prefix(uid, gid)
-    return argv_prefix, wrapped_env, cwd
+    return argv_prefix, wrapped_env, Path(sess.work_dir)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -6714,14 +6852,25 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
         raise BridgeError(400, "botId required")
     secret, secret_file = resolve_bot_secret(data, status_code=400, allow_inline_secret=allow_inline_secret)
     agent_backend = normalize_agent_backend(data.get("agentBackend") or data.get("agent_backend") or "codex")
+    workspace_mode = normalize_workspace_mode(
+        data.get("workspaceMode") or data.get("workspace_mode"),
+        default_backend=agent_backend,
+        fallback_for_missing="team" if any(key in data for key in ("createdAt", "created_at", "updatedAt", "updated_at")) else None,
+    )
+    config_id = str(data.get("id") or "").strip() or uid()
     normalized = {
-        "id": data.get("id") or uid(),
+        "id": config_id,
         "name": (str(data.get("name") or "unnamed").strip() or "unnamed"),
         "botId": bot_id,
         "secret": secret,
         "workDir": normalize_work_dir(data.get("workDir")),
+        "workspaceNamespace": str(
+            data.get("workspaceNamespace") or data.get("workspace_namespace") or config_id or ""
+        ).strip()
+        or config_id,
         "welcome": str(data.get("welcome") or ""),
         "groupSessionMode": normalize_group_session_mode(data.get("groupSessionMode") or data.get("group_session_mode")),
+        "workspaceMode": workspace_mode,
         "agentBackend": agent_backend,
         "agentCommand": normalize_agent_command(data.get("agentCommand") or data.get("agent_command")),
         "agentRunAsUser": normalize_optional_run_as(data.get("agentRunAsUser") or data.get("agent_run_as_user")),
@@ -6755,6 +6904,19 @@ def normalize_persisted_bot_config(record: dict[str, Any]) -> dict[str, Any]:
         normalized["updatedAt"] = updated_at
     else:
         normalized.pop("updatedAt", None)
+    workspace_namespace = str(
+        normalized.get("workspaceNamespace") or normalized.get("workspace_namespace") or normalized.get("id") or ""
+    ).strip()
+    if workspace_namespace:
+        normalized["workspaceNamespace"] = workspace_namespace
+    else:
+        normalized.pop("workspaceNamespace", None)
+    workspace_mode = str(normalized.get("workspaceMode") or normalized.get("workspace_mode") or "").strip()
+    normalized["workspaceMode"] = normalize_workspace_mode(
+        workspace_mode,
+        default_backend=normalized.get("agentBackend") or "codex",
+        fallback_for_missing="team",
+    )
     return normalized
 
 
@@ -6803,11 +6965,22 @@ def load_env_bootstrap_bot_configs() -> list[dict[str, Any]]:
             "name": (str(os.environ.get("WECOM_BOT_NAME") or "default").strip() or "default"),
             "botId": bot_id,
             "workDir": str(os.environ.get("WECOM_BOT_WORK_DIR") or DEFAULT_WORK_DIR).strip() or DEFAULT_WORK_DIR,
+            "workspaceNamespace": str(
+                os.environ.get("WECOM_BOT_WORKSPACE_NAMESPACE")
+                or os.environ.get("WECOM_WORKSPACE_NAMESPACE")
+                or explicit_id
+                or default_bot_config_id(bot_id)
+            ).strip()
+            or (explicit_id or default_bot_config_id(bot_id)),
             "welcome": str(os.environ.get("WECOM_BOT_WELCOME") or ""),
             "groupSessionMode": str(os.environ.get("WECOM_BOT_GROUP_SESSION_MODE") or "per-user").strip()
             or "per-user",
             "agentBackend": str(os.environ.get("WECOM_BOT_AGENT_BACKEND") or os.environ.get("AGENT_BACKEND") or "codex").strip()
             or "codex",
+            "workspaceMode": str(
+                os.environ.get("WECOM_BOT_WORKSPACE_MODE") or os.environ.get("WECOM_WORKSPACE_MODE") or ""
+            ).strip()
+            or None,
             "agentCommand": str(os.environ.get("WECOM_BOT_AGENT_COMMAND") or os.environ.get("AGENT_COMMAND") or "").strip() or None,
             "agentRunAsUser": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_USER") or os.environ.get("AGENT_RUN_AS_USER") or "").strip() or None,
             "agentRunAsGroup": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_GROUP") or os.environ.get("AGENT_RUN_AS_GROUP") or "").strip() or None,
@@ -7085,17 +7258,113 @@ def get_authoritative_bot_config(bot_id: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def workspace_namespace_in_use(namespace: str, *, excluding_bot_id: Optional[str] = None) -> bool:
+    target_namespace = workspace_slug(namespace)
+    excluded = str(excluding_bot_id or "").strip()
+    for bot_id, bot in BOTS.items():
+        if excluded and bot_id == excluded:
+            continue
+        if bot_instance_is_stale(bot):
+            continue
+        if workspace_namespace_for_bot(bot.config) == target_namespace:
+            return True
+    for config in read_persisted_bot_configs():
+        config_id = str(config.get("id") or "").strip()
+        if excluded and config_id == excluded:
+            continue
+        if workspace_namespace_for_bot(config) == target_namespace:
+            return True
+    return False
+
+
+def cleanup_workspace_namespace_if_unused(namespace: str, *, excluding_bot_id: Optional[str] = None) -> None:
+    if workspace_namespace_in_use(namespace, excluding_bot_id=excluding_bot_id):
+        return
+    remove_tree_if_exists(get_workspace_namespace_dir(namespace))
+    remove_tree_if_exists(get_user_alias_dir(namespace))
+
+
 def clear_persisted_session_threads(bot_id: str) -> int:
     cleared = 0
     for record in session_records_for_bot(bot_id):
-        if not str(record.get("threadId") or "").strip():
+        if not (
+            str(record.get("threadId") or "").strip()
+            or str(record.get("activeScheduleId") or "").strip()
+            or str(record.get("status") or "") in {"leased", "running"}
+            or record.get("ownerInstance") is not None
+            or record.get("ownerPid") is not None
+            or record.get("leaseExpiresAt") is not None
+        ):
             continue
         update_session_record(
             str(record["sessionId"]),
-            lambda current: {**current, "threadId": None},
+            lambda current: {
+                **current,
+                "threadId": None,
+                "activeScheduleId": None,
+                "status": "idle",
+                "ownerInstance": None,
+                "ownerPid": None,
+                "leaseExpiresAt": None,
+            },
         )
         cleared += 1
     return cleared
+
+
+def invalidate_bot_session_mappings(bot_id: str) -> int:
+    removed = 0
+    for record in session_records_for_bot(bot_id):
+        remove_tree_if_exists(get_chatfile_dir(str(record["sessionId"])))
+        remove_session_codex_home(str(record["sessionId"]))
+        remove_path_if_exists(Path(str(record["lockFile"])))
+        remove_path_if_exists(get_registry_session_file(str(record["sessionId"])))
+        removed += 1
+    key_root = SESSION_REGISTRY_ROOT / "keys" / bot_id
+    if key_root.exists():
+        for key_file in key_root.glob("*.json"):
+            remove_path_if_exists(key_file)
+    return removed
+
+
+def rebuild_schedule_definition_session_bindings(bot: BotState) -> int:
+    updated = 0
+    for definition in list_schedule_definitions():
+        if str(definition.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+            continue
+        chat_key = str(definition.get("chatKey") or "").strip()
+        if not chat_key:
+            continue
+        record = get_or_create_session_record(bot, chat_key)
+        next_session_id = str(record["sessionId"])
+        if str(definition.get("sessionId") or "").strip() == next_session_id:
+            continue
+        write_schedule_definition({**definition, "sessionId": next_session_id})
+        updated += 1
+    return updated
+
+
+def rebuild_scheduled_job_session_bindings(bot: BotState) -> int:
+    updated = 0
+    for root in (SCHEDULE_PENDING_ROOT, SCHEDULE_PROCESSING_ROOT):
+        if not root.exists():
+            continue
+        for job_file in root.glob("*.json"):
+            job = read_json_file(job_file, None)
+            if not isinstance(job, dict):
+                continue
+            if str(job.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+                continue
+            chat_key = str(job.get("chatKey") or "").strip()
+            if not chat_key:
+                continue
+            record = get_or_create_session_record(bot, chat_key)
+            next_session_id = str(record["sessionId"])
+            if str(job.get("sessionId") or "").strip() == next_session_id:
+                continue
+            write_json_atomic(job_file, {**job, "sessionId": next_session_id})
+            updated += 1
+    return updated
 
 
 def invalidate_bot_session_threads(bot_id: str) -> int:
@@ -7111,10 +7380,16 @@ def invalidate_bot_session_threads(bot_id: str) -> int:
     return invalidated
 
 
-def reset_bot_session_runtime_state(bot_id: str) -> int:
+def reset_bot_session_runtime_state(bot_id: str, replacement_config: Optional[dict[str, Any]] = None) -> int:
     bot = BOTS.get(bot_id)
     if not bot:
-        return clear_persisted_session_threads(bot_id)
+        cleared = clear_persisted_session_threads(bot_id)
+        invalidate_bot_session_mappings(bot_id)
+        if replacement_config:
+            rebuild_bot = BotState(config=dict(replacement_config))
+            rebuild_schedule_definition_session_bindings(rebuild_bot)
+            rebuild_scheduled_job_session_bindings(rebuild_bot)
+        return cleared
     cleared = 0
     for sess in bot.sessions.values():
         had_state = bool(
@@ -7157,7 +7432,20 @@ def reset_bot_session_runtime_state(bot_id: str) -> int:
             cleared += 1
     if bot.reply_sessions:
         bot.reply_sessions = {}
+    cleared += clear_persisted_session_threads(bot_id)
+    invalidate_bot_session_mappings(bot_id)
+    rebuild_target = BotState(config=dict(replacement_config)) if replacement_config else bot
+    rebuild_schedule_definition_session_bindings(rebuild_target)
+    rebuild_scheduled_job_session_bindings(rebuild_target)
     return cleared
+
+
+def bot_runtime_workspace_identity(config: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(config.get("workDir") or "").strip(),
+        workspace_namespace_for_bot(config),
+        bot_workspace_mode(config),
+    )
 
 
 def remove_path_if_exists(path: Path) -> None:
@@ -7261,10 +7549,10 @@ def cleanup_bot_session_storage(bot_id: str) -> None:
                 continue
             remove_path_if_exists(Path(record["lockFile"]))
             remove_session_codex_home(record["sessionId"])
+            remove_tree_if_exists(get_chatfile_dir(str(record["sessionId"])))
             remove_path_if_exists(session_file)
     remove_tree_if_exists(SESSION_REGISTRY_ROOT / "keys" / bot_id)
     remove_tree_if_exists(SESSION_LOCK_ROOT / bot_id)
-    remove_tree_if_exists(get_bot_workspace_dir(bot_id))
 
 
 def cleanup_bot_schedule_jobs(bot_id: str) -> None:
@@ -7481,12 +7769,14 @@ async def remove_bot(bot_id: str) -> None:
     if existing_config is None:
         raise BridgeError(404, f"bot not found: {bot_id}")
     wecom_bot_id = str((existing_config or {}).get("botId") or "").strip() or None
+    workspace_namespace = workspace_namespace_for_bot(existing_config)
     mark_bot_deleted_globally(bot_id, wecom_bot_id)
     remove_persisted_bot_config(bot_id)
     try:
         await stop_bot(bot_id, persist_disable=False, reason="remove_bot")
         cleanup_bot_schedule_definitions(bot_id)
         cleanup_bot_session_storage(bot_id)
+        cleanup_workspace_namespace_if_unused(workspace_namespace, excluding_bot_id=bot_id)
     finally:
         BOTS.pop(bot_id, None)
         PREPARED_PREVIOUS_BOT_CONFIGS.pop(bot_id, None)
@@ -7744,8 +8034,8 @@ async def start_bot(config: dict[str, Any]) -> BotState:
         previous_config = PREPARED_PREVIOUS_BOT_CONFIGS.pop(normalized["id"], None)
     if previous_config is None:
         previous_config = read_persisted_bot_config(normalized["id"])
-    if previous_config and str(previous_config.get("workDir") or "") != normalized["workDir"]:
-        reset_bot_session_runtime_state(normalized["id"])
+    if previous_config and bot_runtime_workspace_identity(previous_config) != bot_runtime_workspace_identity(normalized):
+        reset_bot_session_runtime_state(normalized["id"], normalized)
     if normalized["id"] in BOTS:
         await stop_bot(normalized["id"], persist_disable=False, reason="start_bot_replace")
     bot = BotState(config=normalized)
@@ -8163,6 +8453,8 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "name": bot.config["name"],
         "botId": bot.config["botId"],
         "workDir": bot.config["workDir"],
+        "workspaceMode": bot.config.get("workspaceMode", "team"),
+        "workspaceNamespace": bot.config.get("workspaceNamespace"),
         "groupSessionMode": bot.config.get("groupSessionMode", "per-user"),
         "agentBackend": bot.config.get("agentBackend", "codex"),
         "agentCommand": bot.config.get("agentCommand"),
@@ -8198,6 +8490,8 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "name": config["name"],
         "botId": config["botId"],
         "workDir": config["workDir"],
+        "workspaceMode": config.get("workspaceMode", "team"),
+        "workspaceNamespace": config.get("workspaceNamespace"),
         "groupSessionMode": config.get("groupSessionMode", "per-user"),
         "agentBackend": config.get("agentBackend", "codex"),
         "agentCommand": config.get("agentCommand"),
@@ -8252,7 +8546,9 @@ async def api_add_bot(request: web.Request) -> web.Response:
         data = await read_json_body(request)
         wecom_bot_id = str(data.get("botId") or "").strip()
         config_id = find_config_id_by_wecom_bot_id(wecom_bot_id) or default_bot_config_id(wecom_bot_id)
-        config = normalize_bot_config({**data, "id": config_id, "enabled": True})
+        base = get_authoritative_bot_config(config_id) or {}
+        candidate = {**base, **data, "id": config_id, "enabled": True}
+        config = normalize_bot_config(candidate)
         await start_bot(config)
         payload = {"ok": True, "id": config["id"], "secretSource": bot_secret_source(config)}
         warning = bot_secret_persistence_warning(config)

@@ -325,7 +325,7 @@ async def process_scheduled_jobs_once(config, runtime: WeComBotRuntime | None = 
         active_run_key: tuple[str, str] | None = None
         run_task = None
         try:
-            payload = __import__("json").loads(processing_path.read_text(encoding="utf-8"))
+            payload = json.loads(processing_path.read_text(encoding="utf-8"))
             job = ScheduledJob(**payload)
             if runtime is not None and (runtime.pending_finals or {}).get(f"job:{job.request_id}"):
                 processing_path.replace(schedule_pending_root(config.runtime_root) / path.name)

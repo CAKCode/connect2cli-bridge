@@ -38,7 +38,7 @@ def main() -> int:
             "cwd": str(launch.cwd),
             "sessionId": launch.session.session_id,
             "workspaceId": launch.session.workspace_id,
-            "projectDir": str(launch.runtime_context.project_dir),
+            "cwdDir": str(launch.runtime_context.cwd_dir),
             "chatfileDir": str(launch.runtime_context.chatfile_dir),
             "effectiveSkills": list(launch.runtime_context.effective_skill_names),
             "prompt": prompt,

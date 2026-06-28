@@ -54,11 +54,7 @@ def build_session_codex_home(runtime_root: Path | str, session_id: str, workspac
 
 
 def resolve_workspace_cwd(workspace: WorkspaceRef) -> Path:
-    if workspace.scope == "user" and workspace.workfile_dir is not None:
-        return workspace.project_dir
-    if workspace.scope == "room" and workspace.roomfile_dir is not None:
-        return workspace.project_dir
-    return workspace.project_dir
+    return workspace.cwd_dir
 
 
 def build_runtime_context(
@@ -73,7 +69,7 @@ def build_runtime_context(
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> WorkspaceRuntimeContext:
     chatfile_root = Path(chatfile_root).expanduser().resolve()
-    chatfile_dir = chatfile_root / workspace.workspace_id.replace(":", "__")
+    chatfile_dir = chatfile_root / session_id
     chatfile_dir.mkdir(parents=True, exist_ok=True)
 
     skill_space = resolve_skill_space(DEFAULT_GLOBAL_SKILL_DIR, workspace.skill_dir)
@@ -81,8 +77,11 @@ def build_runtime_context(
     env = {
         "WECOM_BRIDGE_WORKSPACE_ID": workspace.workspace_id,
         "WECOM_BRIDGE_WORKSPACE_SCOPE": workspace.scope,
+        "WECOM_BRIDGE_WORKSPACE_NAMESPACE": workspace.namespace,
+        "WECOM_BRIDGE_WORKSPACE_MODE": "personal" if workspace.cwd_dir == workspace.source_dir else "team",
         "WECOM_BRIDGE_SOURCE_DIR": str(workspace.source_dir),
-        "WECOM_BRIDGE_PROJECT_DIR": str(workspace.project_dir),
+        "WECOM_BRIDGE_PROJECT_DIR": str(workspace.cwd_dir),
+        "WECOM_BRIDGE_WORKDIR_DIR": str(workspace.source_dir),
         "WECOM_BRIDGE_WORKSPACE_SKILL_DIR": str(workspace.skill_dir),
         "WECOM_BRIDGE_CHATFILE_DIR": str(chatfile_dir),
         "WECOM_BRIDGE_EXPORT_DIR": str(chatfile_dir),
@@ -110,7 +109,7 @@ def build_runtime_context(
 
     return WorkspaceRuntimeContext(
         workspace=workspace,
-        project_dir=workspace.project_dir,
+        cwd_dir=workspace.cwd_dir,
         chatfile_dir=chatfile_dir,
         export_dir=chatfile_dir,
         workfile_dir=workspace.workfile_dir,
