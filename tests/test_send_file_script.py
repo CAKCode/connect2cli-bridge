@@ -40,7 +40,9 @@ def test_send_file_script_uses_local_file_send_queue_root(monkeypatch, tmp_path)
     assert module.DEFAULT_RESULT_TIMEOUT_MS == 120000
 
 
-def test_send_file_script_resolves_relative_queue_root_from_script_dir(monkeypatch):
+def test_send_file_script_resolves_relative_queue_root_from_bridge_runtime_root(monkeypatch, tmp_path):
+    runtime_root = tmp_path / "bridge-runtime"
+    monkeypatch.setenv("BRIDGE_RUNTIME_ROOT", str(runtime_root))
     monkeypatch.setenv("LOCAL_FILE_SEND_QUEUE_ROOT", "relative-queue")
     monkeypatch.delenv("WECOM_BRIDGE_BOT_NAME", raising=False)
     monkeypatch.delenv("WECOM_BRIDGE_BOT_CONFIG_ID", raising=False)
@@ -49,7 +51,7 @@ def test_send_file_script_resolves_relative_queue_root_from_script_dir(monkeypat
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
-    expected = SEND_FILE_PATH.resolve().parent / "relative-queue"
+    expected = runtime_root / "relative-queue"
     assert module.BASE_QUEUE_ROOT == expected.resolve()
     assert module.resolve_base_queue_root(SEND_FILE_PATH.resolve().parent) == expected.resolve()
 
@@ -121,6 +123,19 @@ def test_send_file_parse_args_supports_equals_syntax(monkeypatch, tmp_path):
     assert parsed["session-id"] == "sess-1"
 
 
+def test_send_file_parse_args_rejects_unexpected_positional_arg(monkeypatch, tmp_path, capsys):
+    module = load_send_file_module(monkeypatch, tmp_path / "queue")
+
+    try:
+        module.parse_args(["oops", "--chat-key", "single:test-user", "--file-path", "report.txt"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert "unexpected argument: oops" in capsys.readouterr().err
+
+
 def test_send_file_parse_args_rejects_unknown_option(monkeypatch, tmp_path, capsys):
     module = load_send_file_module(monkeypatch, tmp_path / "queue")
 
@@ -154,6 +169,72 @@ def test_send_file_script_runs_via_shebang():
     assert "session-id or chat-key required" in result.stderr
 
 
+def test_send_file_script_rejects_invalid_chat_key(monkeypatch, tmp_path, capsys):
+    module = load_send_file_module(monkeypatch, tmp_path / "queue", bot_name="codex2", bot_config_id="bot-1")
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["send_file.py", "--chat-key", "invalid", "--file-path", str(file_path)])
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert "invalid chat key" in capsys.readouterr().err
+
+
+def test_send_file_script_rejects_file_queue_root(monkeypatch, tmp_path, capsys):
+    queue_root = tmp_path / "queue-root.txt"
+    queue_root.write_text("not a dir", encoding="utf-8")
+    module = load_send_file_module(monkeypatch, queue_root, bot_name="codex2", bot_config_id="bot-1")
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["send_file.py", "--chat-key", "single:test-user", "--file-path", str(file_path)])
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert f"queue path is not a directory: {queue_root.resolve()}" in capsys.readouterr().err
+
+
+def test_send_file_script_ignores_invalid_chat_key_when_session_id_present(monkeypatch, tmp_path, capsys):
+    module = load_send_file_module(monkeypatch, tmp_path / "queue", bot_name="codex2", bot_config_id="bot-1")
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    pending_request: dict[str, object] = {}
+
+    def fake_sleep(_seconds: float) -> None:
+        pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+        assert pending_files
+        pending_request.update(json.loads(pending_files[0].read_text("utf-8")))
+        request_id = pending_request["requestId"]
+        module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+        (module.RESULT_ROOT / f"{request_id}.json").write_text(
+            json.dumps({"ok": True, "message": "sent report.txt"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["send_file.py", "--session-id", "sess-1", "--chat-key", "invalid", "--file-path", str(file_path)],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert pending_request["sessionId"] == "sess-1"
+    assert pending_request["chatKey"] == "invalid"
+    assert '"ok": true' in output.lower()
+
+
 def test_send_file_main_uses_env_bot_name_when_arg_missing(monkeypatch, tmp_path, capsys):
     module = load_send_file_module(monkeypatch, tmp_path / "queue", bot_name="codex2", bot_config_id="bot-1")
     file_path = tmp_path / "report.txt"
@@ -184,6 +265,43 @@ def test_send_file_main_uses_env_bot_name_when_arg_missing(monkeypatch, tmp_path
     assert isinstance(pending_request["requestedAt"], int)
     assert module.DEFAULT_RESULT_TIMEOUT_MS - 1000 <= pending_request["timeoutMs"] <= module.DEFAULT_RESULT_TIMEOUT_MS
     assert pending_request["expiresAt"] >= pending_request["requestedAt"] + module.DEFAULT_RESULT_TIMEOUT_MS - 1000
+    assert '"ok": true' in output.lower()
+
+
+def test_send_file_main_uses_wecom_bot_env_defaults_when_bridge_env_missing(monkeypatch, tmp_path, capsys):
+    queue_root = tmp_path / "queue"
+    monkeypatch.setenv("LOCAL_FILE_SEND_QUEUE_ROOT", str(queue_root))
+    monkeypatch.delenv("WECOM_BRIDGE_BOT_NAME", raising=False)
+    monkeypatch.delenv("WECOM_BRIDGE_BOT_CONFIG_ID", raising=False)
+    monkeypatch.setenv("WECOM_BOT_NAME", "codex2")
+    monkeypatch.setenv("WECOM_BOT_CONFIG_ID", "bot-1")
+    spec = importlib.util.spec_from_file_location("send_file_wecom_env_defaults", SEND_FILE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    pending_request: dict[str, object] = {}
+
+    def fake_sleep(_seconds: float) -> None:
+        pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+        assert pending_files
+        pending_request.update(json.loads(pending_files[0].read_text("utf-8")))
+        request_id = pending_request["requestId"]
+        module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+        (module.RESULT_ROOT / f"{request_id}.json").write_text(
+            json.dumps({"ok": True, "message": "sent report.txt"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(sys, "argv", ["send_file.py", "--chat-key", "single:test-user", "--file-path", str(file_path)])
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert pending_request["botName"] == "codex2"
+    assert pending_request["targetConfigId"] == "bot-1"
     assert '"ok": true' in output.lower()
 
 
@@ -239,6 +357,59 @@ def test_send_file_main_retries_transient_bridge_errors(monkeypatch, tmp_path, c
 
     output = capsys.readouterr().out
     assert len(pending_request_ids) == 2
+    assert '"ok": true' in output.lower()
+
+
+def test_send_file_main_retries_with_unique_request_ids_within_same_millisecond(monkeypatch, tmp_path, capsys):
+    module = load_send_file_module(monkeypatch, tmp_path / "queue", bot_name="codex2", bot_config_id="bot-1")
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    seen_request_ids: list[str] = []
+    sleep_calls = {"count": 0}
+
+    def fake_time() -> float:
+        return 1000.0
+
+    def fake_sleep(_seconds: float) -> None:
+        pending_files = sorted(module.PENDING_ROOT.glob("*.json"))
+        assert pending_files
+        pending_request = json.loads(pending_files[-1].read_text("utf-8"))
+        request_id = str(pending_request["requestId"])
+        if request_id not in seen_request_ids:
+            seen_request_ids.append(request_id)
+        module.RESULT_ROOT.mkdir(parents=True, exist_ok=True)
+        payload = (
+            {"ok": False, "statusCode": 503, "error": "bot not connected"}
+            if len(seen_request_ids) == 1 and sleep_calls["count"] == 0
+            else {"ok": True, "message": "sent report.txt"}
+        )
+        (module.RESULT_ROOT / f"{request_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        sleep_calls["count"] += 1
+
+    monkeypatch.setattr(module.time, "time", fake_time)
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "send_file.py",
+            "--chat-key",
+            "single:test-user",
+            "--file-path",
+            str(file_path),
+            "--timeout-ms",
+            "5000",
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert len(seen_request_ids) == 2
+    assert len(set(seen_request_ids)) == 2
     assert '"ok": true' in output.lower()
 
 

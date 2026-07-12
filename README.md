@@ -19,7 +19,7 @@ English overview: [README.en.md](README.en.md)
 - 为会话启动可选 agent backend（`codex` / `claude`），并在当前运行态可恢复时尝试原生 resume
 - 为组内多人协作提供隔离 workspace，保证每人文件和代码操作互不影响
 - 提供全局共享 skill 与个人私有 skill 的分层注入和隔离
-- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`
+- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`、`/cwd`
 - 下载企微图片/文件到本地 workspace
 - 对外暴露运行状态和最新摘要，便于前端轮询刷新
 - 对超长运行会话支持企微 10 分钟后的分段回复与后续续传
@@ -438,6 +438,7 @@ python3 ./schedule_message.py \
 - `/bridge-interrupt`
 - `/bridge-reset`
 - `/bridge-resume`
+- `/cwd`
 
 语义：
 
@@ -449,6 +450,8 @@ python3 ./schedule_message.py \
   中断当前任务，并清空当前会话上下文
 - `/bridge-resume`
   列出当前用户在当前运行态内可恢复的会话；回复编号可选择，或直接发送 `/bridge-resume <sessionId>`
+- `/cwd`
+  仅 `workspaceMode=personal` 可用；`/cwd` 查看当前目录，`/cwd <path>` 切换到 `workDir` 内的子目录；任务运行中不允许切换
 
 ## 长时运行回复策略
 

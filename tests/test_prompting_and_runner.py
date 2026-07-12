@@ -4,10 +4,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import workspace_bridge.agent_backends as agent_backends_module
 import workspace_bridge.codex_runtime as codex_runtime
 import workspace_bridge.context as context_module
 import workspace_bridge.models as models_module
 import workspace_bridge.prompting as prompting_module
+from workspace_bridge.agent_backends import parse_command_to_argv, resolve_agent_command
 from workspace_bridge.prompting import build_bridge_context, build_prompt
 from workspace_bridge.runner import build_runner_invocation, run_invocation
 from workspace_bridge.runtime import build_bot_config, prepare_session_run
@@ -276,6 +278,18 @@ def test_build_runner_invocation_respects_code_command_override(tmp_path: Path, 
     assert invocation.argv[0:4] == ("/opt/codex/bin/codex", "--profile", "automation", "exec")
 
 
+def test_parse_command_to_argv_tolerates_unbalanced_quotes() -> None:
+    assert parse_command_to_argv('codex --profile "unterminated') == ('codex --profile "unterminated',)
+
+
+def test_resolve_agent_command_tolerates_unbalanced_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_COMMAND", 'codex --profile "unterminated')
+
+    argv = resolve_agent_command("codex")
+
+    assert argv == ('codex --profile "unterminated',)
+
+
 def test_build_runner_invocation_uses_host_exec_mode_when_configured(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     runtime_root = tmp_path / "runtime"
@@ -327,6 +341,62 @@ def test_build_runner_invocation_prepends_bundled_bwrap_to_path(tmp_path: Path, 
     )
 
     assert invocation.env["PATH"].split(os.pathsep)[0] == str(bwrap.parent)
+
+
+def test_codex_runtime_prepare_env_does_not_treat_non_codex_command_as_codex(tmp_path: Path, monkeypatch) -> None:
+    codex_exec, bwrap = make_fake_codex_install(tmp_path)
+    codex_runtime.resolve_executable.cache_clear()
+    codex_runtime.find_bundled_bwrap.cache_clear()
+
+    def fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "bwrap":
+            return None
+        if name == "notcodex":
+            return str(codex_exec)
+        return None
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(codex_runtime.shutil, "which", fake_which)
+
+    env = codex_runtime.prepare_codex_subprocess_env({"PATH": "/usr/bin"}, command="notcodex")
+
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_agent_backends_prepare_env_does_not_treat_non_codex_command_as_codex(tmp_path: Path, monkeypatch) -> None:
+    codex_exec, bwrap = make_fake_codex_install(tmp_path)
+
+    def fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "bwrap":
+            return None
+        if name == "notcodex":
+            return str(codex_exec)
+        return None
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(agent_backends_module.shutil, "which", fake_which)
+
+    env = agent_backends_module.prepare_subprocess_env({"PATH": "/usr/bin"}, backend="codex", command="notcodex")
+
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_codex_runtime_resolve_executable_rejects_directory_command(tmp_path: Path) -> None:
+    command_dir = tmp_path / "fake-codex-dir"
+    command_dir.mkdir()
+
+    codex_runtime.resolve_executable.cache_clear()
+    try:
+        assert codex_runtime.resolve_executable(str(command_dir)) is None
+    finally:
+        codex_runtime.resolve_executable.cache_clear()
+
+
+def test_agent_backends_resolve_executable_rejects_directory_command(tmp_path: Path) -> None:
+    command_dir = tmp_path / "fake-codex-dir"
+    command_dir.mkdir()
+
+    assert agent_backends_module.resolve_executable(str(command_dir)) is None
 
 
 def test_run_invocation_executes_override_process(tmp_path: Path) -> None:
@@ -384,3 +454,152 @@ def test_run_codex_session_cli_dry_run_outputs_launch_payload(tmp_path: Path) ->
     assert payload["cwd"].endswith("/workfile")
     assert payload["workspaceId"].startswith("user:")
     assert "prompt" in payload
+
+
+def test_run_codex_session_cli_reports_invalid_chat_key_cleanly(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    output_file = tmp_path / "out.jsonl"
+    source_dir.mkdir()
+    script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bot-id",
+            "bot-1",
+            "--bot-name",
+            "codex",
+            "--runtime-root",
+            str(runtime_root),
+            "--source-dir",
+            str(source_dir),
+            "--chatfile-root",
+            str(chatfile_root),
+            "--chat-key",
+            "invalid",
+            "--message",
+            "hello",
+            "--output-file",
+            str(output_file),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=script.parent,
+    )
+
+    assert result.returncode == 4
+    assert "invalid chat key" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_run_codex_session_cli_dry_run_does_not_require_output_file(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bot-id",
+            "bot-1",
+            "--bot-name",
+            "codex",
+            "--runtime-root",
+            str(runtime_root),
+            "--source-dir",
+            str(source_dir),
+            "--chatfile-root",
+            str(chatfile_root),
+            "--chat-key",
+            "single:alice",
+            "--message",
+            "hello",
+            "--dry-run",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=script.parent,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["workspaceId"].startswith("user:")
+    assert "prompt" in payload
+
+
+def test_run_codex_session_cli_requires_output_file_without_dry_run(tmp_path: Path) -> None:
+    source_dir = tmp_path / "repo"
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    source_dir.mkdir()
+    script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bot-id",
+            "bot-1",
+            "--bot-name",
+            "codex",
+            "--runtime-root",
+            str(runtime_root),
+            "--source-dir",
+            str(source_dir),
+            "--chatfile-root",
+            str(chatfile_root),
+            "--chat-key",
+            "single:alice",
+            "--message",
+            "hello",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=script.parent,
+    )
+
+    assert result.returncode == 4
+    assert "--output-file is required" in result.stderr
+
+
+def test_run_codex_session_cli_rejects_missing_source_dir_cleanly(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    chatfile_root = tmp_path / "chatfiles"
+    missing_source_dir = tmp_path / "missing-repo"
+    script = Path(__file__).resolve().parent.parent / "run_codex_session.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bot-id",
+            "bot-1",
+            "--bot-name",
+            "codex",
+            "--runtime-root",
+            str(runtime_root),
+            "--source-dir",
+            str(missing_source_dir),
+            "--chatfile-root",
+            str(chatfile_root),
+            "--chat-key",
+            "single:alice",
+            "--message",
+            "hello",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=script.parent,
+    )
+
+    assert result.returncode == 4
+    assert f"source-dir does not exist: {missing_source_dir.resolve()}" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "Traceback" not in result.stderr

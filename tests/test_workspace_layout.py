@@ -90,3 +90,42 @@ def test_personal_workspace_mode_uses_source_dir_as_cwd_and_skill_root(tmp_path:
     assert workspace.cwd_dir == source_dir.resolve()
     assert workspace.project_dir == runtime_root / "workspaces" / "team-a" / "users" / "alice" / "workfile"
     assert workspace.skill_dir == source_dir.resolve() / ".codex" / "skills"
+
+
+def test_build_workspace_ref_rejects_file_runtime_root(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime.txt"
+    source_dir = tmp_path / "repo"
+    runtime_root.write_text("not a dir", encoding="utf-8")
+    source_dir.mkdir()
+
+    try:
+        build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    except ValueError as exc:
+        assert str(exc) == f"runtime_root is not a directory: {runtime_root.resolve()}"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_build_workspace_ref_rejects_missing_source_dir(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    source_dir = tmp_path / "missing-repo"
+
+    try:
+        build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    except ValueError as exc:
+        assert str(exc) == f"source_dir does not exist: {source_dir.resolve()}"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_build_workspace_ref_rejects_file_source_dir(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    source_dir = tmp_path / "repo.txt"
+    source_dir.write_text("not a dir", encoding="utf-8")
+
+    try:
+        build_workspace_ref(runtime_root, "team-a", source_dir, "single:alice")
+    except ValueError as exc:
+        assert str(exc) == f"source_dir is not a directory: {source_dir.resolve()}"
+    else:
+        raise AssertionError("expected ValueError")

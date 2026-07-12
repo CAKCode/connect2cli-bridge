@@ -69,7 +69,7 @@ basic_auth = sys.argv[4]
 token = sys.argv[5]
 
 base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-url = f"http://{base_host}:{port}/healthz"
+url = f"http://{base_host}:{port}/livez"
 headers = {}
 if basic_auth:
     raw = base64.b64encode(basic_auth.encode("utf-8")).decode("ascii")

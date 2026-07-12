@@ -5,20 +5,27 @@ import re
 from pathlib import Path
 
 
-def sanitize_file_name(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+def sanitize_file_name(name: str, fallback: str = "attachment.bin") -> str:
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or fallback).strip())
+    if base in {".", ".."}:
+        return fallback
+    return base or fallback
 
 
 def build_nonconflicting_file_path(target_dir: Path, file_name: str) -> Path:
-    candidate = target_dir / file_name
-    if not candidate.exists():
+    normalized_name = Path(str(file_name or "")).name or "attachment.bin"
+    if normalized_name in {".", ".."}:
+        normalized_name = "attachment.bin"
+    candidate = target_dir / normalized_name
+    if not candidate.exists() and not candidate.is_symlink():
         return candidate
-    stem = candidate.stem
-    suffix = candidate.suffix
+    path = Path(normalized_name)
+    stem = path.stem or "attachment"
+    suffix = path.suffix
     index = 1
     while True:
         candidate = target_dir / f"{stem}-{index}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and not candidate.is_symlink():
             return candidate
         index += 1
 
@@ -27,6 +34,8 @@ def extract_mixed_text(mixed: dict) -> str:
     items = mixed.get("msg_item") or mixed.get("msgItem") or []
     parts = []
     for item in items:
+        if not isinstance(item, dict):
+            continue
         if item.get("msgtype") == "text":
             content = ((item.get("text") or {}).get("content") or "").strip()
             if content:
@@ -36,7 +45,20 @@ def extract_mixed_text(mixed: dict) -> str:
 
 def extract_mixed_images(mixed: dict) -> list[dict]:
     items = mixed.get("msg_item") or mixed.get("msgItem") or []
-    return [item.get("image") for item in items if item.get("msgtype") == "image" and (item.get("image") or {}).get("url")]
+    return [
+        item.get("image")
+        for item in items
+        if (
+            isinstance(item, dict)
+            and item.get("msgtype") == "image"
+            and isinstance(item.get("image"), dict)
+            and (
+                item["image"].get("url")
+                or item["image"].get("download_url")
+                or item["image"].get("downloadUrl")
+            )
+        )
+    ]
 
 
 def decode_aes_key(key: str) -> bytes:

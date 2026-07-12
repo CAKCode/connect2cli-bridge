@@ -12,6 +12,7 @@ from workspace_bridge.wecom_protocol import (
     build_text_response_payloads,
     chat_key_from_message,
     chat_key_to_send_target,
+    extract_response_url,
     is_subscribe_ok,
     normalize_bridge_command_text,
     parse_template_card_event,
@@ -106,9 +107,34 @@ def test_build_text_response_payload_uses_stream_format() -> None:
     assert payload["body"]["stream"]["finish"] is True
 
 
+def test_build_text_response_payload_rejects_empty_ids() -> None:
+    try:
+        build_text_response_payload("", "session-1", "done", final=True)
+    except ValueError as exc:
+        assert str(exc) == "reqId required"
+    else:
+        raise AssertionError("expected ValueError")
+
+    try:
+        build_text_response_payload("req-1", "", "done", final=True)
+    except ValueError as exc:
+        assert str(exc) == "sessionId required"
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_chat_key_to_send_target_preserves_group_for_per_user_mode() -> None:
     assert chat_key_to_send_target("group-user:room-1:alice") == (2, "room-1")
     assert chat_key_to_send_target("single:alice") == (1, "alice")
+
+
+def test_chat_key_to_send_target_rejects_invalid_chat_key() -> None:
+    try:
+        chat_key_to_send_target("unknown:alice")
+    except ValueError as exc:
+        assert str(exc) == "invalid chat key: unknown:alice"
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_build_proactive_text_payload_mentions_group_user() -> None:
@@ -126,6 +152,12 @@ def test_build_proactive_text_payload_does_not_mention_single_chat_user() -> Non
     assert payload["cmd"] == "aibot_send_msg"
     assert payload["body"]["chat_type"] == 1
     assert payload["body"]["chatid"] == "alice"
+    assert payload["body"]["markdown"]["content"] == "done"
+
+
+def test_build_proactive_text_payload_ignores_null_explicit_mention_user_id() -> None:
+    payload = build_proactive_text_payload("single:alice", "done", mention_user_id="null")
+
     assert payload["body"]["markdown"]["content"] == "done"
 
 
@@ -174,6 +206,54 @@ def test_build_proactive_message_payload_supports_template_card_feedback() -> No
     assert payload["body"]["msgtype"] == "template_card"
     assert payload["body"]["template_card"]["card_type"] == "text_notice"
     assert payload["body"]["template_card"]["feedback"]["id"] == "feedback-1"
+
+
+def test_validate_template_card_payload_rejects_invalid_embedded_feedback_id() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "text_notice",
+                "main_title": {"title": "hello"},
+                "card_action": {"type": 1, "url": "https://example.com"},
+                "feedback": {"id": "x" * 257},
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "templateCard.feedback.id exceeds 256 bytes"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_validate_template_card_payload_rejects_non_object_feedback() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "text_notice",
+                "main_title": {"title": "hello"},
+                "card_action": {"type": 1, "url": "https://example.com"},
+                "feedback": "bad",
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "templateCard.feedback must be an object"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_build_proactive_message_payload_rejects_oversized_feedback_id() -> None:
+    try:
+        build_proactive_message_payload(
+            OutboundMessage(
+                chat_key="single:alice",
+                msgtype="markdown",
+                content="done",
+                feedback_id="x" * 257,
+            )
+        )
+    except ValueError as exc:
+        assert str(exc) == "feedback.id exceeds 256 bytes"
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_build_proactive_message_payload_enriches_group_interaction_card_owner_and_task_id() -> None:
@@ -266,13 +346,56 @@ def test_parse_template_card_event_extracts_selected_items() -> None:
     assert event.selected_items[0].option_ids == ("prod", "gray")
 
 
+def test_protocol_parsers_tolerate_non_dict_payload_sections() -> None:
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": "bad",
+        "body": "bad",
+        "response_url": "https://example.com/response",
+    }
+
+    try:
+        chat_key_from_message(payload)
+    except ValueError as exc:
+        assert str(exc) == "message sender userid required"
+    else:
+        raise AssertionError("expected ValueError")
+    assert parse_text_callback(payload) is None
+    assert extract_response_url(payload) == "https://example.com/response"
+
+    event_payload = {
+        "cmd": "aibot_event_callback",
+        "headers": [],
+        "body": {"msgtype": "event", "event": "bad"},
+    }
+    assert parse_template_card_event(event_payload) is None
+
+
+def test_parse_text_callback_rejects_missing_sender_user_id() -> None:
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgtype": "text",
+            "text": {"content": "hello"},
+            "from": {},
+        },
+    }
+
+    assert parse_text_callback(payload) is None
+
+
 def test_build_template_card_update_payload_uses_update_template_card_shape() -> None:
     from workspace_bridge.models import TemplateCardUpdateRequest
 
     payload = build_template_card_update_payload(
         TemplateCardUpdateRequest(
             req_id="req-update-1",
-            template_card={"card_type": "button_interaction", "main_title": {"title": "updated"}},
+            template_card={
+                "card_type": "button_interaction",
+                "main_title": {"title": "updated"},
+                "button_list": [{"text": "go", "key": "go"}],
+            },
         )
     )
 
@@ -280,6 +403,42 @@ def test_build_template_card_update_payload_uses_update_template_card_shape() ->
     assert payload["headers"]["req_id"] == "req-update-1"
     assert payload["body"]["response_type"] == "update_template_card"
     assert payload["body"]["template_card"]["card_type"] == "button_interaction"
+
+
+def test_build_template_card_update_payload_rejects_invalid_payload() -> None:
+    from workspace_bridge.models import TemplateCardUpdateRequest
+
+    try:
+        build_template_card_update_payload(
+            TemplateCardUpdateRequest(
+                req_id="req-update-1",
+                template_card={"card_type": "button_interaction", "main_title": {"title": "updated"}},
+            )
+        )
+    except ValueError as exc:
+        assert str(exc) == "button_interaction.button_list required"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_build_template_card_update_payload_rejects_empty_req_id() -> None:
+    from workspace_bridge.models import TemplateCardUpdateRequest
+
+    try:
+        build_template_card_update_payload(
+            TemplateCardUpdateRequest(
+                req_id="",
+                template_card={
+                    "card_type": "button_interaction",
+                    "main_title": {"title": "updated"},
+                    "button_list": [{"text": "go", "key": "go"}],
+                },
+            )
+        )
+    except ValueError as exc:
+        assert str(exc) == "reqId required"
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_validate_template_card_payload_rejects_invalid_button_key() -> None:
@@ -294,6 +453,25 @@ def test_validate_template_card_payload_rejects_invalid_button_key() -> None:
         )
     except ValueError as exc:
         assert str(exc) == "button_interaction.button_list[1].key required"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_validate_template_card_payload_rejects_duplicate_button_keys() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "button_interaction",
+                "main_title": {"title": "hello"},
+                "button_list": [
+                    {"text": "go", "style": 1, "key": "go"},
+                    {"text": "again", "style": 1, "key": "go"},
+                ],
+                "task_id": "task-1",
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "button_interaction.button_list[2].key duplicates a previous key"
     else:
         raise AssertionError("expected ValueError")
 
@@ -348,6 +526,59 @@ def test_validate_template_card_payload_allows_missing_task_id_for_multiple_inte
     assert payload["card_type"] == "multiple_interaction"
 
 
+def test_validate_template_card_payload_rejects_duplicate_vote_option_ids() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "vote_interaction",
+                "main_title": {"title": "hello"},
+                "checkbox": {
+                    "question_key": "q1",
+                    "option_list": [{"id": "a", "text": "A"}, {"id": "a", "text": "A2"}],
+                },
+                "submit_button": {"text": "提交", "key": "submit"},
+                "task_id": "task-1",
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "vote_interaction.checkbox.option_list[2].id duplicates a previous id"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_validate_template_card_payload_rejects_duplicate_multiple_question_keys() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "multiple_interaction",
+                "main_title": {"title": "hello"},
+                "select_list": [
+                    {"question_key": "q1", "option_list": [{"id": "a", "text": "A"}]},
+                    {"question_key": "q1", "option_list": [{"id": "b", "text": "B"}]},
+                ],
+                "submit_button": {"text": "提交", "key": "submit"},
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "multiple_interaction.select_list[2].question_key duplicates a previous question_key"
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_validate_template_card_payload_rejects_unsupported_card_type() -> None:
+    try:
+        validate_template_card_payload(
+            {
+                "card_type": "unsupported_card",
+                "main_title": {"title": "hello"},
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "unsupported templateCard.card_type: unsupported_card"
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_strip_text_mentions_supports_bot_name_with_spaces() -> None:
     assert strip_text_mentions("@Leo C /bridge-interrupt", "Leo C") == "/bridge-interrupt"
     assert strip_text_mentions("@Leo C 请分析这句话里的 @Leo C 是否会被保留", "Leo C") == "请分析这句话里的 @Leo C 是否会被保留"
@@ -359,12 +590,15 @@ def test_strip_text_mentions_supports_bot_name_with_spaces() -> None:
 def test_normalize_bridge_command_text_allows_leading_mention_fallback_for_bridge_commands() -> None:
     assert normalize_bridge_command_text("@Leo2 /bridge-interrupt", "Leo") == "/bridge-interrupt"
     assert normalize_bridge_command_text("@robot, /bridge-status", "robot") == "/bridge-status"
+    assert normalize_bridge_command_text("@robot, /cwd ../repo", "robot") == "/cwd ../repo"
     assert normalize_bridge_command_text("@someone hello", "robot") == "@someone hello"
 
 
 def test_is_subscribe_ok_accepts_success_payload() -> None:
     assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": 0}) is True
+    assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": "0"}) is True
     assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": 1}) is False
+    assert is_subscribe_ok({"cmd": "aibot_subscribe", "errcode": "bad"}) is False
     assert is_subscribe_ok({"headers": {"req_id": "req-1"}, "errcode": 0, "errmsg": "ok"}) is True
 
 

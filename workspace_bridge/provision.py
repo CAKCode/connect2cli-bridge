@@ -13,6 +13,15 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def normalize_optional_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
@@ -121,25 +130,36 @@ def bootstrap_project_dir(workspace: WorkspaceRef) -> None:
         if should_skip_source_child(workspace, child):
             continue
         target = workspace.cwd_dir / child.name
-        if child.is_dir():
-            shutil.copytree(child, target, dirs_exist_ok=True)
+        if child.is_symlink():
+            if target.exists() or target.is_symlink():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            __import__("os").symlink(__import__("os").readlink(child), target, target_is_directory=child.is_dir())
+        elif child.is_dir():
+            shutil.copytree(child, target, dirs_exist_ok=True, symlinks=True)
         else:
-            shutil.copy2(child, target)
+            shutil.copy2(child, target, follow_symlinks=False)
 
 
 def copy_missing_tree_contents(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     for child in sorted(source.iterdir(), key=lambda item: item.name):
         destination = target / child.name
-        if destination.exists():
-            if child.is_dir() and destination.is_dir():
+        if child.is_symlink():
+            if destination.exists() or destination.is_symlink():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            __import__("os").symlink(__import__("os").readlink(child), destination, target_is_directory=child.is_dir())
+            continue
+        if destination.exists() or destination.is_symlink():
+            if child.is_dir() and destination.is_dir() and not destination.is_symlink():
                 copy_missing_tree_contents(child, destination)
             continue
         if child.is_dir():
-            shutil.copytree(child, destination)
+            shutil.copytree(child, destination, symlinks=True)
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(child, destination)
+            shutil.copy2(child, destination, follow_symlinks=False)
 
 
 def legacy_workspace_root(runtime_root: Path, namespace: str) -> Path:
@@ -208,7 +228,9 @@ def provision_workspace(workspace: WorkspaceRef) -> ProvisionedWorkspace:
     bootstrap_project_dir(workspace)
     source_mode = detect_source_mode(workspace.source_dir)
     source_revision = detect_source_revision(workspace.source_dir)
-    initialized_at = int(metadata.get("initializedAt")) if metadata and metadata.get("initializedAt") else now_ms()
+    initialized_at = normalize_optional_int(metadata.get("initializedAt")) if metadata else None
+    if initialized_at is None:
+        initialized_at = now_ms()
     updated_at = now_ms()
     payload = {
         "workspaceId": workspace.workspace_id,

@@ -39,7 +39,13 @@ def build_workspace_ref(
     agent_backend: str = "codex",
 ) -> WorkspaceRef:
     runtime_root = Path(runtime_root).expanduser().resolve()
+    if runtime_root.exists() and not runtime_root.is_dir():
+        raise ValueError(f"runtime_root is not a directory: {runtime_root}")
     source_dir = Path(source_dir).expanduser().resolve()
+    if not source_dir.exists():
+        raise ValueError(f"source_dir does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise ValueError(f"source_dir is not a directory: {source_dir}")
     namespace = slugify(workspace_namespace)
     mode = str(workspace_mode or "").strip().lower().replace("_", "-")
     if not mode:

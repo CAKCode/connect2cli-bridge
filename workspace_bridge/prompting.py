@@ -19,6 +19,7 @@ def build_bridge_context(bot: BotConfig, launch: CodexLaunchSpec) -> str:
     skill_names = ", ".join(launch.runtime_context.effective_skill_names) or "-"
     allowed_file_roots = ", ".join(str(root) for root in launch.runtime_context.allowed_file_roots)
     execution_mode = launch.runtime_context.codex_exec_mode
+    workspace_skill_dir = Path(launch.env["WECOM_BRIDGE_WORKSPACE_SKILL_DIR"]).resolve()
     execution_mode_note = (
         "Local network access is blocked inside the Codex sandbox for this bridge. "
         "Never probe localhost ports or use curl/python sockets to send files."
@@ -45,7 +46,7 @@ def build_bridge_context(bot: BotConfig, launch: CodexLaunchSpec) -> str:
             f"CWD_DIR: {launch.cwd}",
             f"PROJECT_DIR: {launch.runtime_context.cwd_dir}",
             f"WORKDIR_DIR: {workspace.source_dir}",
-            f"WORKSPACE_SKILL_DIR: {workspace.skill_dir}",
+            f"WORKSPACE_SKILL_DIR: {workspace_skill_dir}",
             "HOME_CODEX_SKILLS_DIR: ~/.codex/skills",
             f"CHATFILE_DIR: {launch.runtime_context.chatfile_dir}",
             f"WORKFILE_DIR: {launch.runtime_context.workfile_dir or '-'}",

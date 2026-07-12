@@ -5,15 +5,18 @@ import os
 import re
 import sys
 import time
+from itertools import count
 from pathlib import Path
 from urllib.parse import quote
 
+from workspace_bridge.layout import parse_chat_key
 
-def resolve_base_queue_root(base_dir: Path | None = None) -> Path:
+
+def resolve_runtime_root(base_dir: Path | None = None) -> Path:
     root_base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
-    raw = str(os.environ.get("LOCAL_FILE_SEND_QUEUE_ROOT") or "").strip()
+    raw = str(os.environ.get("BRIDGE_RUNTIME_ROOT") or "").strip()
     if not raw:
-        return (root_base_dir / ".local-file-send-queue").resolve()
+        return root_base_dir
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = (root_base_dir / path).resolve()
@@ -22,11 +25,24 @@ def resolve_base_queue_root(base_dir: Path | None = None) -> Path:
     return path
 
 
+def resolve_base_queue_root(base_dir: Path | None = None) -> Path:
+    runtime_root = resolve_runtime_root(base_dir)
+    raw = str(os.environ.get("LOCAL_FILE_SEND_QUEUE_ROOT") or "").strip()
+    if not raw:
+        return (runtime_root / ".local-file-send-queue").resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (runtime_root / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
 BASE_QUEUE_ROOT = resolve_base_queue_root()
 DEFAULT_RESULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_TIMEOUT_MS", "120000")))
 TRANSIENT_RETRY_INTERVAL_SEC = 1.0
-DEFAULT_BOT_NAME = str(os.environ.get("WECOM_BRIDGE_BOT_NAME") or "").strip()
-DEFAULT_BOT_CONFIG_ID = str(os.environ.get("WECOM_BRIDGE_BOT_CONFIG_ID") or "").strip()
+DEFAULT_BOT_NAME = str(os.environ.get("WECOM_BRIDGE_BOT_NAME") or os.environ.get("WECOM_BOT_NAME") or "").strip()
+DEFAULT_BOT_CONFIG_ID = str(os.environ.get("WECOM_BRIDGE_BOT_CONFIG_ID") or os.environ.get("WECOM_BOT_CONFIG_ID") or "").strip()
 EXPECTED_ARG_KEYS = {
     "session-id",
     "session_id",
@@ -64,6 +80,7 @@ def queue_paths_for_target(bot_config_id: str) -> tuple[Path, Path, Path]:
 
 
 QUEUE_ROOT, PENDING_ROOT, RESULT_ROOT = queue_paths_for_target(DEFAULT_BOT_CONFIG_ID)
+REQUEST_COUNTER = count()
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -72,6 +89,11 @@ def fail(message: str, code: int = 1) -> None:
 
 
 def ensure_dir(path: Path) -> None:
+    blocking = path
+    while not blocking.exists() and blocking != blocking.parent:
+        blocking = blocking.parent
+    if blocking.exists() and not blocking.is_dir():
+        fail(f"queue path is not a directory: {blocking}", 2)
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -107,8 +129,7 @@ def parse_args(argv: list[str]) -> dict[str, str]:
     while idx < len(argv):
         item = argv[idx]
         if not item.startswith("--"):
-            idx += 1
-            continue
+            fail(f"unexpected argument: {item}", 2)
         raw = item[2:]
         if "=" in raw:
             key, value = raw.split("=", 1)
@@ -134,6 +155,10 @@ def parse_args(argv: list[str]) -> dict[str, str]:
     return args
 
 
+def next_request_id() -> str:
+    return f"{int(time.time() * 1000):x}-{os.getpid()}-{next(REQUEST_COUNTER):x}"
+
+
 def main() -> None:
     args = parse_args(sys.argv[1:])
     session_id = args.get("session-id") or args.get("session_id") or ""
@@ -146,6 +171,11 @@ def main() -> None:
 
     if not session_id and not chat_key:
         fail("session-id or chat-key required", 2)
+    if chat_key and not session_id:
+        try:
+            parse_chat_key(chat_key)
+        except ValueError as exc:
+            fail(str(exc), 2)
     if not file_path_arg:
         fail("file-path required", 2)
 
@@ -163,7 +193,7 @@ def main() -> None:
     request_id = ""
     while time.time() < deadline:
         requested_at = int(time.time() * 1000)
-        request_id = f"{int(time.time() * 1000):x}-{os.getpid()}"
+        request_id = next_request_id()
         request = {
             "requestId": request_id,
             "sessionId": session_id or None,

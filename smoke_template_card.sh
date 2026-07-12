@@ -5,7 +5,7 @@ cd "$SCRIPT_DIR"
 
 CHAT_KEY="$1"
 BOT_CONFIG_ID="${2:-}"
-BOT_NAME="${3:-default}"
+BOT_NAME="${3:-}"
 
 if [ -z "$CHAT_KEY" ]; then
   echo "usage: sh ./smoke_template_card.sh <chat-key> [bot-config-id] [bot-name]" >&2
@@ -50,18 +50,33 @@ EOF
 
 echo "[smoke] sending owner-aware button card..."
 if [ -n "$BOT_CONFIG_ID" ]; then
-  python3 "$SCRIPT_DIR/send_message.py" \
-    --chat-key "$CHAT_KEY" \
-    --bot-config-id "$BOT_CONFIG_ID" \
-    --bot-name "$BOT_NAME" \
-    --msgtype template_card \
-    --template-card-file "$CARD_FILE" || exit 1
+  if [ -n "$BOT_NAME" ]; then
+    python3 "$SCRIPT_DIR/send_message.py" \
+      --chat-key "$CHAT_KEY" \
+      --bot-config-id "$BOT_CONFIG_ID" \
+      --bot-name "$BOT_NAME" \
+      --msgtype template_card \
+      --template-card-file "$CARD_FILE" || exit 1
+  else
+    python3 "$SCRIPT_DIR/send_message.py" \
+      --chat-key "$CHAT_KEY" \
+      --bot-config-id "$BOT_CONFIG_ID" \
+      --msgtype template_card \
+      --template-card-file "$CARD_FILE" || exit 1
+  fi
 else
-  python3 "$SCRIPT_DIR/send_message.py" \
-    --chat-key "$CHAT_KEY" \
-    --bot-name "$BOT_NAME" \
-    --msgtype template_card \
-    --template-card-file "$CARD_FILE" || exit 1
+  if [ -n "$BOT_NAME" ]; then
+    python3 "$SCRIPT_DIR/send_message.py" \
+      --chat-key "$CHAT_KEY" \
+      --bot-name "$BOT_NAME" \
+      --msgtype template_card \
+      --template-card-file "$CARD_FILE" || exit 1
+  else
+    python3 "$SCRIPT_DIR/send_message.py" \
+      --chat-key "$CHAT_KEY" \
+      --msgtype template_card \
+      --template-card-file "$CARD_FILE" || exit 1
+  fi
 fi
 
 echo "[smoke] sent. now verify in WeCom:"
@@ -69,4 +84,4 @@ echo "1. owner clicks once -> card should update"
 echo "2. another member clicks once -> card should not update, only receive a hint"
 echo
 echo "[smoke] useful log filters:"
-echo "grep -n 'template_card_event\\|message request accepted via api\\|template card update skipped\\|这是 .* 的卡片' '$SCRIPT_DIR/bridge.log' | tail -n 50"
+echo "grep -n 'template_card_event\\|message request accepted via \\|template card update skipped\\|这是 .* 的卡片' '$SCRIPT_DIR/bridge.log' | tail -n 50"

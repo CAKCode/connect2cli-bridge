@@ -11,7 +11,7 @@ def looks_like_codex_command(command: str | None) -> bool:
     if not raw:
         return True
     name = Path(raw).name.lower()
-    return name == "codex" or name == "codex.js" or "codex" in name
+    return name == "codex" or name == "codex.js" or name.startswith("codex-")
 
 
 def _path_entries(path_value: str) -> list[str]:
@@ -38,7 +38,7 @@ def resolve_executable(command: str) -> Path | None:
 
     if os.path.sep in raw or (os.path.altsep and os.path.altsep in raw):
         candidate = Path(raw).expanduser()
-        if candidate.exists():
+        if candidate.is_file():
             return candidate.resolve()
         return None
 

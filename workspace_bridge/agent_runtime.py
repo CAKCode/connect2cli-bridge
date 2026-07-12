@@ -70,28 +70,35 @@ def _copy_root_claude_state(source_root: Path, target_root: Path) -> None:
     for name in copy_dirs:
         source = source_root / name
         target = target_root / name
-        if not source.exists() or target.exists():
+        if not source.exists() and not source.is_symlink():
             continue
-        if source.is_dir():
-            shutil.copytree(source, target)
+        if target.is_symlink() and not target.exists():
+            target.unlink(missing_ok=True)
+        elif target.exists() or target.is_symlink():
+            continue
+        if source.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.readlink(source), target, target_is_directory=source.is_dir())
+        elif source.is_dir():
+            shutil.copytree(source, target, symlinks=True)
         else:
-            shutil.copy2(source, target)
+            shutil.copy2(source, target, follow_symlinks=False)
 
 
 def _chown_tree(path: Path, uid: int, gid: int) -> None:
     for root, dirs, files in os.walk(path):
         try:
-            os.chown(root, uid, gid)
+            os.chown(root, uid, gid, follow_symlinks=False)
         except OSError:
             pass
         for name in dirs:
             try:
-                os.chown(os.path.join(root, name), uid, gid)
+                os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
             except OSError:
                 pass
         for name in files:
             try:
-                os.chown(os.path.join(root, name), uid, gid)
+                os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
             except OSError:
                 pass
 

@@ -30,6 +30,7 @@ workspace/
 .runtime/
 .shared-runtime/
 .claude-runtime/
+.ops-console/
 
 # Only keep WeCom-related skills in this repository.
 relate-skills/*

@@ -5,6 +5,7 @@ from contextlib import suppress
 import json
 import hashlib
 from json import JSONDecodeError
+import time
 import uuid
 
 from aiohttp import web
@@ -21,7 +22,9 @@ from .runtime import (
     cleanup_orphan_session_codex_homes,
     cleanup_stale_session_codex_homes,
     load_reply_url_state,
+    load_session_record,
     load_template_card_state,
+    normalize_optional_int,
     stable_session_id,
 )
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
@@ -46,6 +49,8 @@ def _clear_deferred_schedule_cache(runtime: WeComBotRuntime, runtime_root, sched
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
+                continue
+            if not isinstance(payload, dict):
                 continue
             if str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
                 continue
@@ -93,6 +98,73 @@ async def _interrupt_active_schedule_run(runtime: WeComBotRuntime, schedule_id: 
     runtime.terminal_schedule_cancels.discard((chat_key, request_id))
 
 
+def _resolve_valid_reply_url_state(runtime: WeComBotRuntime, reply_req_id: str) -> dict | None:
+    state = dict(runtime.reply_urls.get(reply_req_id) or {})
+    if not state:
+        return None
+    response_url = str(state.get("responseUrl") or "").strip()
+    if not response_url:
+        return None
+    captured_at_ms = normalize_optional_int(state.get("capturedAtMs")) or 0
+    if captured_at_ms <= 0 or int(time.time() * 1000) - captured_at_ms >= 60 * 60 * 1000:
+        return None
+    if state.get("consumed") is True:
+        return None
+    return {**state, "responseUrl": response_url}
+
+
+def _restore_persisted_runtime_state(runtime: WeComBotRuntime, config: AppConfig) -> None:
+    runtime.template_card_payloads = {}
+    runtime.template_card_button_texts = {}
+    runtime.template_card_delivery_meta = load_template_card_state(config.runtime_root, config.bot_id)
+    runtime.reply_urls = load_reply_url_state(config.runtime_root, config.bot_id)
+    runtime.consumed_template_card_actions = set()
+    for item in runtime.template_card_delivery_meta.values():
+        template_card = item.get("templateCard")
+        if not isinstance(template_card, dict):
+            continue
+        task_id = str(template_card.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        runtime.template_card_payloads[task_id] = dict(template_card)
+        button_texts: dict[str, str] = {}
+        for button in template_card.get("button_list") or []:
+            if not isinstance(button, dict):
+                continue
+            key = str(button.get("key") or "").strip()
+            text = str(button.get("text") or "").strip()
+            if key and text:
+                button_texts[key] = text
+        if button_texts:
+            runtime.template_card_button_texts[task_id] = button_texts
+
+
+def _schedule_bot_identity_payload(config: AppConfig) -> dict[str, str]:
+    return {
+        "botId": config.bot_id,
+        "botConfigId": config.bot_id,
+        "botName": config.bot_name,
+    }
+
+
+def _load_schedule_definition_for_current_bot(config: AppConfig, schedule_id: str):
+    from .schedule import read_schedule_definition
+
+    definition = read_schedule_definition(config.runtime_root, schedule_id)
+    if definition is None:
+        return None
+    if definition.bot_id not in {None, config.bot_id}:
+        return None
+    return definition
+
+
+def _normalize_optional_text(value) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
 async def api_health(request: web.Request) -> web.Response:
     config = request.app[APP_CONFIG_KEY]
     runtime = request.app[APP_WECOM_RUNTIME_KEY]
@@ -133,6 +205,10 @@ async def api_health(request: web.Request) -> web.Response:
         },
         status=200 if health_ok else 503,
     )
+
+
+async def api_livez(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "botId": request.app[APP_CONFIG_KEY].bot_id}, status=200)
 
 
 async def api_prepare(request) -> web.Response:
@@ -257,31 +333,37 @@ async def api_send_message(request) -> web.Response:
         raise web.HTTPBadRequest(text="request body must be a JSON object")
     chat_key = str(data.get("chatKey") or "").strip()
     reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip()
+    if reply_req_id.lower() in {"null", "none"}:
+        reply_req_id = ""
     msgtype = str(data.get("msgtype") or "").strip()
     if not chat_key and not reply_req_id:
         raise web.HTTPBadRequest(text="chatKey required")
-    if chat_key:
+    if chat_key and not reply_req_id:
         try:
             parse_chat_key(chat_key)
         except ValueError as exc:
             raise web.HTTPBadRequest(text=str(exc)) from exc
+    reply_state = _resolve_valid_reply_url_state(runtime, reply_req_id) if reply_req_id else None
+    if reply_req_id and reply_state is None:
+        raise web.HTTPNotFound(text=f"reply response_url not found or expired: {reply_req_id}")
+    resolved_chat_key = str((reply_state or {}).get("chatKey") or "").strip() if reply_req_id else chat_key
     if not msgtype:
         raise web.HTTPBadRequest(text="msgtype required")
     if msgtype == "markdown":
         content = str(data.get("content") or "").strip()
         if not content:
             raise web.HTTPBadRequest(text="content required")
-        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        feedback_id = _normalize_optional_text(data.get("feedbackId") or data.get("feedback_id"))
         if feedback_id is not None:
             try:
                 feedback_id = validate_feedback_id(feedback_id)
             except ValueError as exc:
                 raise web.HTTPBadRequest(text=str(exc)) from exc
         message = OutboundMessage(
-            chat_key=chat_key or str((runtime.reply_urls.get(reply_req_id) or {}).get("chatKey") or ""),
+            chat_key=resolved_chat_key,
             msgtype="markdown",
             content=content,
-            mention_user_id=str(data.get("mentionUserId") or data.get("mention_user_id") or "").strip() or None,
+            mention_user_id=_normalize_optional_text(data.get("mentionUserId") or data.get("mention_user_id")),
             feedback_id=feedback_id,
         )
     elif msgtype == "template_card":
@@ -290,21 +372,21 @@ async def api_send_message(request) -> web.Response:
             template_card = validate_template_card_payload(template_card, require_interaction_task_id=False)
         except ValueError as exc:
             raise web.HTTPBadRequest(text=str(exc)) from exc
-        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        feedback_id = _normalize_optional_text(data.get("feedbackId") or data.get("feedback_id"))
         if feedback_id is not None:
             try:
                 feedback_id = validate_feedback_id(feedback_id)
             except ValueError as exc:
                 raise web.HTTPBadRequest(text=str(exc)) from exc
         message = OutboundMessage(
-            chat_key=chat_key or str((runtime.reply_urls.get(reply_req_id) or {}).get("chatKey") or ""),
+            chat_key=resolved_chat_key,
             msgtype="template_card",
             template_card=template_card,
             feedback_id=feedback_id,
         )
     else:
         raise web.HTTPBadRequest(text=f"unsupported msgtype: {msgtype}")
-    if runtime.ws is None or not runtime.connected:
+    if not reply_req_id and (runtime.ws is None or not runtime.connected):
         raise web.HTTPServiceUnavailable(text="bot not connected")
     try:
         if reply_req_id:
@@ -317,12 +399,14 @@ async def api_send_message(request) -> web.Response:
         message_text = str(exc) or "message send failed"
         if "not connected" in message_text:
             raise web.HTTPServiceUnavailable(text=message_text) from exc
+        if message_text.startswith("reply response_url not found or expired:"):
+            raise web.HTTPNotFound(text=message_text) from exc
         raise web.HTTPBadGateway(text=message_text) from exc
     except Exception as exc:
         raise web.HTTPBadGateway(text=str(exc) or "message send failed") from exc
     response_payload = {
         "ok": True,
-        "chatKey": chat_key,
+        "chatKey": message.chat_key,
         "msgtype": msgtype,
         "payloadCount": int(result.get("payloadCount") or 1),
     }
@@ -381,6 +465,7 @@ async def api_list_schedules(request) -> web.Response:
 
     definitions = [
         {
+            **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": item.schedule_id,
             "chatKey": item.chat_key,
             "sessionId": stable_session_id(
@@ -408,7 +493,7 @@ async def api_list_schedules(request) -> web.Response:
             "misfirePolicy": item.misfire_policy,
             "concurrencyPolicy": item.concurrency_policy,
         }
-        for item in list_schedule_definitions(request.app[APP_CONFIG_KEY].runtime_root)
+        for item in list_schedule_definitions(request.app[APP_CONFIG_KEY].runtime_root, bot_id=request.app[APP_CONFIG_KEY].bot_id)
     ]
     return web.json_response(definitions)
 
@@ -416,7 +501,7 @@ async def api_list_schedules(request) -> web.Response:
 async def api_create_schedule(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
-    from .schedule import create_schedule_definition
+    from .schedule import create_schedule_definition, read_schedule_definition
 
     try:
         data = await request.json()
@@ -424,21 +509,50 @@ async def api_create_schedule(request) -> web.Response:
         raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
     if not isinstance(data, dict):
         raise web.HTTPBadRequest(text="request body must be a JSON object")
+    schedule_id = _normalize_optional_text(data.get("scheduleId") or data.get("schedule_id")) or ""
     chat_key = str(data.get("chatKey") or "").strip()
+    session_id = _normalize_optional_text(data.get("sessionId") or data.get("session_id")) or ""
     message = str(data.get("message") or "").strip()
+    mode = str(data.get("mode") or "").strip().lower()
     cron = str(data.get("cron") or "").strip()
-    timezone_name = str(data.get("timezone") or "UTC").strip() or "UTC"
-    misfire_policy = str(data.get("misfirePolicy") or data.get("misfire_policy") or "fire_once_now").strip() or "fire_once_now"
-    concurrency_policy = str(data.get("concurrencyPolicy") or data.get("concurrency_policy") or "skip_if_running").strip() or "skip_if_running"
-    max_runs = data.get("maxRuns") or data.get("max_runs")
-    if not chat_key:
-        raise web.HTTPBadRequest(text="chatKey required")
+    interval_value = None
+    for key in ("intervalSeconds", "interval_seconds", "everySeconds", "every_seconds"):
+        if key in data:
+            interval_value = data.get(key)
+            break
+    timezone_name = _normalize_optional_text(data.get("timezone")) or "UTC"
+    misfire_policy = _normalize_optional_text(data.get("misfirePolicy") or data.get("misfire_policy")) or "fire_once_now"
+    concurrency_policy = _normalize_optional_text(data.get("concurrencyPolicy") or data.get("concurrency_policy")) or "skip_if_running"
+    max_runs = data.get("maxRuns") if "maxRuns" in data else data.get("max_runs")
+    if not chat_key and not session_id:
+        raise web.HTTPBadRequest(text="chatKey or sessionId required")
+    if chat_key:
+        try:
+            parse_chat_key(chat_key)
+        except ValueError as exc:
+            if not session_id:
+                raise web.HTTPBadRequest(text=str(exc)) from exc
+            chat_key = ""
+    if not chat_key and session_id:
+        record = load_session_record(request.app[APP_CONFIG_KEY].runtime_root, session_id)
+        if record is None:
+            raise web.HTTPNotFound(text=f"session not found: {session_id}")
+        if record.bot_id != request.app[APP_CONFIG_KEY].bot_id:
+            raise web.HTTPConflict(text=f"bot config mismatch for schedule target: {request.app[APP_CONFIG_KEY].bot_id}")
+        chat_key = record.chat_key
     if not message:
         raise web.HTTPBadRequest(text="message required")
+    if interval_value not in (None, ""):
+        raise web.HTTPBadRequest(text="intervalSeconds is no longer supported; use cron")
+    if mode not in {"", "cron"}:
+        raise web.HTTPBadRequest(text="mode must be cron")
     if not cron:
         raise web.HTTPBadRequest(text="cron required")
-    schedule_seed = "\n".join((chat_key, message, cron, timezone_name, str(max_runs or ""), misfire_policy, concurrency_policy))
-    schedule_id = f"schedule-{hashlib.sha1(schedule_seed.encode('utf-8')).hexdigest()[:8]}-{uuid.uuid4().hex[:8]}"
+    if not schedule_id:
+        schedule_seed = "\n".join((chat_key, message, cron, timezone_name, str(max_runs or ""), misfire_policy, concurrency_policy))
+        schedule_id = f"schedule-{hashlib.sha1(schedule_seed.encode('utf-8')).hexdigest()[:8]}-{uuid.uuid4().hex[:8]}"
+    elif read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id) is not None:
+        raise web.HTTPConflict(text=f"scheduleId already exists: {schedule_id}")
     try:
         definition = create_schedule_definition(
             request.app[APP_CONFIG_KEY].runtime_root,
@@ -450,12 +564,14 @@ async def api_create_schedule(request) -> web.Response:
             max_runs=max_runs,
             misfire_policy=misfire_policy,
             concurrency_policy=concurrency_policy,
+            bot_id=request.app[APP_CONFIG_KEY].bot_id,
         )
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     return web.json_response(
         {
             "ok": True,
+            **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": definition.schedule_id,
             "chatKey": definition.chat_key,
             "sessionId": stable_session_id(
@@ -489,13 +605,12 @@ async def api_create_schedule(request) -> web.Response:
 async def api_get_schedule(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
-    from .schedule import read_schedule_definition
-
-    definition = read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, request.match_info["schedule_id"])
+    definition = _load_schedule_definition_for_current_bot(request.app[APP_CONFIG_KEY], request.match_info["schedule_id"])
     if definition is None:
         raise web.HTTPNotFound(text="schedule not found")
     return web.json_response(
         {
+            **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": definition.schedule_id,
             "chatKey": definition.chat_key,
             "sessionId": stable_session_id(
@@ -529,10 +644,10 @@ async def api_get_schedule(request) -> web.Response:
 async def api_pause_schedule(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
-    from .schedule import pause_schedule_definition, read_schedule_definition
+    from .schedule import pause_schedule_definition
 
     schedule_id = request.match_info["schedule_id"]
-    definition = read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
+    definition = _load_schedule_definition_for_current_bot(request.app[APP_CONFIG_KEY], schedule_id)
     if definition is None:
         raise web.HTTPNotFound(text="schedule not found")
     await _interrupt_active_schedule_run(
@@ -549,7 +664,13 @@ async def api_pause_schedule(request) -> web.Response:
         definition = pause_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(text="schedule not found") from exc
-    return web.json_response({"scheduleId": definition.schedule_id, "enabled": definition.enabled})
+    return web.json_response(
+        {
+            **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
+            "scheduleId": definition.schedule_id,
+            "enabled": definition.enabled,
+        }
+    )
 
 
 async def api_resume_schedule(request) -> web.Response:
@@ -558,21 +679,28 @@ async def api_resume_schedule(request) -> web.Response:
     from .schedule import resume_schedule_definition
 
     try:
-        definition = resume_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, request.match_info["schedule_id"])
+        definition = _load_schedule_definition_for_current_bot(request.app[APP_CONFIG_KEY], request.match_info["schedule_id"])
+        if definition is None:
+            raise FileNotFoundError(request.match_info["schedule_id"])
+        definition = resume_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, definition.schedule_id)
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(text="schedule not found") from exc
-    return web.json_response({"scheduleId": definition.schedule_id, "enabled": definition.enabled})
+    return web.json_response(
+        {
+            **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
+            "scheduleId": definition.schedule_id,
+            "enabled": definition.enabled,
+        }
+    )
 
 
 async def api_delete_schedule(request) -> web.Response:
     if not request.app[APP_CONFIG_KEY].wecom_enabled:
         raise web.HTTPServiceUnavailable(text="schedules require wecom runtime")
+    schedule_id = request.match_info["schedule_id"]
     from .schedule import delete_schedule_definition
 
-    schedule_id = request.match_info["schedule_id"]
-    from .schedule import read_schedule_definition
-
-    definition = read_schedule_definition(request.app[APP_CONFIG_KEY].runtime_root, schedule_id)
+    definition = _load_schedule_definition_for_current_bot(request.app[APP_CONFIG_KEY], schedule_id)
     if definition is None:
         raise web.HTTPNotFound(text="schedule not found")
     await _interrupt_active_schedule_run(
@@ -593,32 +721,14 @@ def create_app(config: AppConfig) -> web.Application:
     app = web.Application()
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.template_card_delivery_meta = load_template_card_state(config.runtime_root, config.bot_id)
-    runtime.reply_urls = load_reply_url_state(config.runtime_root, config.bot_id)
-    for item in runtime.template_card_delivery_meta.values():
-        template_card = item.get("templateCard")
-        if not isinstance(template_card, dict):
-            continue
-        task_id = str(template_card.get("task_id") or "").strip()
-        if not task_id:
-            continue
-        runtime.template_card_payloads[task_id] = dict(template_card)
-        button_texts: dict[str, str] = {}
-        for button in template_card.get("button_list") or []:
-            if not isinstance(button, dict):
-                continue
-            key = str(button.get("key") or "").strip()
-            text = str(button.get("text") or "").strip()
-            if key and text:
-                button_texts[key] = text
-        if button_texts:
-            runtime.template_card_button_texts[task_id] = button_texts
+    _restore_persisted_runtime_state(runtime, config)
     app[APP_CONFIG_KEY] = config
     app[APP_BOT_KEY] = bot
     app[APP_WECOM_RUNTIME_KEY] = runtime
     app[APP_WECOM_TASK_KEY] = None
     app[APP_SCHEDULE_TASK_KEY] = None
     app.router.add_get("/", api_health)
+    app.router.add_get("/livez", api_livez)
     app.router.add_get("/healthz", api_health)
     app.router.add_post("/api/prepare", api_prepare)
     app.router.add_post("/api/send-message", api_send_message)
@@ -632,6 +742,7 @@ def create_app(config: AppConfig) -> web.Application:
     app.router.add_delete("/api/schedules/{schedule_id}", api_delete_schedule)
 
     async def on_startup(app_: web.Application) -> None:
+        _restore_persisted_runtime_state(app_[APP_WECOM_RUNTIME_KEY], config)
         cleanup_outdated_session_artifacts(bot)
         cleanup_orphan_session_codex_homes(config.runtime_root)
         cleanup_stale_session_codex_homes(
@@ -723,6 +834,11 @@ def create_app(config: AppConfig) -> web.Application:
         runtime_.suppressed_failure_tasks = set()
         runtime_.resume_candidates = {}
         runtime_.resume_selection_expires_at = {}
+        runtime_.template_card_payloads = {}
+        runtime_.template_card_button_texts = {}
+        runtime_.template_card_delivery_meta = {}
+        runtime_.consumed_template_card_actions = set()
+        runtime_.reply_urls = {}
         app_[APP_WECOM_TASK_KEY] = None
 
     app.on_startup.append(on_startup)

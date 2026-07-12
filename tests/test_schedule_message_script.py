@@ -53,6 +53,19 @@ def test_schedule_message_parse_args_supports_chat_key():
     assert parsed["run-at"] == "123"
 
 
+def test_schedule_message_parse_args_rejects_unexpected_positional_arg(capsys):
+    module = load_schedule_message_module()
+
+    try:
+        module.parse_args(["oops", "--message", "hello", "--chat-key", "single:test-user", "--run-at", "123"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert "unexpected argument: oops" in capsys.readouterr().err
+
+
 def test_schedule_message_parse_args_supports_reply_req_id_and_template_card():
     module = load_schedule_message_module()
 
@@ -115,9 +128,46 @@ def test_schedule_message_main_accepts_chat_key(monkeypatch, capsys):
     assert '"ok": true' in output.lower()
 
 
+def test_schedule_message_main_rejects_invalid_chat_key(monkeypatch, capsys):
+    module = load_schedule_message_module()
+    monkeypatch.setattr(sys, "argv", ["schedule_message.py", "--chat-key", "invalid", "--run-at", "123", "--message", "hello"])
+
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert "invalid chat key" in capsys.readouterr().err
+
+
 def test_schedule_message_main_uses_env_bot_name(monkeypatch, capsys):
     monkeypatch.setenv("WECOM_BRIDGE_BOT_NAME", "codex2")
     monkeypatch.setenv("WECOM_BRIDGE_BOT_CONFIG_ID", "bot-1")
+    module = load_schedule_message_module()
+    captured = {}
+
+    def fake_write_one_shot_schedule(data):
+        captured.update(data)
+        return {"ok": True, "botName": data.get("botName")}
+
+    monkeypatch.setattr(module, "write_one_shot_schedule", fake_write_one_shot_schedule)
+    monkeypatch.setattr(sys, "argv", ["schedule_message.py", "--chat-key", "single:test-user", "--run-at", "123", "--message", "hello"])
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert captured["botName"] == "codex2"
+    assert captured["targetConfigId"] == "bot-1"
+    assert '"ok": true' in output.lower()
+
+
+def test_schedule_message_main_uses_wecom_bot_env_defaults_when_bridge_env_missing(monkeypatch, capsys):
+    monkeypatch.delenv("WECOM_BRIDGE_BOT_NAME", raising=False)
+    monkeypatch.delenv("WECOM_BRIDGE_BOT_CONFIG_ID", raising=False)
+    monkeypatch.setenv("WECOM_BOT_NAME", "codex2")
+    monkeypatch.setenv("WECOM_BOT_CONFIG_ID", "bot-1")
     module = load_schedule_message_module()
     captured = {}
 
@@ -223,4 +273,70 @@ def test_schedule_message_main_accepts_reply_req_id_template_card(monkeypatch, c
     assert captured["replyReqId"] == "req-1"
     assert captured["msgtype"] == "template_card"
     assert captured["templateCard"]["card_type"] == "button_interaction"
+    assert '"ok": true' in output.lower()
+
+
+def test_schedule_message_main_ignores_invalid_chat_key_when_reply_req_id_present(monkeypatch, capsys):
+    module = load_schedule_message_module()
+    captured = {}
+
+    def fake_write_one_shot_schedule(data):
+        captured.update(data)
+        return {"ok": True, "replyReqId": data.get("replyReqId")}
+
+    monkeypatch.setattr(module, "write_one_shot_schedule", fake_write_one_shot_schedule)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "schedule_message.py",
+            "--reply-req-id",
+            "req-1",
+            "--chat-key",
+            "invalid",
+            "--run-at",
+            "123",
+            "--message",
+            "hello",
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert captured["replyReqId"] == "req-1"
+    assert captured["chatKey"] == "invalid"
+    assert '"ok": true' in output.lower()
+
+
+def test_schedule_message_main_ignores_invalid_chat_key_when_session_id_present(monkeypatch, capsys):
+    module = load_schedule_message_module()
+    captured = {}
+
+    def fake_write_one_shot_schedule(data):
+        captured.update(data)
+        return {"ok": True, "sessionId": data.get("sessionId")}
+
+    monkeypatch.setattr(module, "write_one_shot_schedule", fake_write_one_shot_schedule)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "schedule_message.py",
+            "--session-id",
+            "sess-1",
+            "--chat-key",
+            "invalid",
+            "--run-at",
+            "123",
+            "--message",
+            "hello",
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    assert captured["sessionId"] == "sess-1"
+    assert captured["chatKey"] == "invalid"
     assert '"ok": true' in output.lower()

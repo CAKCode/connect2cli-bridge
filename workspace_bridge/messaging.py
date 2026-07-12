@@ -20,7 +20,7 @@ class MessagingProvider(Protocol):
 
 
 def get_messaging_provider(config) -> MessagingProvider:
-    platform = str(getattr(config, "platform", "wecom") or "wecom").strip().lower()
+    platform = (str(getattr(config, "platform", "wecom") or "").strip().lower() or "wecom")
     if platform == "wecom":
         from .wecom_messaging import WeComMessagingProvider
 

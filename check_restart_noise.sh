@@ -1,5 +1,7 @@
 #!/bin/sh
 
+set -eu
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -18,7 +20,8 @@ echo "[1/3] Restart bridge"
 sh "$SCRIPT_DIR/start.sh" || exit 1
 
 echo "[2/3] Wait for health check"
-python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" <<'PY'
+python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "${BRIDGE_BASIC_AUTH:-}" "${BRIDGE_TOKEN:-}" <<'PY'
+import base64
 import json
 import sys
 import time
@@ -27,14 +30,24 @@ import urllib.request
 host = sys.argv[1]
 port = int(sys.argv[2])
 timeout_sec = int(sys.argv[3])
+basic_auth = sys.argv[4]
+token = sys.argv[5]
 base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-url = f"http://{base_host}:{port}/"
+url = f"http://{base_host}:{port}/healthz"
 deadline = time.time() + timeout_sec
 last_error = None
 
+headers = {}
+if basic_auth:
+    raw = base64.b64encode(basic_auth.encode("utf-8")).decode("ascii")
+    headers["Authorization"] = f"Basic {raw}"
+elif token:
+    headers["Authorization"] = f"Bearer {token}"
+
 while time.time() < deadline:
     try:
-        with urllib.request.urlopen(url, timeout=2) as resp:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=2) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
             if payload.get("ok") is True:
                 print(f"health ok: {url}")

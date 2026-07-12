@@ -3,25 +3,34 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import aiohttp
 from aiohttp import WSMsgType
 
 from .async_utils import run_blocking
 from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
+from .layout import build_workspace_ref
 from .reply_state import cleanup_reply_state
 from .runtime import (
     list_session_records,
+    load_session_record,
+    path_within_root,
     prepare_session_run,
     remove_session_chatfile,
     remove_session_codex_home,
+    resolve_personal_session_cwd,
+    resolve_personal_skill_dir,
     stable_session_id,
     update_session_record,
 )
+from .schedule import advance_schedule_definition_after_success, schedule_processing_root
+from .schedule import schedule_definition_processing_marker_file
 from .runtime import store_reply_url_state
 from .wecom_protocol import (
     build_subscribe_payload,
     build_text_response_payload,
+    chat_key_from_message,
     chat_key_to_user_id,
     extract_response_url,
     is_subscribe_ok,
@@ -55,6 +64,7 @@ async def _wait_for_process_exit(process, timeout_sec: float = 1.0) -> None:
 
 
 def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None = None) -> str:
+    session_record = load_session_record(runtime.config.runtime_root, session_id) if session_id else None
     active_task = runtime.active_message_tasks.get(chat_key)
     active_schedule_task = runtime.active_schedule_tasks.get(chat_key)
     active = (
@@ -63,7 +73,7 @@ def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None 
         or (active_schedule_task is not None and not active_schedule_task.done())
         or chat_key in runtime.active_schedule_runs
     )
-    thread_id = str(runtime.session_threads.get(chat_key) or "").strip() or "-"
+    thread_id = str(runtime.session_threads.get(chat_key) or (session_record.thread_id if session_record is not None else "") or "").strip() or "-"
     pending_stream_count = 0
     for req_id, payloads in (runtime.pending_streams or {}).items():
         state = runtime.reply_states.get(req_id)
@@ -74,17 +84,123 @@ def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None 
         state = runtime.reply_states.get(req_id)
         if state is not None and state.chat_key == chat_key:
             pending_final_count += 1
+    session_cwd = session_record.cwd_dir if session_record is not None else None
+    if session_cwd is not None:
+        current_cwd = str(session_cwd)
+    else:
+        current_cwd = str(
+            build_workspace_ref(
+                runtime.config.runtime_root,
+                runtime.config.workspace_namespace,
+                runtime.config.source.source_dir,
+                chat_key,
+                workspace_mode=runtime.config.workspace_mode,
+                agent_backend=runtime.config.agent_backend,
+            ).cwd_dir
+        )
     return "\n".join(
         [
             f"chatKey: {chat_key}",
             f"sessionId: {session_id or '-'}",
             f"threadId: {thread_id}",
+            f"cwd: {current_cwd}",
             f"connected: {'yes' if runtime.connected else 'no'}",
             f"running: {'yes' if active else 'no'}",
             f"pendingStreams: {pending_stream_count}",
             f"pendingFinals: {pending_final_count}",
         ]
     )
+
+
+async def _handle_cwd_command(runtime, parsed, command_session_id: str, command_text: str) -> bool:
+    if not command_text.startswith("/cwd"):
+        return False
+    if runtime.config.workspace_mode != "personal":
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(parsed.req_id, command_session_id, "仅 personal 模式支持 /cwd；team 模式不允许切换。", final=True),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    active_task = runtime.active_message_tasks.get(parsed.chat_key)
+    active_schedule_task = runtime.active_schedule_tasks.get(parsed.chat_key)
+    if (
+        parsed.chat_key in runtime.active_processes
+        or (active_task is not None and not active_task.done())
+        or (active_schedule_task is not None and not active_schedule_task.done())
+        or parsed.chat_key in runtime.active_schedule_runs
+    ):
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(parsed.req_id, command_session_id, "当前有任务在运行，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。", final=True),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    launch = await run_blocking(prepare_session_run, runtime.config, parsed.chat_key)
+    current_cwd = launch.cwd.resolve()
+    args = command_text.split(None, 1)
+    if len(args) == 1:
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(parsed.req_id, command_session_id, f"Current cwd: {current_cwd}", final=True),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    requested = args[1].strip()
+    if not requested:
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(parsed.req_id, command_session_id, f"Current cwd: {current_cwd}", final=True),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    requested_path = Path(requested).expanduser()
+    resolved = (current_cwd / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
+    try:
+        next_cwd = resolve_personal_session_cwd(runtime.config, resolved)
+    except ValueError as exc:
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(parsed.req_id, command_session_id, str(exc), final=True),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    if not path_within_root(next_cwd, runtime.config.source.source_dir):
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(
+                parsed.req_id,
+                command_session_id,
+                f"cwd must stay within workDir: {runtime.config.source.source_dir}",
+                final=True,
+            ),
+        )
+        cleanup_reply_state(runtime, parsed.req_id)
+        return True
+    changed = next_cwd != current_cwd
+    if changed:
+        runtime.session_threads.pop(parsed.chat_key, None)
+        _clear_resume_selection(runtime, parsed.chat_key)
+    skill_dir = resolve_personal_skill_dir(next_cwd)
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    update_session_record(
+        runtime.config.runtime_root,
+        command_session_id,
+        lambda current: replace(
+            current,
+            workspace_mode="personal",
+            cwd_dir=next_cwd,
+            skill_dir=skill_dir,
+            thread_id=None if changed else current.thread_id,
+            updated_at=int(__import__("time").time() * 1000),
+        ),
+    )
+    await ws_send_json(
+        runtime,
+        build_text_response_payload(parsed.req_id, command_session_id, f"cwd changed to {next_cwd}", final=True),
+    )
+    cleanup_reply_state(runtime, parsed.req_id)
+    return True
 
 
 def _handle_message_task(chat_key: str, task, runtime) -> None:
@@ -103,6 +219,51 @@ def _handle_message_task(chat_key: str, task, runtime) -> None:
     except Exception as exc:
         runtime.last_status = "message_failed"
         runtime.last_error = str(exc)
+
+
+async def _interrupt_active_schedule_run_for_chat(runtime, chat_key: str) -> None:
+    active = runtime.active_schedule_runs.get(chat_key)
+    schedule_id = str(active[0]).strip() if active is not None and len(active) > 0 else ""
+    request_id = str(active[1]).strip() if active is not None and len(active) > 1 else ""
+    if request_id:
+        runtime.suppressed_schedule_cancels.add((chat_key, request_id))
+        runtime.terminal_schedule_cancels.add((chat_key, request_id))
+    schedule_task = runtime.active_schedule_tasks.pop(chat_key, None)
+    process = runtime.active_processes.get(chat_key)
+    if schedule_task is not None:
+        with __import__("contextlib").suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            schedule_task.cancel()
+            await asyncio.wait_for(schedule_task, timeout=1.0)
+    if process is not None:
+        process.terminate()
+        await _wait_for_process_exit(process)
+        runtime.active_processes.pop(chat_key, None)
+    runtime.active_schedule_runs.pop(chat_key, None)
+    processing_root = schedule_processing_root(runtime.config.runtime_root)
+    for path in processing_root.glob("*.json"):
+        if schedule_id and path == schedule_definition_processing_marker_file(runtime.config.runtime_root, schedule_id):
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload_request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+        if request_id and payload_request_id == request_id:
+            path.unlink(missing_ok=True)
+    if schedule_id:
+        advance_schedule_definition_after_success(runtime.config.runtime_root, schedule_id)
+    if request_id:
+        cache_key = f"job:{request_id}"
+        if runtime.pending_finals is not None:
+            runtime.pending_finals.pop(cache_key, None)
+        if runtime.pending_streams is not None:
+            runtime.pending_streams.pop(cache_key, None)
+        cleanup_reply_state(runtime, cache_key)
+        runtime.suppressed_schedule_cancels.discard((chat_key, request_id))
+        runtime.terminal_schedule_cancels.discard((chat_key, request_id))
 
 
 def _chat_key_to_room_id(chat_key: str) -> str | None:
@@ -130,7 +291,7 @@ def _resume_record_is_visible(target_key: str, current_key: str) -> bool:
 def _build_resume_candidates_from_records(records, runtime, chat_key: str) -> list[dict[str, str | int]]:
     candidates: list[dict[str, str | int]] = []
     for record in records:
-        thread_id = str(runtime.session_threads.get(record.chat_key) or "").strip()
+        thread_id = str(runtime.session_threads.get(record.chat_key) or record.thread_id or "").strip()
         if not thread_id or not _resume_record_is_visible(record.chat_key, chat_key):
             continue
         candidates.append(
@@ -206,6 +367,8 @@ async def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, st
             current,
             updated_at=int(__import__("time").time() * 1000),
             last_run_at=int(__import__("time").time() * 1000),
+            thread_id=thread_id,
+            recent_chat=record.recent_chat,
         ),
     )
     _clear_resume_selection(runtime, chat_key)
@@ -294,29 +457,47 @@ async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
     task.add_done_callback(lambda completed, chat_key=parsed.chat_key: _handle_message_task(chat_key, completed, runtime))
 
 
-async def handle_wecom_payload(config, runtime, ws, payload, handler):
-    if resolve_pending_request(runtime, payload):
+def _runtime_has_pending_payloads(runtime) -> bool:
+    return bool(runtime.pending_streams or runtime.pending_finals)
+
+
+async def _flush_pending_runtime_payloads_from_inbound(runtime, source: str) -> None:
+    if runtime.ws is None or not _runtime_has_pending_payloads(runtime):
         return
-    req_id = str((payload.get("headers") or {}).get("req_id") or "").strip()
+    try:
+        await flush_cached_runtime_payloads(runtime)
+    except Exception as exc:
+        runtime.last_error = str(exc)
+
+
+async def handle_wecom_payload(config, runtime, ws, payload, handler):
+    if not isinstance(payload, dict):
+        return
+    if resolve_pending_request(runtime, payload):
+        await _flush_pending_runtime_payloads_from_inbound(runtime, "resolved_request")
+        return
+    headers = payload.get("headers")
+    req_id = str(headers.get("req_id") or "").strip() if isinstance(headers, dict) else ""
     response_url = extract_response_url(payload)
     if req_id and response_url:
-        chat_key = None
-        parsed_preview = parse_text_callback(payload)
-        if parsed_preview is not None:
-            chat_key = parsed_preview.chat_key
-        else:
-            event_preview = parse_template_card_event(payload)
-            if event_preview is not None:
-                chat_key = event_preview.chat_key
-        runtime.reply_urls[req_id] = {
-            "responseUrl": response_url,
-            "chatKey": str(chat_key or ""),
-            "capturedAtMs": int(__import__("time").time() * 1000),
-            "consumed": False,
-        }
-        store_reply_url_state(runtime.config.runtime_root, runtime.config.bot_id, runtime.reply_urls)
+        try:
+            chat_key = chat_key_from_message(payload)
+        except ValueError:
+            chat_key = None
+        if chat_key:
+            runtime.reply_urls[req_id] = {
+                "responseUrl": response_url,
+                "chatKey": str(chat_key or ""),
+                "capturedAtMs": int(__import__("time").time() * 1000),
+                "consumed": False,
+            }
+            store_reply_url_state(runtime.config.runtime_root, runtime.config.bot_id, runtime.reply_urls)
     if str(payload.get("cmd") or "").strip() == "aibot_event_callback":
-        event_type = str((((payload.get("body") or {}).get("event") or {}).get("eventtype") or "")).strip()
+        body = payload.get("body")
+        body_dict = body if isinstance(body, dict) else {}
+        event = body_dict.get("event")
+        event_dict = event if isinstance(event, dict) else {}
+        event_type = str(event_dict.get("eventtype") or "").strip()
         if event_type == "disconnected_event":
             _set_wecom_state(runtime, "websocket_disconnected_event", "bot disconnected event")
             if runtime.ws is not None and ws is not None and runtime.ws is ws:
@@ -326,14 +507,19 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
     if card_event is not None:
         task_id = str(card_event.task_id or "").strip()
         if task_id:
-            runtime.template_card_delivery_meta[task_id] = {
+            current = dict(runtime.template_card_delivery_meta.get(task_id) or {})
+            template_card = runtime.template_card_payloads.get(task_id) or current.get("templateCard") or {}
+            current.update({
                 "taskId": task_id,
                 "chatKey": card_event.chat_key,
-                "templateCard": dict(runtime.template_card_payloads.get(task_id) or {}),
-            }
+                "templateCard": dict(template_card),
+            })
+            runtime.template_card_delivery_meta[task_id] = current
         return
     parsed = parse_text_callback(payload)
     if parsed is None:
+        if payload.get("errcode") is not None and is_subscribe_ok(payload) and not payload.get("cmd"):
+            await _flush_pending_runtime_payloads_from_inbound(runtime, "ack_only")
         return
     text = strip_text_mentions(parsed.content, runtime.config.bot_name)
     command_text = normalize_bridge_command_text(parsed.content, runtime.config.bot_name)
@@ -360,6 +546,8 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
             ),
         )
         cleanup_reply_state(runtime, parsed.req_id)
+        return
+    if await _handle_cwd_command(runtime, parsed, command_session_id, command_text):
         return
     if command_text == "/bridge-resume":
         records = await run_blocking(list_session_records, runtime.config.runtime_root, runtime.config.bot_id)
@@ -393,6 +581,7 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
     if command_text == "/bridge-reset":
         _clear_resume_selection(runtime, parsed.chat_key)
         runtime.session_threads.pop(parsed.chat_key, None)
+        await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
         process = runtime.active_processes.pop(parsed.chat_key, None)
         active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
         if active_task is not None:
@@ -414,6 +603,17 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         )
         await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
         await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
+        update_session_record(
+            runtime.config.runtime_root,
+            session_id,
+            lambda current: replace(
+                current,
+                updated_at=int(__import__("time").time() * 1000),
+                last_run_at=int(__import__("time").time() * 1000),
+                thread_id=None,
+                recent_chat=(),
+            ),
+        )
         req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
         for req_id in req_ids:
             cleanup_reply_state(runtime, req_id)
@@ -426,6 +626,7 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         return
     if command_text == "/bridge-interrupt":
         _clear_resume_selection(runtime, parsed.chat_key)
+        await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
         process = runtime.active_processes.get(parsed.chat_key)
         active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
         if active_task is not None:
@@ -481,6 +682,10 @@ async def run_wecom_runtime_once(config, runtime) -> None:
                 _set_wecom_state(runtime, "subscribe_failed", f"unexpected subscribe message type: {subscribe_msg.type!s}")
                 raise RuntimeError(runtime.wecom_last_error or "subscribe failed")
             subscribe_response = json.loads(subscribe_msg.data)
+            if not isinstance(subscribe_response, dict):
+                runtime.connected = False
+                _set_wecom_state(runtime, "subscribe_failed", "unexpected subscribe payload shape")
+                raise RuntimeError(runtime.wecom_last_error or "subscribe failed")
             if resolve_pending_request(runtime, subscribe_response):
                 pass
             if not is_subscribe_ok(subscribe_response):

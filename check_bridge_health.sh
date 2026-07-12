@@ -8,10 +8,12 @@ cd "$SCRIPT_DIR"
 load_bridge_runtime_env "$SCRIPT_DIR" || exit 1
 
 : "${HEALTH_TIMEOUT_SEC:=10}"
+SCHEDULE_ROOT="${BRIDGE_SHARED_RUNTIME_ROOT:-$SCRIPT_DIR}/.scheduled-messages"
 
-python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "$BRIDGE_BASIC_AUTH" "$BRIDGE_TOKEN" <<'PY'
+python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "$BRIDGE_BASIC_AUTH" "$BRIDGE_TOKEN" "$SCHEDULE_ROOT" <<'PY'
 import base64
 import json
+import pathlib
 import sys
 import time
 import urllib.request
@@ -21,6 +23,7 @@ port = int(sys.argv[2])
 timeout_sec = int(sys.argv[3])
 basic_auth = sys.argv[4]
 token = sys.argv[5]
+schedule_root = pathlib.Path(sys.argv[6]).expanduser()
 
 def api_base():
     base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
@@ -44,7 +47,7 @@ deadline = time.time() + timeout_sec
 last_error = None
 while time.time() < deadline:
     try:
-        root = fetch_json("/")
+        root = fetch_json("/livez")
         if root.get("ok") is True:
             break
         last_error = f"unexpected root payload: {root}"
@@ -55,14 +58,17 @@ else:
     print(f"bridge health failed: {last_error}", file=sys.stderr)
     raise SystemExit(1)
 
-bots = fetch_json("/api/bots")
+try:
+    bots = fetch_json("/api/bots")
+except Exception as exc:
+    print(f"bridge bot listing failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
 processing = 0
 pending = 0
-for folder in (".scheduled-messages/processing", ".scheduled-messages/pending"):
+for folder in (schedule_root / "processing", schedule_root / "pending"):
     try:
-        import pathlib
-        count = sum(1 for item in pathlib.Path(folder).glob("*.json"))
-        if folder.endswith("processing"):
+        count = sum(1 for item in folder.glob("*.json"))
+        if folder.name == "processing":
             processing = count
         else:
             pending = count

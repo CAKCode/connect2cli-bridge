@@ -161,12 +161,16 @@ Implemented:
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/bridge-resume`
+- `/cwd`
 
 Meaning:
 
 - `status` reports current runtime state and identifiers
 - `interrupt` stops the current run without resetting the conversation state
 - `reset` clears the active session context and starts fresh
+- `resume` lists resumable sessions visible to the current chat and binds the selected session thread
+- `cwd` is available only in `workspaceMode=personal`; it shows or switches the session cwd within `workDir`, and cannot switch while a run is active
 
 API equivalents also exist for interrupt and reset.
 

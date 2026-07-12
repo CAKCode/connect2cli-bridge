@@ -5,6 +5,7 @@ import os
 import sys
 
 import bridge
+from workspace_bridge.layout import parse_chat_key
 
 
 EXPECTED_ARG_KEYS = {
@@ -39,8 +40,8 @@ EXPECTED_ARG_KEYS = {
     "concurrency-policy",
     "concurrency_policy",
 }
-DEFAULT_BOT_NAME = str(os.environ.get("WECOM_BRIDGE_BOT_NAME") or "").strip()
-DEFAULT_BOT_CONFIG_ID = str(os.environ.get("WECOM_BRIDGE_BOT_CONFIG_ID") or "").strip()
+DEFAULT_BOT_NAME = str(os.environ.get("WECOM_BRIDGE_BOT_NAME") or os.environ.get("WECOM_BOT_NAME") or "").strip()
+DEFAULT_BOT_CONFIG_ID = str(os.environ.get("WECOM_BRIDGE_BOT_CONFIG_ID") or os.environ.get("WECOM_BOT_CONFIG_ID") or "").strip()
 DASH_PREFIX_VALUE_KEYS = {
     "message",
 }
@@ -57,8 +58,7 @@ def parse_args(argv: list[str]) -> dict[str, str]:
     while idx < len(argv):
         item = argv[idx]
         if not item.startswith("--"):
-            idx += 1
-            continue
+            fail(f"unexpected argument: {item}", 2)
         raw = item[2:]
         if "=" in raw:
             key, value = raw.split("=", 1)
@@ -104,6 +104,11 @@ def main() -> None:
 
     if not session_id and not chat_key and not reply_req_id:
         fail("session-id or chat-key or reply-req-id required", 2)
+    if chat_key and not session_id and not reply_req_id:
+        try:
+            parse_chat_key(chat_key)
+        except ValueError as exc:
+            fail(str(exc), 2)
     if msgtype == "markdown" and not message.strip():
         fail("message required", 2)
     if msgtype == "template_card":

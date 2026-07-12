@@ -13,6 +13,8 @@ AgentBackend = Literal["codex", "claude"]
 
 def normalize_agent_backend(value: str | None) -> AgentBackend:
     text = str(value or "").strip().lower()
+    if text in {"none", "null"}:
+        text = ""
     if not text or text == "codex":
         return "codex"
     if text in {"claude", "claude-code", "claudecode"}:
@@ -21,7 +23,10 @@ def normalize_agent_backend(value: str | None) -> AgentBackend:
 
 
 def parse_command_to_argv(command: str) -> tuple[str, ...]:
-    return tuple(shlex.split(command))
+    try:
+        return tuple(shlex.split(command))
+    except ValueError:
+        return (command,)
 
 
 def _resolve_command(raw: str | None, env_var: str, default_argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -127,17 +132,16 @@ def extract_agent_thread_id(backend: AgentBackend, stdout: str) -> str | None:
         except Exception:
             continue
         if backend == "claude":
-            if str(payload.get("type") or "").strip() == "system":
-                session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
-                if session_id:
-                    return session_id
-                subtype = str(payload.get("subtype") or "").strip()
-                if subtype == "init":
-                    nested = payload.get("data")
-                    if isinstance(nested, dict):
-                        session_id = str(nested.get("session_id") or nested.get("sessionId") or "").strip()
-                        if session_id:
-                            return session_id
+            session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+            if session_id:
+                return session_id
+            subtype = str(payload.get("subtype") or "").strip()
+            if subtype == "init":
+                nested = payload.get("data")
+                if isinstance(nested, dict):
+                    session_id = str(nested.get("session_id") or nested.get("sessionId") or "").strip()
+                    if session_id:
+                        return session_id
             continue
         if payload.get("type") == "thread.started":
             thread_id = str(payload.get("thread_id") or "").strip()
@@ -159,7 +163,7 @@ def prepare_subprocess_env(
     raw = str(command or "").strip()
     if raw:
         command_name = Path(raw).name.lower()
-        if command_name not in {"codex", "codex.js"} and "codex" not in command_name:
+        if command_name not in {"codex", "codex.js"} and not command_name.startswith("codex-"):
             return prepared
 
     path_value = prepared.get("PATH") or os.defpath
@@ -197,7 +201,7 @@ def resolve_executable(command: str | None) -> Path | None:
         return None
     if os.path.sep in raw or (os.path.altsep and os.path.altsep in raw):
         candidate = Path(raw).expanduser()
-        if candidate.exists():
+        if candidate.is_file():
             return candidate.resolve()
         return None
     resolved = shutil.which(raw)

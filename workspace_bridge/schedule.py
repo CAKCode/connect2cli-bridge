@@ -5,6 +5,7 @@ import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .layout import parse_chat_key
@@ -38,8 +39,25 @@ VALID_MISFIRE_POLICIES = {"fire_once_now", "skip_missed"}
 VALID_CONCURRENCY_POLICIES = {"skip_if_running"}
 
 
+def _parse_optional_bool(value, *, default: bool) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean: {value}")
+
+
 def _schedule_root(runtime_root: Path | str) -> Path:
     return Path(runtime_root).expanduser().resolve() / "schedules"
+
+
+def _path_component(value: str) -> str:
+    return quote(str(value or "").strip(), safe="._-")
 
 
 def schedule_pending_root(runtime_root: Path | str) -> Path:
@@ -72,6 +90,30 @@ def schedule_definition_root(runtime_root: Path | str) -> Path:
     return root
 
 
+def schedule_definition_file(runtime_root: Path | str, schedule_id: str) -> Path:
+    return schedule_definition_root(runtime_root) / f"{_path_component(schedule_id)}.json"
+
+
+def schedule_failed_marker_file(runtime_root: Path | str, schedule_id: str) -> Path:
+    return schedule_failed_root(runtime_root) / f"{_path_component(schedule_id)}.json"
+
+
+def schedule_done_marker_file(runtime_root: Path | str, schedule_id: str) -> Path:
+    return schedule_done_root(runtime_root) / f"{_path_component(schedule_id)}.json"
+
+
+def schedule_processing_marker_file(runtime_root: Path | str, schedule_id: str) -> Path:
+    return schedule_processing_root(runtime_root) / f"definition-{_path_component(schedule_id)}.json"
+
+
+def schedule_definition_processing_marker_file(runtime_root: Path | str, schedule_id: str) -> Path:
+    return schedule_processing_marker_file(runtime_root, schedule_id)
+
+
+def scheduled_job_file_name(run_at: int, request_id: str) -> str:
+    return f"{int(run_at):013d}-{_path_component(request_id)}.json"
+
+
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
@@ -80,10 +122,13 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def _read_json(path: Path) -> dict | None:
+    if path.is_symlink():
+        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return payload if isinstance(payload, dict) else None
 
 
 def resolve_schedule_timezone(name: str) -> ZoneInfo:
@@ -233,22 +278,105 @@ def compute_next_cron_run_on_or_after(cron: str, timezone_name: str, current_ms:
     raise ValueError("cron has no matching run time within 5 years")
 
 
+def _parse_schedule_definition_payload(payload: dict | None) -> ScheduleDefinition | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        schedule_id = str(payload["schedule_id"] or "").strip()
+        chat_key = str(payload["chat_key"] or "").strip()
+        message = str(payload["message"] or "").strip()
+        cron_raw = payload.get("cron")
+        cron = None if cron_raw in (None, "") else str(cron_raw).strip() or None
+        timezone_raw = payload.get("timezone_name")
+        timezone_name = None if timezone_raw in (None, "") else str(timezone_raw).strip() or None
+        next_run_at = int(payload["next_run_at"])
+        enabled = _parse_optional_bool(payload.get("enabled", True), default=True)
+        max_runs_raw = payload.get("max_runs")
+        max_runs = None if max_runs_raw in (None, "") else int(max_runs_raw)
+        run_count = int(payload.get("run_count", 0))
+        misfire_policy = str(payload.get("misfire_policy") or "fire_once_now").strip() or "fire_once_now"
+        concurrency_policy = str(payload.get("concurrency_policy") or "skip_if_running").strip() or "skip_if_running"
+        run_at_raw = payload.get("run_at_ms")
+        run_at_ms = None if run_at_raw in (None, "") else int(run_at_raw)
+        bot_id_raw = payload.get("bot_id")
+        bot_id = None if bot_id_raw in (None, "") else str(bot_id_raw).strip() or None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not schedule_id or not message:
+        return None
+    try:
+        parse_chat_key(chat_key)
+        validate_schedule_misfire_policy(misfire_policy)
+        validate_schedule_concurrency_policy(concurrency_policy)
+    except ValueError:
+        return None
+    return ScheduleDefinition(
+        schedule_id=schedule_id,
+        chat_key=chat_key,
+        message=message,
+        cron=cron,
+        timezone_name=timezone_name,
+        next_run_at=next_run_at,
+        enabled=enabled,
+        max_runs=max_runs,
+        run_count=run_count,
+        misfire_policy=misfire_policy,
+        concurrency_policy=concurrency_policy,
+        run_at_ms=run_at_ms,
+        bot_id=bot_id,
+    )
+
+
+def parse_scheduled_job_payload(payload: dict | None) -> ScheduledJob | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        request_id = str(payload["request_id"] or "").strip()
+        schedule_id = str(payload["schedule_id"] or "").strip()
+        chat_key = str(payload["chat_key"] or "").strip()
+        message = str(payload["message"] or "").strip()
+        run_at = int(payload["run_at"])
+        created_at = int(payload["created_at"])
+        bot_id_raw = payload.get("bot_id")
+        bot_id = None if bot_id_raw in (None, "") else str(bot_id_raw).strip() or None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not request_id or not schedule_id or not message:
+        return None
+    try:
+        parse_chat_key(chat_key)
+    except ValueError:
+        return None
+    return ScheduledJob(
+        request_id=request_id,
+        schedule_id=schedule_id,
+        chat_key=chat_key,
+        message=message,
+        run_at=run_at,
+        created_at=created_at,
+        bot_id=bot_id,
+    )
+
+
 def write_schedule_definition(runtime_root: Path | str, definition: ScheduleDefinition) -> ScheduleDefinition:
-    _write_json(schedule_definition_root(runtime_root) / f"{definition.schedule_id}.json", asdict(definition))
+    _write_json(schedule_definition_file(runtime_root, definition.schedule_id), asdict(definition))
     return definition
 
 
 def read_schedule_definition(runtime_root: Path | str, schedule_id: str) -> ScheduleDefinition | None:
-    payload = _read_json(schedule_definition_root(runtime_root) / f"{schedule_id}.json")
-    return ScheduleDefinition(**payload) if payload else None
+    payload = _read_json(schedule_definition_file(runtime_root, schedule_id))
+    return _parse_schedule_definition_payload(payload)
 
 
-def list_schedule_definitions(runtime_root: Path | str) -> list[ScheduleDefinition]:
+def list_schedule_definitions(runtime_root: Path | str, *, bot_id: str | None = None) -> list[ScheduleDefinition]:
     items = []
     for path in sorted(schedule_definition_root(runtime_root).glob("*.json")):
-        payload = _read_json(path)
-        if payload:
-            items.append(ScheduleDefinition(**payload))
+        definition = _parse_schedule_definition_payload(_read_json(path))
+        if definition is None:
+            continue
+        if bot_id is not None and definition.bot_id not in {None, bot_id}:
+            continue
+        items.append(definition)
     return items
 
 
@@ -302,6 +430,7 @@ def create_schedule_definition(
     max_runs: int | None = None,
     misfire_policy: str = "fire_once_now",
     concurrency_policy: str = "skip_if_running",
+    bot_id: str | None = None,
 ) -> ScheduleDefinition:
     parse_chat_key(chat_key)
     normalized_max_runs = None if max_runs in (None, "") else int(max_runs)
@@ -321,6 +450,7 @@ def create_schedule_definition(
         run_count=0,
         misfire_policy=normalized_misfire_policy,
         concurrency_policy=normalized_concurrency_policy,
+        bot_id=bot_id,
     )
     return write_schedule_definition(runtime_root, definition)
 
@@ -332,6 +462,7 @@ def create_one_shot_schedule(
     chat_key: str,
     message: str,
     run_at_ms: int,
+    bot_id: str | None = None,
 ) -> ScheduleDefinition:
     parse_chat_key(chat_key)
     definition = ScheduleDefinition(
@@ -347,12 +478,13 @@ def create_one_shot_schedule(
         misfire_policy="fire_once_now",
         concurrency_policy="skip_if_running",
         run_at_ms=run_at_ms,
+        bot_id=bot_id,
     )
     return write_schedule_definition(runtime_root, definition)
 
 
-def due_schedule_definitions(runtime_root: Path | str, *, current_ms: int) -> list[ScheduleDefinition]:
-    return [item for item in list_schedule_definitions(runtime_root) if item.enabled and item.next_run_at <= current_ms]
+def due_schedule_definitions(runtime_root: Path | str, *, current_ms: int, bot_id: str | None = None) -> list[ScheduleDefinition]:
+    return [item for item in list_schedule_definitions(runtime_root, bot_id=bot_id) if item.enabled and item.next_run_at <= current_ms]
 
 
 def pause_schedule_definition(runtime_root: Path | str, schedule_id: str) -> ScheduleDefinition:
@@ -361,10 +493,14 @@ def pause_schedule_definition(runtime_root: Path | str, schedule_id: str) -> Sch
         raise FileNotFoundError(schedule_id)
     for root in (schedule_pending_root(runtime_root), schedule_processing_root(runtime_root)):
         for path in root.glob("*.json"):
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+                continue
             payload = _read_json(path)
             if not payload or str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
                 continue
             path.replace(schedule_failed_root(runtime_root) / path.name)
+    schedule_definition_processing_marker_file(runtime_root, schedule_id).unlink(missing_ok=True)
     return write_schedule_definition(runtime_root, replace(definition, enabled=False))
 
 
@@ -387,13 +523,17 @@ def delete_schedule_definition(runtime_root: Path | str, schedule_id: str) -> No
         schedule_done_root(runtime_root),
     ):
         for path in root.glob("*.json"):
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+                continue
             payload = _read_json(path)
             if not payload or str(payload.get("schedule_id") or payload.get("scheduleId") or "") != schedule_id:
                 continue
             path.unlink(missing_ok=True)
-    schedule_failed_root(runtime_root).joinpath(f"{schedule_id}.json").unlink(missing_ok=True)
-    schedule_done_root(runtime_root).joinpath(f"{schedule_id}.json").unlink(missing_ok=True)
-    (schedule_definition_root(runtime_root) / f"{schedule_id}.json").unlink(missing_ok=True)
+    schedule_definition_processing_marker_file(runtime_root, schedule_id).unlink(missing_ok=True)
+    schedule_failed_marker_file(runtime_root, schedule_id).unlink(missing_ok=True)
+    schedule_done_marker_file(runtime_root, schedule_id).unlink(missing_ok=True)
+    schedule_definition_file(runtime_root, schedule_id).unlink(missing_ok=True)
 
 
 def write_scheduled_job(path: Path, job: ScheduledJob) -> None:

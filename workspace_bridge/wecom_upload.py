@@ -6,36 +6,38 @@ import hashlib
 from pathlib import Path
 
 from .models import FileSendRequest, WeComBotRuntime
-from .wecom_protocol import uid
-
-
-def chat_key_to_send_target(key: str) -> tuple[int, str]:
-    if key.startswith("group-user:"):
-        parts = key.split(":", 2)
-        return 2, parts[1]
-    chat_type_name, chat_id = key.split(":", 1)
-    return (2 if chat_type_name == "group" else 1), chat_id
+from .wecom_protocol import uid, chat_key_to_send_target
 
 
 def build_send_file_payload(chat_key: str, media_id: str) -> dict:
+    media_id_text = str(media_id or "").strip()
+    if not media_id_text:
+        raise ValueError("media_id required")
     chat_type, chat_id = chat_key_to_send_target(chat_key)
     return {
         "cmd": "aibot_send_msg",
         "headers": {"req_id": uid()},
-        "body": {"chatid": chat_id, "chat_type": chat_type, "msgtype": "file", "file": {"media_id": media_id}},
+        "body": {"chatid": chat_id, "chat_type": chat_type, "msgtype": "file", "file": {"media_id": media_id_text}},
     }
 
 
 def create_request_future(bot: WeComBotRuntime, req_id: str) -> asyncio.Future:
     if bot.pending_requests is None:
         bot.pending_requests = {}
+    req_text = str(req_id or "").strip()
+    if not req_text:
+        raise ValueError("req_id required")
+    existing = bot.pending_requests.get(req_text)
+    if existing is not None and not existing.done():
+        raise RuntimeError(f"duplicate pending request: {req_text}")
     future = asyncio.get_running_loop().create_future()
-    bot.pending_requests[req_id] = future
+    bot.pending_requests[req_text] = future
     return future
 
 
 def resolve_pending_request(bot: WeComBotRuntime, payload: dict) -> bool:
-    req_id = str((payload.get("headers") or {}).get("req_id") or "")
+    headers = payload.get("headers")
+    req_id = str(headers.get("req_id") or "").strip() if isinstance(headers, dict) else ""
     if not req_id or not bot.pending_requests:
         return False
     future = bot.pending_requests.pop(req_id, None)
@@ -79,11 +81,17 @@ async def send_ws_payload_with_ack(bot: WeComBotRuntime, payload: dict, timeout_
 
 
 def require_ack_ok(payload: dict, stage: str, *, required_body_key: str | None = None) -> dict:
-    errcode = int(payload.get("errcode", 0))
+    raw_errcode = payload.get("errcode", 0)
+    try:
+        errcode = int(raw_errcode if raw_errcode not in (None, "") else 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{stage} failed: invalid errcode") from exc
     if errcode != 0:
         errmsg = str(payload.get("errmsg") or f"{stage} failed")
         raise RuntimeError(f"{stage} failed: {errmsg}")
-    body = payload.get("body") or {}
+    body = payload.get("body")
+    if not isinstance(body, dict):
+        body = {}
     if required_body_key and not body.get(required_body_key):
         raise RuntimeError(f"{stage} failed: missing {required_body_key}")
     return body

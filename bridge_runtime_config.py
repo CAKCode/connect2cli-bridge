@@ -57,6 +57,10 @@ def resolve_host_port(env: Mapping[str, str] | None = None) -> tuple[str, int]:
         or str(values.get("HOST") or "").strip()
         or DEFAULT_HOST
     )
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1].strip()
+    if not host:
+        raise ValueError("BRIDGE_HOST/HOST cannot be empty")
     port_raw = (
         str(values.get("BRIDGE_PORT") or "").strip()
         or str(values.get("PORT") or "").strip()

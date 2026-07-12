@@ -16,7 +16,7 @@ Chinese docs:
 - Manages multiple bot configurations and persistence
 - Starts `codex exec` per session and attempts `codex exec resume` only when a runtime thread is still available
 - Supports built-in session control commands:
-  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`
+  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`, `/bridge-resume`, `/cwd`
 - Downloads inbound WeCom images and files into local workspaces
 - Sends local files back to WeCom through a local command or JSON API
 - Supports one-shot scheduled messages and cron-based recurring schedules
@@ -298,6 +298,8 @@ These commands are intercepted by the bridge and are not forwarded to Codex:
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/bridge-resume`
+- `/cwd`
 
 Meaning:
 
@@ -307,6 +309,10 @@ Meaning:
   stop the current run but keep thread and chat context
 - `/bridge-reset`
   stop the current run and clear session context
+- `/bridge-resume`
+  list resumable sessions visible to the current chat; reply with the index or send `/bridge-resume <sessionId>`
+- `/cwd`
+  available only in `workspaceMode=personal`; `/cwd` shows the current directory, `/cwd <path>` switches to a subdirectory inside `workDir`, and switching is blocked while a run is active
 
 The same controls are also exposed by API:
 

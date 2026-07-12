@@ -6,6 +6,8 @@ import contextlib
 import fcntl
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -20,12 +22,26 @@ START_SH_PATH = REPO_ROOT / "start.sh"
 WATCHDOG_SH_PATH = REPO_ROOT / "bridge_watchdog.sh"
 BRIDGE_RUNTIME_CONFIG_PATH = REPO_ROOT / "bridge_runtime_config.py"
 BRIDGE_ENV_SH_PATH = REPO_ROOT / "bridge_env.sh"
+CHECK_BRIDGE_HEALTH_SH_PATH = REPO_ROOT / "check_bridge_health.sh"
+CHECK_RESTART_NOISE_SH_PATH = REPO_ROOT / "check_restart_noise.sh"
+DEPLOY_FROM_CODEX_SH_PATH = REPO_ROOT / "deploy_from_codex.sh"
 
 
 def load_runtime_config_module():
     spec = importlib.util.spec_from_file_location(
         f"bridge_runtime_config_test_{time.time_ns()}",
         BRIDGE_RUNTIME_CONFIG_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_bridge_module():
+    spec = importlib.util.spec_from_file_location(
+        f"bridge_test_env_{time.time_ns()}",
+        REPO_ROOT / "bridge.py",
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -92,12 +108,82 @@ class FakeStdin:
         return None
 
 
+def make_acking_ws(bot, on_send=None):
+    class AckingWS:
+        closed = False
+
+        async def send_json(self, payload):
+            if on_send is not None:
+                on_send(payload)
+            req_id = ((payload.get("headers") or {}).get("req_id"))
+            future = bot.pending_requests.get(req_id) if req_id else None
+            if future is not None and not future.done():
+                future.set_result({"headers": {"req_id": req_id}, "errcode": 0, "body": {}})
+
+    return AckingWS()
+
+
+def make_flaky_acking_ws(bot, *, fail_on_send_number: int, on_send=None, error: Exception | None = None):
+    failure = error or RuntimeError("socket closed")
+
+    class FlakyAckingWS:
+        closed = False
+
+        def __init__(self) -> None:
+            self.send_count = 0
+
+        async def send_json(self, payload):
+            self.send_count += 1
+            if self.send_count == fail_on_send_number:
+                raise failure
+            if on_send is not None:
+                on_send(payload)
+            req_id = ((payload.get("headers") or {}).get("req_id"))
+            future = bot.pending_requests.get(req_id) if req_id else None
+            if future is not None and not future.done():
+                future.set_result({"headers": {"req_id": req_id}, "errcode": 0, "body": {}})
+
+    return FlakyAckingWS()
+
+
 def test_create_session_record_does_not_persist_workdir(bridge_module):
     bot = make_bot(bridge_module)
     record = bridge_module.create_session_record(bot, "single:test-user")
     persisted = bridge_module.read_json_file(bridge_module.get_registry_session_file(record["sessionId"]), None)
     assert persisted is not None
     assert "workDir" not in persisted
+
+
+def test_create_session_record_persists_personal_cwd_dir(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-record"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    persisted = bridge_module.read_json_file(bridge_module.get_registry_session_file(record["sessionId"]), None)
+
+    assert persisted is not None
+    assert persisted["cwdDir"] == str(work_dir.resolve())
+
+
+def test_get_or_create_session_restores_persisted_recent_chat(bridge_module):
+    bot = make_bot(bridge_module)
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    bridge_module.update_session_record(
+        record["sessionId"],
+        lambda current: {
+            **current,
+            "recentChat": [
+                {"role": "user", "text": "older user turn", "time": 1},
+                {"role": "bot", "text": "older bot turn", "time": 2},
+            ],
+        },
+    )
+
+    sess = bridge_module.get_or_create_session(bot, "single:test-user")
+
+    assert [item["text"] for item in sess.chat] == ["older user turn", "older bot turn"]
 
 
 def test_normalize_bot_config_preserves_workspace_namespace(bridge_module):
@@ -135,6 +221,84 @@ def test_normalize_bot_config_defaults_workspace_namespace_to_generated_id(bridg
     assert normalized["workspaceNamespace"] == normalized["id"]
 
 
+def test_normalize_bot_config_rejects_null_bot_id(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-null-botid.txt", "secret\n")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.normalize_bot_config(
+            {
+                "name": "codex1",
+                "botId": "null",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "groupSessionMode": "per-user",
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "botId required"
+
+
+def test_normalize_bot_config_treats_null_config_id_as_generated(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-null-config-id.txt", "secret\n")
+
+    normalized = bridge_module.normalize_bot_config(
+        {
+            "id": "null",
+            "name": "codex1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["id"]
+    assert normalized["id"] != "null"
+
+
+def test_bridge_module_treats_null_codex_exec_mode_as_host(monkeypatch):
+    monkeypatch.setenv("CODEX_EXEC_MODE", "null")
+
+    module = load_bridge_module()
+
+    assert module.CODEX_EXEC_MODE == "host"
+
+
+def test_normalize_bot_config_treats_null_work_dir_as_default_work_dir(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-null-workdir.txt", "secret\n")
+    monkeypatch.setattr(bridge_module, "DEFAULT_WORK_DIR", str(bridge_module.BASE_DIR))
+
+    normalized = bridge_module.normalize_bot_config(
+        {
+            "name": "codex1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": "null",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["workDir"] == str(bridge_module.BASE_DIR.resolve())
+
+
+def test_normalize_bot_config_treats_null_workspace_namespace_as_default_id(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-null-namespace.txt", "secret\n")
+
+    normalized = bridge_module.normalize_bot_config(
+        {
+            "name": "codex1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "workspaceNamespace": "null",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["workspaceNamespace"] == normalized["id"]
+
+
 def test_normalize_bot_config_defaults_workspace_mode_by_backend_for_new_configs(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-workspace-mode.txt", "secret\n")
 
@@ -161,6 +325,66 @@ def test_normalize_bot_config_defaults_workspace_mode_by_backend_for_new_configs
     assert claude_config["workspaceMode"] == "personal"
 
 
+def test_normalize_bot_config_treats_null_workspace_mode_as_backend_default(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-workspace-null.txt", "secret\n")
+
+    codex_config = bridge_module.normalize_bot_config(
+        {
+            "botId": "remote-bot-codex",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "codex",
+            "workspaceMode": "null",
+        }
+    )
+    claude_config = bridge_module.normalize_bot_config(
+        {
+            "botId": "remote-bot-claude",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "claude",
+            "workspaceMode": "null",
+        }
+    )
+
+    assert codex_config["workspaceMode"] == "team"
+    assert claude_config["workspaceMode"] == "personal"
+
+
+def test_normalize_bot_config_treats_null_group_session_mode_as_default_per_user(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-group-mode-null.txt", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "botId": "remote-bot-codex",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "null",
+        }
+    )
+
+    assert config["groupSessionMode"] == "per-user"
+
+
+def test_normalize_bot_config_treats_null_agent_backend_as_default_codex(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-agent-backend-null.txt", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "botId": "remote-bot-codex",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "null",
+        }
+    )
+
+    assert config["agentBackend"] == "codex"
+    assert config["workspaceMode"] == "team"
+
+
 def test_normalize_persisted_bot_config_defaults_missing_workspace_mode_to_team(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted.txt", "secret\n")
 
@@ -178,6 +402,103 @@ def test_normalize_persisted_bot_config_defaults_missing_workspace_mode_to_team(
     )
 
     assert normalized["workspaceMode"] == "team"
+
+
+def test_normalize_persisted_bot_config_treats_null_welcome_as_empty_string(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted-welcome-null.txt", "secret\n")
+
+    normalized = bridge_module.normalize_persisted_bot_config(
+        {
+            "id": "bot-1",
+            "name": "claude1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "welcome": "null",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["welcome"] == ""
+
+
+def test_normalize_persisted_bot_config_treats_null_name_as_default_unnamed(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted-name-null.txt", "secret\n")
+
+    normalized = bridge_module.normalize_persisted_bot_config(
+        {
+            "id": "bot-1",
+            "name": "null",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    assert normalized["name"] == "unnamed"
+
+
+def test_normalize_persisted_bot_config_rejects_null_bot_id(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted-botid-null.txt", "secret\n")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.normalize_persisted_bot_config(
+            {
+                "id": "bot-1",
+                "name": "claude1",
+                "botId": "null",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+            }
+        )
+
+    assert excinfo.value.status_code == 500
+    assert excinfo.value.message == "botId required"
+
+
+def test_normalize_persisted_bot_config_treats_null_optional_agent_fields_as_unset(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted-null-agent.txt", "secret\n")
+
+    normalized = bridge_module.normalize_persisted_bot_config(
+        {
+            "id": "bot-1",
+            "name": "claude1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "null",
+            "groupSessionMode": "null",
+            "agentCommand": "null",
+            "agentRunAsUser": "null",
+            "agentRunAsGroup": "none",
+            "agentRuntimeRoot": "null",
+        }
+    )
+
+    assert normalized["agentBackend"] == "codex"
+    assert normalized["groupSessionMode"] == "per-user"
+    assert normalized["agentCommand"] is None
+    assert normalized["agentRunAsUser"] is None
+    assert normalized["agentRunAsGroup"] is None
+    assert normalized["agentRuntimeRoot"] is None
+
+
+def test_normalize_persisted_bot_config_coerces_string_false_enabled(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "secret-persisted-enabled-false.txt", "secret\n")
+
+    normalized = bridge_module.normalize_persisted_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "remote-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "enabled": "false",
+        }
+    )
+
+    assert normalized["enabled"] is False
 
 
 def test_recycle_session_removes_idle_session_from_memory(bridge_module):
@@ -215,6 +536,59 @@ def test_cleanup_orphan_session_codex_homes_removes_unregistered_runtime_dirs(br
     assert removed == 1
     assert orphan.exists() is False
     assert live.exists() is True
+
+
+def test_cleanup_orphan_session_codex_homes_preserves_home_for_malformed_registered_session(bridge_module):
+    malformed_id = "sess-malformed"
+    malformed_home = bridge_module.get_session_codex_home_root(malformed_id)
+    orphan = bridge_module.get_session_codex_home_root("sess-orphan")
+    bridge_module.ensure_dir(malformed_home)
+    bridge_module.ensure_dir(orphan)
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(malformed_id),
+        {
+            "sessionId": malformed_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        },
+    )
+
+    removed = bridge_module.cleanup_orphan_session_codex_homes()
+
+    assert removed == 1
+    assert orphan.exists() is False
+    assert malformed_home.exists() is True
+
+
+def test_cleanup_orphan_session_codex_homes_unlinks_symlink_without_deleting_target(bridge_module):
+    orphan = bridge_module.get_session_codex_home_root("sess-orphan")
+    target = bridge_module.BASE_DIR / "external-session-home"
+    bridge_module.ensure_dir(target)
+    (target / "keep.txt").write_text("keep", encoding="utf-8")
+    bridge_module.ensure_dir_for(orphan)
+    orphan.symlink_to(target, target_is_directory=True)
+
+    removed = bridge_module.cleanup_orphan_session_codex_homes()
+
+    assert removed == 1
+    assert not os.path.lexists(orphan)
+    assert target.exists() is True
+    assert (target / "keep.txt").exists() is True
+
+
+def test_cleanup_orphan_session_codex_homes_removes_broken_symlink_home(bridge_module):
+    orphan = bridge_module.get_session_codex_home_root("sess-broken")
+    target = bridge_module.BASE_DIR / "missing-session-home"
+    bridge_module.ensure_dir_for(orphan)
+    orphan.symlink_to(target, target_is_directory=True)
+
+    removed = bridge_module.cleanup_orphan_session_codex_homes()
+
+    assert removed == 1
+    assert not os.path.lexists(orphan)
 
 
 def test_cleanup_stale_session_codex_homes_removes_only_expired_unleased_dirs(bridge_module):
@@ -277,6 +651,204 @@ def test_cleanup_stale_session_codex_homes_removes_only_expired_unleased_dirs(br
     assert active_home.exists() is True
 
 
+def test_cleanup_stale_session_codex_homes_unlinks_symlink_without_deleting_target(bridge_module):
+    session_id = "sess-stale-link"
+    stale_home = bridge_module.get_session_codex_home_root(session_id)
+    target = bridge_module.BASE_DIR / "external-stale-home"
+    bridge_module.ensure_dir(target)
+    (target / "keep.txt").write_text("keep", encoding="utf-8")
+    bridge_module.ensure_dir_for(stale_home)
+    stale_home.symlink_to(target, target_is_directory=True)
+    now_value = bridge_module.now_ms()
+    stale_ms = now_value - (bridge_module.SESSION_TTL * 1000) - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": stale_ms,
+            "updatedAt": stale_ms,
+            "lastRunAt": stale_ms,
+            "status": "idle",
+        },
+    )
+
+    removed = bridge_module.cleanup_stale_session_codex_homes(now_value)
+
+    assert removed == 1
+    assert not os.path.lexists(stale_home)
+    assert target.exists() is True
+    assert (target / "keep.txt").exists() is True
+
+
+def test_cleanup_stale_session_codex_homes_removes_broken_symlink_home(bridge_module):
+    session_id = "sess-broken-stale"
+    stale_home = bridge_module.get_session_codex_home_root(session_id)
+    target = bridge_module.BASE_DIR / "missing-stale-home"
+    bridge_module.ensure_dir_for(stale_home)
+    stale_home.symlink_to(target, target_is_directory=True)
+    now_value = bridge_module.now_ms()
+    stale_ms = now_value - (bridge_module.SESSION_TTL * 1000) - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": stale_ms,
+            "updatedAt": stale_ms,
+            "lastRunAt": stale_ms,
+            "status": "idle",
+        },
+    )
+
+    removed = bridge_module.cleanup_stale_session_codex_homes(now_value)
+
+    assert removed == 1
+    assert not os.path.lexists(stale_home)
+
+
+def test_cleanup_stale_session_codex_homes_removes_malformed_expired_record_home(bridge_module):
+    session_id = "sess-malformed-stale"
+    stale_home = bridge_module.get_session_codex_home_root(session_id)
+    bridge_module.ensure_dir(stale_home)
+    now_value = bridge_module.now_ms()
+    stale_ms = now_value - (bridge_module.SESSION_TTL * 1000) - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": stale_ms,
+            "updatedAt": stale_ms,
+            "lastRunAt": stale_ms,
+            "status": "idle",
+        },
+    )
+
+    removed = bridge_module.cleanup_stale_session_codex_homes(now_value)
+
+    assert removed == 1
+    assert stale_home.exists() is False
+
+
+def test_cleanup_stale_session_codex_homes_preserves_malformed_leased_home(bridge_module):
+    session_id = "sess-malformed-active"
+    active_home = bridge_module.get_session_codex_home_root(session_id)
+    bridge_module.ensure_dir(active_home)
+    now_value = bridge_module.now_ms()
+    stale_ms = now_value - (bridge_module.SESSION_TTL * 1000) - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": stale_ms,
+            "updatedAt": stale_ms,
+            "lastRunAt": stale_ms,
+            "leaseExpiresAt": now_value + 60_000,
+            "status": "leased",
+        },
+    )
+
+    removed = bridge_module.cleanup_stale_session_codex_homes(now_value)
+
+    assert removed == 0
+    assert active_home.exists() is True
+
+
+def test_cleanup_stale_session_codex_homes_preserves_active_session_id_even_when_record_looks_stale(
+    bridge_module,
+):
+    session_id = "sess-active-memory"
+    active_home = bridge_module.get_session_codex_home_root(session_id)
+    bridge_module.ensure_dir(active_home)
+    now_value = bridge_module.now_ms()
+    stale_ms = now_value - (bridge_module.SESSION_TTL * 1000) - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "createdAt": stale_ms,
+            "updatedAt": stale_ms,
+            "lastRunAt": stale_ms,
+            "status": "idle",
+        },
+    )
+
+    removed = bridge_module.cleanup_stale_session_codex_homes(now_value, active_session_ids={session_id})
+
+    assert removed == 0
+    assert active_home.exists() is True
+
+
+def test_migrate_legacy_workspace_dir_preserves_symlinked_entries(bridge_module):
+    source_root = bridge_module.BASE_DIR / "legacy-source"
+    target_root = bridge_module.BASE_DIR / "migrated-target"
+    external_target = bridge_module.BASE_DIR / "legacy-external-target"
+    bridge_module.ensure_dir(source_root)
+    bridge_module.ensure_dir(external_target)
+    (external_target / "nested.txt").write_text("nested", encoding="utf-8")
+    (source_root / "linked-dir").symlink_to(external_target, target_is_directory=True)
+    bridge_module.ensure_dir(source_root / "pkg")
+    (source_root / "pkg" / "linked-nested").symlink_to(external_target, target_is_directory=True)
+
+    bridge_module.migrate_legacy_workspace_dir(source_root, target_root)
+
+    linked_dir = target_root / "linked-dir"
+    nested_link = target_root / "pkg" / "linked-nested"
+    assert linked_dir.is_symlink()
+    assert linked_dir.resolve() == external_target.resolve()
+    assert nested_link.is_symlink()
+    assert nested_link.resolve() == external_target.resolve()
+    assert os.path.lexists(linked_dir)
+    assert os.path.lexists(nested_link)
+    assert (linked_dir / "nested.txt").read_text(encoding="utf-8") == "nested"
+    assert (nested_link / "nested.txt").read_text(encoding="utf-8") == "nested"
+
+
+def test_migrate_legacy_workspace_dir_does_not_recurse_into_existing_symlinked_target_dir(bridge_module):
+    source_root = bridge_module.BASE_DIR / "legacy-source-existing-target"
+    target_root = bridge_module.BASE_DIR / "migrated-target-existing-target"
+    external_target = bridge_module.BASE_DIR / "existing-symlink-target"
+    bridge_module.ensure_dir(source_root / "pkg")
+    bridge_module.ensure_dir(external_target)
+    (source_root / "pkg" / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    (external_target / "keep.txt").write_text("keep", encoding="utf-8")
+    bridge_module.ensure_dir(target_root)
+    (target_root / "pkg").symlink_to(external_target, target_is_directory=True)
+
+    bridge_module.migrate_legacy_workspace_dir(source_root, target_root)
+
+    linked_dir = target_root / "pkg"
+    assert linked_dir.is_symlink()
+    assert linked_dir.resolve() == external_target.resolve()
+    assert (external_target / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert not (external_target / "from-legacy.txt").exists()
+
+
+def test_migrate_legacy_workspace_dir_keeps_existing_broken_symlink_destination(bridge_module):
+    source_root = bridge_module.BASE_DIR / "legacy-source-broken-target"
+    target_root = bridge_module.BASE_DIR / "migrated-target-broken-target"
+    bridge_module.ensure_dir(source_root / "pkg")
+    (source_root / "pkg" / "from-legacy.txt").write_text("legacy", encoding="utf-8")
+    bridge_module.ensure_dir(target_root)
+    broken_target = bridge_module.BASE_DIR / "missing-existing-target"
+    (target_root / "pkg").symlink_to(broken_target, target_is_directory=True)
+
+    bridge_module.migrate_legacy_workspace_dir(source_root, target_root)
+
+    linked_dir = target_root / "pkg"
+    assert linked_dir.is_symlink()
+    assert not linked_dir.exists()
+    assert os.path.lexists(linked_dir)
+
+
 @pytest.mark.asyncio
 async def test_message_after_idle_recycle_reuses_session_id_and_recreates_runtime_session(bridge_module):
     bot = make_bot(bridge_module)
@@ -337,6 +909,162 @@ def test_sanitize_all_session_records_ignores_invalid_records(bridge_module, cap
     assert bridge_module.read_session_record_by_id("bad") is None
 
 
+def test_acquire_session_lease_reclaims_malformed_lock_file(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    record = bridge_module.create_session_record(bot, key)
+    sess = bridge_module.SessionState(
+        session_id=record["sessionId"],
+        work_dir=str(bridge_module.get_session_runtime_cwd(bot, key)),
+        lock_file=Path(record["lockFile"]),
+    )
+    sess.lock_file.parent.mkdir(parents=True, exist_ok=True)
+    sess.lock_file.write_text("[]", encoding="utf-8")
+
+    acquired = bridge_module.acquire_session_lease(bot, sess, key)
+
+    assert acquired is True
+    assert sess.lease_owned is True
+    lease = bridge_module.read_json_file(sess.lock_file, None)
+    assert lease["instanceId"] == bridge_module.INSTANCE_ID
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] == bridge_module.INSTANCE_ID
+
+
+def test_acquire_session_lease_replaces_broken_symlink_lock_file(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    record = bridge_module.create_session_record(bot, key)
+    sess = bridge_module.SessionState(
+        session_id=record["sessionId"],
+        work_dir=str(bridge_module.get_session_runtime_cwd(bot, key)),
+        lock_file=Path(record["lockFile"]),
+    )
+    sess.lock_file.parent.mkdir(parents=True, exist_ok=True)
+    sess.lock_file.symlink_to(bridge_module.BASE_DIR / "missing-lease.lock")
+
+    acquired = bridge_module.acquire_session_lease(bot, sess, key)
+
+    assert acquired is True
+    assert sess.lease_owned is True
+    assert sess.lock_file.exists()
+    assert not sess.lock_file.is_symlink()
+    lease = bridge_module.read_json_file(sess.lock_file, None)
+    assert lease["instanceId"] == bridge_module.INSTANCE_ID
+
+
+def test_acquire_session_lease_replaces_valid_symlink_lock_file_without_touching_target(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    record = bridge_module.create_session_record(bot, key)
+    sess = bridge_module.SessionState(
+        session_id=record["sessionId"],
+        work_dir=str(bridge_module.get_session_runtime_cwd(bot, key)),
+        lock_file=Path(record["lockFile"]),
+    )
+    external_lock = bridge_module.BASE_DIR / "external-lease.lock"
+    external_lock.write_text('{"instanceId":"external"}', encoding="utf-8")
+    sess.lock_file.parent.mkdir(parents=True, exist_ok=True)
+    sess.lock_file.symlink_to(external_lock)
+
+    acquired = bridge_module.acquire_session_lease(bot, sess, key)
+
+    assert acquired is True
+    assert sess.lease_owned is True
+    assert sess.lock_file.exists()
+    assert not sess.lock_file.is_symlink()
+    assert external_lock.read_text(encoding="utf-8") == '{"instanceId":"external"}'
+    lease = bridge_module.read_json_file(sess.lock_file, None)
+    assert lease["instanceId"] == bridge_module.INSTANCE_ID
+
+
+def test_renew_session_lease_treats_malformed_lock_as_lost(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.lock_file.write_text("[]", encoding="utf-8")
+
+    renewed = bridge_module.renew_session_lease(bot, "single:test-user", sess)
+
+    assert renewed is False
+    assert sess.lease_owned is False
+
+
+def test_release_session_lease_tolerates_malformed_lock_file(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.lock_file.write_text("[]", encoding="utf-8")
+
+    bridge_module.release_session_lease(bot, "single:test-user", sess)
+
+    assert sess.lease_owned is False
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] is None
+    assert persisted["leaseExpiresAt"] is None
+
+
+def test_normalize_session_record_rejects_path_like_session_id(bridge_module):
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "../escape",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", "escape")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        }
+    )
+
+    assert record is None
+
+
+def test_normalize_session_record_rejects_lock_file_outside_managed_roots(bridge_module):
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "lockFile": "/tmp/not-managed.lock.json",
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        }
+    )
+
+    assert record is None
+
+
+def test_normalize_session_record_accepts_legacy_managed_lock_file_path(bridge_module):
+    legacy_lock = bridge_module.legacy_managed_session_lock_file("bot-1", "sess-1")
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "lockFile": str(legacy_lock),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        }
+    )
+
+    assert record is not None
+    assert record["lockFile"] == str(legacy_lock)
+
+
+def test_normalize_session_record_infers_bot_id_from_managed_lock_file(bridge_module):
+    lock_file = bridge_module.get_managed_session_lock_file("bot-1", "sess-1")
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "chatKey": "single:test-user",
+            "lockFile": str(lock_file),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        }
+    )
+
+    assert record is not None
+    assert record["botId"] == "bot-1"
+
+
 def test_create_session_record_recovers_from_stale_key_mapping(bridge_module):
     bot = make_bot(bridge_module)
     key = "single:test-user"
@@ -369,6 +1097,230 @@ def test_create_session_record_repairs_invalid_key_file_without_recreating_exist
     stored_key = bridge_module.read_json_file(key_file, None)
     assert stored_key is not None
     assert stored_key["sessionId"] == existing["sessionId"]
+
+
+def test_create_session_record_recovers_existing_session_missing_bot_id_when_managed_lock_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    session_id = "sess-managed"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "chatKey": key,
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        },
+    )
+
+    record = bridge_module.create_session_record(bot, key)
+
+    assert record["sessionId"] == session_id
+    stored_key = bridge_module.read_json_file(bridge_module.get_registry_key_file(bot.config["id"], key), None)
+    assert stored_key is not None
+    assert stored_key["sessionId"] == session_id
+
+
+def test_create_session_record_recovers_existing_session_missing_chat_key_when_key_file_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    session_id = "sess-missing-chat"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": bot.config["id"],
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        },
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": bot.config["id"], "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    record = bridge_module.create_session_record(bot, key)
+
+    assert record["sessionId"] == session_id
+    stored_record = bridge_module.read_json_file(bridge_module.get_registry_session_file(session_id), None)
+    assert stored_record is not None
+    assert stored_record["chatKey"] == key
+
+
+def test_read_session_record_by_key_repairs_key_file_missing_bot_id_using_recoverable_session(bridge_module):
+    bot = make_bot(bridge_module)
+    key = "single:test-user"
+    session_id = "sess-key-missing-botid"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": bot.config["id"],
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        },
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    record = bridge_module.read_session_record_by_key(bot.config["id"], key)
+
+    assert record is not None
+    assert record["sessionId"] == session_id
+    stored_key = bridge_module.read_json_file(key_file, None)
+    assert stored_key is not None
+    assert stored_key["botId"] == bot.config["id"]
+    assert stored_key["chatKey"] == key
+
+
+def test_read_session_record_by_id_recovers_missing_bot_id_from_managed_lock_file(bridge_module):
+    session_id = "sess-1"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "chatKey": "single:test-user",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+
+    record = bridge_module.read_session_record_by_id(session_id)
+
+    assert record is not None
+    assert record["botId"] == "bot-1"
+
+
+def test_read_session_record_by_id_recovers_missing_chat_key_from_key_registry(bridge_module):
+    session_id = "sess-missing-chatkey"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    key = "single:test-user"
+    key_file = bridge_module.get_registry_key_file("bot-1", key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": "bot-1", "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    record = bridge_module.read_session_record_by_id(session_id)
+
+    assert record is not None
+    assert record["botId"] == "bot-1"
+    assert record["chatKey"] == key
+
+
+def test_read_session_record_by_id_recovers_missing_chat_key_from_raw_bot_id_and_key_registry(bridge_module):
+    session_id = "sess-missing-chatkey-raw-bot"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    key = "single:test-user"
+    key_file = bridge_module.get_registry_key_file("bot-1", key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": "bot-1", "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    record = bridge_module.read_session_record_by_id(session_id)
+
+    assert record is not None
+    assert record["botId"] == "bot-1"
+    assert record["chatKey"] == key
+
+
+def test_read_session_record_by_id_prefers_latest_key_registry_entry_when_multiple_match(bridge_module):
+    session_id = "sess-key-latest"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    old_key = bridge_module.get_registry_key_file("bot-1", "single:old-user")
+    new_key = bridge_module.get_registry_key_file("bot-1", "single:new-user")
+    bridge_module.ensure_dir_for(old_key)
+    bridge_module.write_json_atomic(
+        old_key,
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:old-user",
+            "createdAt": 1,
+            "updatedAt": 1,
+        },
+    )
+    bridge_module.write_json_atomic(
+        new_key,
+        {
+            "sessionId": session_id,
+            "botId": "bot-1",
+            "chatKey": "single:new-user",
+            "createdAt": 2,
+            "updatedAt": 2,
+        },
+    )
+
+    record = bridge_module.read_session_record_by_id(session_id)
+
+    assert record is not None
+    assert record["chatKey"] == "single:new-user"
+
+
+def test_read_session_record_by_id_recovers_chat_key_from_key_file_name_when_field_missing(bridge_module):
+    session_id = "sess-key-name-fallback"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    key = "single:test-user"
+    key_file = bridge_module.get_registry_key_file("bot-1", key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": "bot-1"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    record = bridge_module.read_session_record_by_id(session_id)
+
+    assert record is not None
+    assert record["chatKey"] == key
 
 
 def test_read_session_record_by_key_repairs_invalid_key_file_without_recreating_existing_session(bridge_module):
@@ -607,6 +1559,69 @@ async def test_start_bot_rebinds_scheduled_job_session_id_when_workspace_identit
     assert updated["sessionId"] != old_session_id
 
 
+@pytest.mark.asyncio
+async def test_start_bot_rebinds_scheduled_job_session_id_when_job_bot_id_missing_but_definition_matches(
+    bridge_module, monkeypatch
+):
+    old_work_dir = bridge_module.BASE_DIR / "old-workdir"
+    new_work_dir = bridge_module.BASE_DIR / "new-workdir"
+    old_work_dir.mkdir(parents=True, exist_ok=True)
+    new_work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, config_id="bot-1", work_dir=str(old_work_dir))
+    record = bridge_module.create_session_record(bot, "single:test-user")
+    old_session_id = record["sessionId"]
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": old_session_id,
+            "chatKey": "single:test-user",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    processing = bridge_module.SCHEDULE_PROCESSING_ROOT / "job-workspace-switch-missing-bot.json"
+    bridge_module.ensure_dir(processing.parent)
+    bridge_module.write_json_atomic(
+        processing,
+        {
+            "requestId": "job-workspace-switch-missing-bot",
+            "scheduleId": definition["scheduleId"],
+            "sessionId": old_session_id,
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal", **_kwargs):
+        return None
+
+    monkeypatch.setattr(bridge_module, "stop_bot", fake_stop_bot)
+
+    await bridge_module.start_bot(
+        {
+            "id": bot.config["id"],
+            "name": bot.config["name"],
+            "botId": bot.config["botId"],
+            "secret": "secret",
+            "workDir": str(new_work_dir),
+            "enabled": True,
+            "welcome": "",
+            "groupSessionMode": "per-user",
+        }
+    )
+
+    updated = bridge_module.read_json_file(processing, None)
+    assert updated is not None
+    assert updated["sessionId"] != old_session_id
+
+
 def test_build_bridge_context_mentions_skill_dirs(bridge_module):
     work_dir = bridge_module.BASE_DIR / "repo"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -679,17 +1694,575 @@ def test_env_example_declares_watchdog_controls():
     assert "BRIDGE_WATCHDOG_COOLDOWN_SEC=60" in content
 
 
-def test_watchdog_script_exists_and_uses_health_probe():
+def test_watchdog_script_exists_and_uses_livez_probe():
     content = WATCHDOG_SH_PATH.read_text(encoding="utf-8")
 
     assert "export_bridge_runtime_env" in content
     assert "GET /" not in content
     assert "bridge_health_ok()" in content
-    assert "/healthz" in content
+    assert "/livez" in content
     assert ".bridge.guard.pid" in content
     assert "restart triggered" in content
     assert "bridge recovered before restart; skip restart" in content
     assert 'load_bridge_runtime_env "$SCRIPT_DIR" || exit 1' in content.split("start_bridge_process() {", 1)[1]
+
+
+def test_check_bridge_health_uses_shared_runtime_schedule_dirs(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "check_bridge_health.sh").write_text(
+        CHECK_BRIDGE_HEALTH_SH_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    shared_runtime_root = tmp_path / "shared-runtime"
+    processing_root = shared_runtime_root / ".scheduled-messages" / "processing"
+    pending_root = shared_runtime_root / ".scheduled-messages" / "pending"
+    processing_root.mkdir(parents=True, exist_ok=True)
+    pending_root.mkdir(parents=True, exist_ok=True)
+    (processing_root / "job-1.json").write_text("{}", encoding="utf-8")
+    (pending_root / "job-2.json").write_text("{}", encoding="utf-8")
+    (pending_root / "job-3.json").write_text("{}", encoding="utf-8")
+
+    python_hook_dir = tmp_path / "python-hook"
+    python_hook_dir.mkdir(parents=True, exist_ok=True)
+    (python_hook_dir / "sitecustomize.py").write_text(
+        """
+import io
+import json
+import urllib.request
+
+ROOT = json.dumps({"ok": True}).encode("utf-8")
+BOTS = json.dumps([{"id": "bot-1", "name": "codex1", "status": "running", "enabled": True, "sessions": []}]).encode("utf-8")
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+def _fake_urlopen(req, timeout=None):
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    if url.endswith("/api/bots"):
+        return _Resp(BOTS)
+    if url.endswith("/healthz"):
+        return _Resp(ROOT)
+    raise RuntimeError(f"unexpected url: {url}")
+
+urllib.request.urlopen = _fake_urlopen
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text(
+        "BRIDGE_BIND=127.0.0.1:19399\n"
+        f"BRIDGE_SHARED_RUNTIME_ROOT={shared_runtime_root}\n",
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    existing_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = (
+        f"{python_hook_dir}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(python_hook_dir)
+    )
+
+    result = subprocess.run(
+        ["sh", str(script_dir / "check_bridge_health.sh")],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "bridge root: ok" in result.stdout
+    assert "bots: 1" in result.stdout
+    assert "scheduled processing=1 pending=2" in result.stdout
+
+
+def test_check_restart_noise_uses_configured_api_auth(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "check_restart_noise.sh").write_text(
+        CHECK_RESTART_NOISE_SH_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "start.sh").write_text("#!/bin/sh\n: > bridge.log\n: > bridge.log.prev\nexit 0\n", encoding="utf-8")
+    (script_dir / "bridge.log").write_text("", encoding="utf-8")
+    (script_dir / "bridge.log.prev").write_text("", encoding="utf-8")
+
+    python_hook_dir = tmp_path / "python-hook"
+    python_hook_dir.mkdir(parents=True, exist_ok=True)
+    (python_hook_dir / "sitecustomize.py").write_text(
+        """
+import json
+import urllib.request
+
+ROOT = json.dumps({"ok": True}).encode("utf-8")
+EXPECTED = "Bearer token-from-env"
+EXPECTED_URL = "http://127.0.0.1:19399/healthz"
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+def _fake_urlopen(req, timeout=None):
+    header = req.headers.get("Authorization") if hasattr(req, "headers") else ""
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    if header != EXPECTED:
+        raise RuntimeError(f"unexpected auth header: {header!r}")
+    if url != EXPECTED_URL:
+        raise RuntimeError(f"unexpected url: {url!r}")
+    return _Resp(ROOT)
+
+urllib.request.urlopen = _fake_urlopen
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text(
+        "BRIDGE_BIND=127.0.0.1:19399\nBRIDGE_TOKEN=token-from-env\n",
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    existing_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = (
+        f"{python_hook_dir}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(python_hook_dir)
+    )
+
+    result = subprocess.run(
+        ["sh", str(script_dir / "check_restart_noise.sh")],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "health ok: http://127.0.0.1:19399/healthz" in result.stdout
+    assert "restart noise check passed" in result.stdout
+
+
+def test_check_restart_noise_uses_healthz_not_root(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "check_restart_noise.sh").write_text(
+        CHECK_RESTART_NOISE_SH_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "start.sh").write_text("#!/bin/sh\n: > bridge.log\n: > bridge.log.prev\nexit 0\n", encoding="utf-8")
+    (script_dir / "bridge.log").write_text("", encoding="utf-8")
+    (script_dir / "bridge.log.prev").write_text("", encoding="utf-8")
+
+    python_hook_dir = tmp_path / "python-hook"
+    python_hook_dir.mkdir(parents=True, exist_ok=True)
+    (python_hook_dir / "sitecustomize.py").write_text(
+        """
+import json
+import urllib.request
+
+ROOT = json.dumps({"ok": True}).encode("utf-8")
+HEALTHZ = json.dumps({"ok": False}).encode("utf-8")
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+def _fake_urlopen(req, timeout=None):
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    if url.endswith("/healthz"):
+        return _Resp(HEALTHZ)
+    if url.endswith("/"):
+        return _Resp(ROOT)
+    raise RuntimeError(f"unexpected url: {url!r}")
+
+urllib.request.urlopen = _fake_urlopen
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text(
+        "BRIDGE_BIND=127.0.0.1:19399\n",
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    existing_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = (
+        f"{python_hook_dir}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(python_hook_dir)
+    )
+
+    result = subprocess.run(
+        ["sh", str(script_dir / "check_restart_noise.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "health check failed" in result.stderr
+
+
+def test_deploy_from_codex_quotes_env_values_for_paths_with_spaces(tmp_path):
+    script_dir = tmp_path / "bridge scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    work_root = tmp_path / "work root"
+    target_repo_dir = work_root / "demo-repo"
+    (target_repo_dir / ".git").mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    env_file = script_dir / ".env"
+    assert env_file.exists()
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; printf "%s\\n%s\\n%s\\n" "$WORK_DIR" "$WECOM_BOT_WORK_DIR" "$WECOM_BOT_SECRET_FILE"',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == str(target_repo_dir)
+    assert lines[1] == str(target_repo_dir)
+    assert lines[2] == str(script_dir / ".secrets" / "demo-repo.secret")
+
+
+def test_deploy_from_codex_rejects_path_like_bot_name(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--bot-name",
+            "../escape",
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "--bot-name must not contain '/'" in result.stderr
+    assert not (script_dir.parent / "escape.secret").exists()
+
+
+def test_deploy_from_codex_rejects_path_like_repository_name(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "..",
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "--github-repo repository name must not be empty, '.' or '..'" in result.stderr
+
+
+def test_deploy_from_codex_expands_tilde_work_root(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    home_dir = tmp_path / "home"
+    work_root = home_dir / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    (target_repo_dir / ".git").mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    env = dict(os.environ)
+    env["HOME"] = str(home_dir)
+    subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            "~/work-root",
+            "--skip-install",
+            "--skip-start",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; printf "%s\\n%s\\n" "$WORK_DIR" "$WECOM_BOT_WORK_DIR"',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    lines = result.stdout.strip().splitlines()
+    assert lines == [str(target_repo_dir), str(target_repo_dir)]
+
+
+def test_deploy_from_codex_rejects_existing_repo_with_mismatched_origin(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/other-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "origin mismatch" in result.stderr
+
+
+def test_deploy_from_codex_accepts_equivalent_ssh_origin_forms(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "ssh://git@github.com/example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Reusing existing git repo" in result.stdout
+
+
+def test_deploy_from_codex_accepts_equivalent_https_and_ssh_repo_urls(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "secret-value",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Reusing existing git repo" in result.stdout
 
 
 async def test_main_starts_http_before_runtime_migration_and_bot_loading(bridge_module, monkeypatch):
@@ -796,11 +2369,61 @@ def test_runtime_config_supports_ipv6_bridge_bind():
     assert module.build_bridge_api_base(host, port) == "http://[::1]:19301"
 
 
+def test_runtime_config_strips_ipv6_brackets_from_split_host_port_env():
+    module = load_runtime_config_module()
+
+    host, port = module.resolve_host_port({"BRIDGE_HOST": "[::1]", "BRIDGE_PORT": "19301"})
+
+    assert host == "::1"
+    assert port == 19301
+    assert module.build_bridge_api_base(host, port) == "http://[::1]:19301"
+
+
+def test_runtime_config_rejects_empty_split_host_after_ipv6_bracket_stripping():
+    module = load_runtime_config_module()
+
+    with pytest.raises(ValueError, match="BRIDGE_HOST/HOST cannot be empty"):
+        module.resolve_host_port({"BRIDGE_HOST": "[]", "BRIDGE_PORT": "19301"})
+
+
 def test_runtime_config_rejects_unbracketed_ipv6_bind():
     module = load_runtime_config_module()
 
     with pytest.raises(ValueError, match="IPv6"):
         module.resolve_host_port({"BRIDGE_BIND": "::1:19301"})
+
+
+def test_bridge_module_rejects_file_shared_runtime_root(monkeypatch, tmp_path):
+    bad_root = tmp_path / "shared-runtime-root.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("BRIDGE_SHARED_RUNTIME_ROOT", str(bad_root))
+
+    with pytest.raises(Exception) as excinfo:
+        load_bridge_module()
+
+    assert str(excinfo.value) == f"BRIDGE_SHARED_RUNTIME_ROOT is not a directory: {bad_root.resolve()}"
+
+
+def test_bridge_module_rejects_file_instance_runtime_root(monkeypatch, tmp_path):
+    bad_root = tmp_path / "instance-runtime-root.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("BRIDGE_RUNTIME_ROOT", str(bad_root))
+
+    with pytest.raises(Exception) as excinfo:
+        load_bridge_module()
+
+    assert str(excinfo.value) == f"BRIDGE_RUNTIME_ROOT is not a directory: {bad_root.resolve()}"
+
+
+def test_bridge_module_rejects_file_send_root_that_is_not_directory(monkeypatch, tmp_path):
+    bad_root = tmp_path / "file-send-root.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("FILE_SEND_ROOTS", str(bad_root))
+
+    with pytest.raises(Exception) as excinfo:
+        load_bridge_module()
+
+    assert "FILE_SEND_ROOTS entry is not a directory" in str(excinfo.value)
 
 
 def test_bridge_env_load_uses_bridge_bind_from_dotenv(tmp_path):
@@ -841,14 +2464,24 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "BRIDGE_BIND=127.0.0.1:19399\n"
         "WORK_DIR=/tmp/from-dotenv\n"
         "BRIDGE_TOKEN=token-from-dotenv\n"
+        "CODEX_COMMAND=/opt/codex/bin/codex\n"
+        "CODEX_HOME=/tmp/custom-codex-home\n"
         "WECOM_BOT_WORKSPACE_MODE=personal\n"
+        "WECOM_WORKSPACE_MODE=team\n"
         "WECOM_BOT_AGENT_BACKEND=claude\n"
         'WECOM_BOT_AGENT_COMMAND="claude --model sonnet"\n'
         "WECOM_BOT_AGENT_RUN_AS_USER=claudebot\n"
         "WECOM_BOT_AGENT_RUN_AS_GROUP=claudew\n"
         "WECOM_BOT_AGENT_RUNTIME_ROOT=/tmp/claude-runtime\n"
         "LOCAL_FILE_SEND_POLL_MS=4321\n"
+        "LOCAL_SEND_MESSAGE_POLL_MS=5432\n"
         "LOCAL_FILE_SEND_RESULT_RETENTION_MS=654321\n"
+        "REPLY_SEND_ACK_TIMEOUT_SEC=17\n"
+        "STREAM_TEXT_MAX_CHARS=777\n"
+        "WECOM_INBOUND_IDLE_TIMEOUT_MS=888000\n"
+        "WECOM_HEARTBEAT_ACK_TIMEOUT_MS=777000\n"
+        "WECOM_DISCONNECT_GRACE_MS=9999\n"
+        "WECOM_RAW_INBOUND_LOG_ENABLED=false\n"
         "PROACTIVE_TEXT_MAX_CHARS=987\n",
         encoding="utf-8",
     )
@@ -858,7 +2491,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
             "sh",
             "-c",
             '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
-            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'WECOM_BOT_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_BOT_AGENT_BACKEND\')); print(os.getenv(\'WECOM_BOT_AGENT_COMMAND\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_USER\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_GROUP\')); print(os.getenv(\'WECOM_BOT_AGENT_RUNTIME_ROOT\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'CODEX_COMMAND\')); print(os.getenv(\'CODEX_HOME\')); print(os.getenv(\'WECOM_BOT_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_BOT_AGENT_BACKEND\')); print(os.getenv(\'WECOM_BOT_AGENT_COMMAND\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_USER\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_GROUP\')); print(os.getenv(\'WECOM_BOT_AGENT_RUNTIME_ROOT\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_SEND_MESSAGE_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'REPLY_SEND_ACK_TIMEOUT_SEC\')); print(os.getenv(\'STREAM_TEXT_MAX_CHARS\')); print(os.getenv(\'WECOM_INBOUND_IDLE_TIMEOUT_MS\')); print(os.getenv(\'WECOM_HEARTBEAT_ACK_TIMEOUT_MS\')); print(os.getenv(\'WECOM_DISCONNECT_GRACE_MS\')); print(os.getenv(\'WECOM_RAW_INBOUND_LOG_ENABLED\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
             "sh",
             str(script_dir),
         ],
@@ -870,16 +2503,57 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
     assert result.stdout.strip().splitlines() == [
         "/tmp/from-dotenv",
         "token-from-dotenv",
+        "/opt/codex/bin/codex",
+        "/tmp/custom-codex-home",
         "personal",
+        "team",
         "claude",
         "claude --model sonnet",
         "claudebot",
         "claudew",
         "/tmp/claude-runtime",
         "4321",
+        "5432",
         "654321",
+        "17",
+        "777",
+        "888000",
+        "777000",
+        "9999",
+        "false",
         "987",
     ]
+
+
+def test_bridge_env_load_rejects_deprecated_plaintext_secret(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text(
+        "BRIDGE_BIND=127.0.0.1:19399\n"
+        "WECOM_BOT_ID=bot-id\n"
+        "WECOM_BOT_SECRET=deprecated-secret\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"',
+            "sh",
+            str(script_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "WECOM_BOT_SECRET is no longer supported" in result.stderr
 
 
 def test_load_env_bootstrap_bot_configs_reads_workspace_mode_from_single_bot_env(bridge_module, monkeypatch):
@@ -1058,6 +2732,59 @@ def test_start_bot_invalidates_persisted_threads_when_workspace_namespace_change
     assert recreated["sessionId"] != "sess-1"
 
 
+def test_start_bot_invalidates_persisted_threads_when_group_session_mode_changes(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-group-mode.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "team-main",
+                "workspaceMode": "team",
+                "groupSessionMode": "shared",
+                "enabled": True,
+            }
+        ],
+    )
+    record = bridge_module.normalize_session_record(
+        {
+            "sessionId": "sess-1",
+            "botId": "bot-1",
+            "chatKey": "group:test-room",
+            "threadId": "thread-old",
+            "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", "sess-1")),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+            "status": "idle",
+        }
+    )
+    bridge_module.write_session_record(record)
+
+    asyncio.run(
+        bridge_module.start_bot(
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "workspaceNamespace": "team-main",
+                "workspaceMode": "team",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        )
+    )
+
+    assert bridge_module.read_session_record_by_id("sess-1") is None
+    recreated = bridge_module.create_session_record(bridge_module.BOTS["bot-1"], "group-user:test-room:test-user")
+    assert recreated["sessionId"] != "sess-1"
+
+
 def test_reset_bot_session_runtime_state_clears_persisted_threads_for_loaded_bot(bridge_module):
     bot = make_bot(bridge_module, work_dir=str(bridge_module.BASE_DIR))
     record = bridge_module.normalize_session_record(
@@ -1114,6 +2841,151 @@ def test_reset_bot_session_runtime_state_clears_persisted_running_schedule_state
     persisted = bridge_module.read_session_record_by_id("sess-1")
     assert cleared >= 1
     assert persisted is None
+
+
+def test_reset_bot_session_runtime_state_removes_malformed_persisted_session_record_for_unloaded_bot(bridge_module):
+    session_id = "sess-bad-unloaded"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "botId": "bot-1",
+                "chatKey": "single:test-user",
+                "lockFile": "/tmp/not-managed.lock.json",
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+                "threadId": "thread-old",
+                "status": "leased",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    cleared = bridge_module.reset_bot_session_runtime_state("bot-1")
+
+    assert cleared == 0
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_reset_bot_session_runtime_state_removes_artifacts_for_malformed_persisted_session_record_missing_session_id(
+    bridge_module,
+):
+    session_id = "sess-missing-id-unloaded"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "botId": "bot-1",
+                "chatKey": "single:test-user",
+                "lockFile": "/tmp/not-managed.lock.json",
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+                "threadId": "thread-old",
+                "status": "leased",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    cleared = bridge_module.reset_bot_session_runtime_state("bot-1")
+
+    assert cleared == 0
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_reset_bot_session_runtime_state_removes_artifacts_for_session_id_referenced_only_by_key_file(
+    bridge_module,
+):
+    session_id = "sess-key-only-unloaded"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "chatKey": "single:test-user",
+                "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+                "threadId": "thread-old",
+                "status": "leased",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    key_file = bridge_module.get_registry_key_file("bot-1", "single:test-user")
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": "bot-1", "chatKey": "single:test-user"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    cleared = bridge_module.reset_bot_session_runtime_state("bot-1")
+
+    assert cleared == 1
+    assert not session_file.exists()
+    assert not key_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_reset_bot_session_runtime_state_removes_artifacts_for_session_record_missing_bot_id_but_managed_lock(
+    bridge_module,
+):
+    session_id = "sess-missing-bot-id-unloaded"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "chatKey": "single:test-user",
+                "lockFile": str(bridge_module.get_managed_session_lock_file("bot-1", session_id)),
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+                "threadId": "thread-old",
+                "status": "leased",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    cleared = bridge_module.reset_bot_session_runtime_state("bot-1")
+
+    assert cleared == 1
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
 
 
 def test_prepare_and_start_bot_invalidates_threads_when_bootstrap_workdir_changes(bridge_module, monkeypatch):
@@ -1306,6 +3178,116 @@ def test_prepare_bot_configs_bootstraps_single_bot_from_env(bridge_module, monke
     assert "secret" not in stored[0]
 
 
+def test_prepare_bot_configs_treats_null_explicit_config_id_as_default_id(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-null-config-id.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_CONFIG_ID", "null")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["id"] == bridge_module.default_bot_config_id("bot-id")
+
+
+def test_prepare_bot_configs_rejects_null_env_bot_id_when_secret_file_present(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-null-botid.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "null")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.prepare_bot_configs()
+
+    assert excinfo.value.message == "WECOM_BOT_ID must be set together with WECOM_BOT_SECRET_FILE"
+
+
+def test_prepare_bot_configs_treats_null_enabled_as_default_true(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-enabled-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_ENABLED", "null")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["enabled"] is True
+
+
+def test_prepare_bot_configs_treats_null_group_session_mode_as_default_per_user(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-group-mode-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_GROUP_SESSION_MODE", "null")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["groupSessionMode"] == "per-user"
+
+
+def test_prepare_bot_configs_treats_null_workspace_namespace_as_default_id(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-namespace-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_WORKSPACE_NAMESPACE", "null")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["workspaceNamespace"] == bridge_module.default_bot_config_id("bot-id")
+
+
+def test_prepare_bot_configs_treats_null_work_dir_as_default_work_dir(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-workdir-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", "null")
+    monkeypatch.setattr(bridge_module, "DEFAULT_WORK_DIR", str(bridge_module.BASE_DIR))
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["workDir"] == str(bridge_module.BASE_DIR.resolve())
+
+
+def test_prepare_bot_configs_treats_null_welcome_as_empty_string(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-welcome-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+    monkeypatch.setenv("WECOM_BOT_WELCOME", "null")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["welcome"] == ""
+
+
+def test_prepare_bot_configs_treats_null_name_as_default(bridge_module, monkeypatch):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "env-name-null.secret", "secret\n")
+    monkeypatch.setenv("WECOM_BOT_NAME", "null")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET_FILE", str(secret_file))
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["name"] == "default"
+
+
 def test_prepare_bot_configs_bootstraps_single_bot_from_secret_file(bridge_module, monkeypatch):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret-from-file\n")
     monkeypatch.setenv("WECOM_BOT_NAME", "env-bot")
@@ -1391,6 +3373,111 @@ def test_prepare_bot_configs_switches_secret_source_without_stale_conflict(bridg
     assert configs[0]["secretFile"] == str(new_secret_file)
 
 
+def test_prepare_bot_configs_prunes_legacy_generated_bootstrap_bot_missing_from_current_bootstrap(
+    bridge_module, monkeypatch
+):
+    stale_secret_file = write_secret_file(bridge_module.BASE_DIR / "stale.secret", "stale-secret\n")
+    live_secret_file = write_secret_file(bridge_module.BASE_DIR / "live.secret", "live-secret\n")
+    manual_secret_file = write_secret_file(bridge_module.BASE_DIR / "manual.secret", "manual-secret\n")
+    stale_bot_id = "stale-bot"
+    manual_bot_id = "manual-bot"
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": bridge_module.default_bot_config_id(stale_bot_id),
+                "name": "stale-env-bot",
+                "botId": stale_bot_id,
+                "secretFile": str(stale_secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            },
+            {
+                "id": "manual-bot-id",
+                "name": "manual-bot",
+                "botId": manual_bot_id,
+                "secretFile": str(manual_secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            },
+        ],
+    )
+    monkeypatch.setenv(
+        "WECOM_BOOTSTRAP_BOTS_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "live-env-bot",
+                    "botId": "live-bot",
+                    "secretFile": str(live_secret_file),
+                    "workDir": str(bridge_module.BASE_DIR),
+                }
+            ]
+        ),
+    )
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert {item["botId"] for item in configs} == {"live-bot", manual_bot_id}
+    persisted = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert {item["botId"] for item in persisted} == {"live-bot", manual_bot_id}
+    assert all(item["botId"] != stale_bot_id for item in persisted)
+
+
+def test_prepare_bot_configs_prunes_stale_explicit_bootstrap_managed_bot_when_bootstrap_changes(
+    bridge_module, monkeypatch
+):
+    old_secret_file = write_secret_file(bridge_module.BASE_DIR / "old-bootstrap.secret", "old-secret\n")
+    new_secret_file = write_secret_file(bridge_module.BASE_DIR / "new-bootstrap.secret", "new-secret\n")
+    monkeypatch.setenv(
+        "WECOM_BOOTSTRAP_BOTS_JSON",
+        json.dumps(
+            [
+                {
+                    "id": "custom-bootstrap-id",
+                    "name": "old-bootstrap-bot",
+                    "botId": "old-bootstrap-bot",
+                    "secretFile": str(old_secret_file),
+                    "workDir": str(bridge_module.BASE_DIR),
+                }
+            ]
+        ),
+    )
+
+    first_configs = bridge_module.prepare_bot_configs()
+
+    assert first_configs[0]["bootstrapManaged"] is True
+    first_persisted = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert first_persisted[0]["bootstrapManaged"] is True
+
+    monkeypatch.setenv(
+        "WECOM_BOOTSTRAP_BOTS_JSON",
+        json.dumps(
+            [
+                {
+                    "id": "replacement-bootstrap-id",
+                    "name": "replacement-bootstrap-bot",
+                    "botId": "replacement-bootstrap-bot",
+                    "secretFile": str(new_secret_file),
+                    "workDir": str(bridge_module.BASE_DIR),
+                }
+            ]
+        ),
+    )
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["id"] == "replacement-bootstrap-id"
+    persisted = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert len(persisted) == 1
+    assert persisted[0]["id"] == "replacement-bootstrap-id"
+
+
 def test_prepare_bot_configs_filters_tombstoned_persisted_bot(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
     bridge_module.write_json_atomic(
@@ -1416,6 +3503,31 @@ def test_prepare_bot_configs_filters_tombstoned_persisted_bot(bridge_module):
     assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
 
 
+def test_prepare_bot_configs_filters_tombstoned_malformed_persisted_bot(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-malformed.secret", "secret\n")
+    payload = [
+        {
+            "id": "bot-1",
+            "name": "bad-backend",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "not-a-backend",
+            "enabled": True,
+            "createdAt": bridge_module.now_ms() - 1000,
+            "updatedAt": bridge_module.now_ms() - 1000,
+        }
+    ]
+    bridge_module.write_json_atomic(bridge_module.DATA_FILE, payload)
+    bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert configs == []
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+
+
 def test_prepare_bot_configs_filters_tombstoned_env_bootstrap_bot(bridge_module, monkeypatch):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
     bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
@@ -1428,6 +3540,17 @@ def test_prepare_bot_configs_filters_tombstoned_env_bootstrap_bot(bridge_module,
 
     assert configs == []
     assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+
+
+def test_prepare_bot_configs_ignores_invalid_tombstoned_env_bootstrap_bot(bridge_module, monkeypatch):
+    bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_ID", "bot-id")
+    monkeypatch.setenv("WECOM_BOT_SECRET", "deprecated-secret")
+    monkeypatch.setenv("WECOM_BOT_WORK_DIR", str(bridge_module.BASE_DIR))
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert configs == []
 
 
 def test_filter_deleted_bot_configs_does_not_persist_changes(bridge_module):
@@ -1563,6 +3686,39 @@ def test_prepare_bot_configs_skips_invalid_persisted_entries(bridge_module, caps
     assert "ignore invalid bot config at index 2" in captured.out
 
 
+def test_prepare_bot_configs_skips_invalid_persisted_agent_backend(bridge_module, capsys):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-invalid-backend.secret", "secret\n")
+    payload = [
+        {
+            "id": "bot-bad",
+            "name": "bad-backend",
+            "botId": "bad-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "not-a-backend",
+            "enabled": True,
+        },
+        {
+            "id": "bot-good",
+            "name": "good-backend",
+            "botId": "good-bot",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentBackend": "codex",
+            "enabled": True,
+        },
+    ]
+    bridge_module.write_json_atomic(bridge_module.DATA_FILE, payload)
+
+    configs = bridge_module.prepare_bot_configs()
+
+    assert [item["id"] for item in configs] == ["bot-good"]
+    captured = capsys.readouterr()
+    assert "ignore invalid bot config bot-bad" in captured.out
+
+
 def test_save_bots_redacts_secret_but_keeps_secret_file(bridge_module):
     bot = bridge_module.BotState(
         config={
@@ -1598,6 +3754,20 @@ def test_save_bots_redacts_secret_but_keeps_secret_file(bridge_module):
     expected["updatedAt"] = stored[0]["updatedAt"]
     assert stored == [expected]
     assert bridge_module.get_persisted_bot_configs_lock_file().exists()
+
+
+def test_persisted_bot_configs_lock_replaces_symlink_lock_file_without_touching_target(bridge_module):
+    lock_file = bridge_module.get_persisted_bot_configs_lock_file()
+    external_lock = bridge_module.BASE_DIR / "external-bots.lock"
+    external_lock.write_text("external", encoding="utf-8")
+    bridge_module.ensure_dir_for(lock_file)
+    lock_file.symlink_to(external_lock)
+
+    with bridge_module.persisted_bot_configs_lock():
+        assert lock_file.exists()
+        assert not lock_file.is_symlink()
+
+    assert external_lock.read_text(encoding="utf-8") == "external"
 
 
 def test_start_bot_restores_template_card_delivery_meta(bridge_module):
@@ -1668,6 +3838,62 @@ def test_start_bot_restores_reply_url_state(bridge_module):
     )
 
     assert bot.reply_urls["req-1"]["responseUrl"] == "https://example.com/response"
+
+
+def test_start_bot_ignores_reply_url_state_without_response_url(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+    state_file = bridge_module.get_reply_url_state_file("bot-1")
+    bridge_module.write_json_atomic(
+        state_file,
+        {
+            "req-bad": {
+                "chatKey": "single:test-user",
+                "capturedAtMs": bridge_module.now_ms(),
+                "consumed": False,
+            },
+            "req-good": {
+                "responseUrl": "https://example.com/response",
+                "chatKey": "single:test-user",
+                "capturedAtMs": bridge_module.now_ms(),
+                "consumed": False,
+            },
+        },
+    )
+
+    bot = asyncio.run(
+        bridge_module.start_bot(
+            {
+                "id": "bot-1",
+                "name": "codex1",
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "enabled": True,
+                "welcome": "",
+                "groupSessionMode": "per-user",
+            }
+        )
+    )
+
+    assert "req-bad" not in bot.reply_urls
+    assert bot.reply_urls["req-good"]["responseUrl"] == "https://example.com/response"
+
+
+def test_register_template_card_button_texts_clears_stale_mapping_when_buttons_removed(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.template_card_button_texts["task-1"] = {"old": "Old"}
+
+    bridge_module.register_template_card_button_texts(
+        bot,
+        {
+            "card_type": "text_notice",
+            "main_title": {"title": "hello"},
+            "card_action": {"type": 1, "url": "https://example.com"},
+            "task_id": "task-1",
+        },
+    )
+
+    assert "task-1" not in bot.template_card_button_texts
 
 
 def test_remove_bot_deletes_template_card_state(bridge_module):
@@ -1924,6 +4150,48 @@ def test_ensure_session_workspace_dirs_bootstraps_non_git_project_tree(bridge_mo
     assert (paths["workfile"] / "tests").is_dir()
 
 
+def test_ensure_session_workspace_dirs_replaces_broken_symlinked_file_during_bootstrap(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-broken-file"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "tracked.txt").write_text("hello", encoding="utf-8")
+    (work_dir / ".git").mkdir()
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    workfile = bridge_module.get_workfile_dir(bot.config["id"], "test-user")
+    workfile.mkdir(parents=True, exist_ok=True)
+    (workfile / "tracked.txt").symlink_to(bridge_module.BASE_DIR / "missing-tracked.txt")
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    restored = paths["workfile"] / "tracked.txt"
+    assert restored.is_file()
+    assert not restored.is_symlink()
+    assert restored.read_text(encoding="utf-8") == "hello"
+
+
+def test_ensure_session_workspace_dirs_replaces_broken_symlinked_symlink_during_bootstrap(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-broken-link"
+    external_target = bridge_module.BASE_DIR / "external-target"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    external_target.mkdir(parents=True, exist_ok=True)
+    (external_target / "nested.txt").write_text("nested", encoding="utf-8")
+    (work_dir / "linked-dir").symlink_to(external_target, target_is_directory=True)
+    (work_dir / ".git").mkdir()
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    workfile = bridge_module.get_workfile_dir(bot.config["id"], "test-user")
+    workfile.mkdir(parents=True, exist_ok=True)
+    (workfile / "linked-dir").symlink_to(bridge_module.BASE_DIR / "missing-linked-dir", target_is_directory=True)
+
+    paths = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")
+
+    assert paths["workfile"] is not None
+    restored = paths["workfile"] / "linked-dir"
+    assert restored.is_symlink()
+    assert restored.resolve() == external_target.resolve()
+    assert os.path.lexists(restored)
+    assert (restored / "nested.txt").read_text(encoding="utf-8") == "nested"
+
+
 def test_ensure_session_workspace_dirs_does_not_overwrite_existing_workfile(bridge_module):
     work_dir = bridge_module.BASE_DIR / "repo"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -2052,6 +4320,60 @@ def test_validate_file_for_upload_only_allows_chatfile_by_default(bridge_module)
     assert resolved == chat_file.resolve()
 
 
+def test_validate_file_for_upload_prefers_allowlist_error_over_size_for_outside_file(bridge_module):
+    bot = make_bot(bridge_module)
+    outside_dir = bridge_module.BASE_DIR / "outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    file_path = outside_dir / "big.bin"
+    file_path.write_bytes(b"x" * (bridge_module.MAX_UPLOAD_SIZE + 1))
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.validate_file_for_upload(bot, "single:test-user", str(file_path))
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.message.startswith("filePath is outside allowed roots:")
+
+
+def test_extract_mixed_images_accepts_download_url_variants_in_classic_bridge(bridge_module):
+    mixed = {
+        "msg_item": [
+            {"msgtype": "image", "image": {"download_url": "https://example.test/a.png"}},
+            {"msgtype": "image", "image": {"downloadUrl": "https://example.test/b.png"}},
+        ]
+    }
+
+    assert bridge_module.extract_mixed_images(mixed) == [
+        {"download_url": "https://example.test/a.png"},
+        {"downloadUrl": "https://example.test/b.png"},
+    ]
+
+
+def test_validate_file_for_upload_accepts_tilde_expanded_file_send_root(monkeypatch, tmp_path):
+    home_dir = tmp_path / "home"
+    allowed_root = home_dir / "allowed"
+    allowed_root.mkdir(parents=True, exist_ok=True)
+    file_path = allowed_root / "artifact.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("FILE_SEND_ROOTS", "~/allowed")
+
+    bridge_module = load_bridge_module()
+    bot = make_bot(bridge_module)
+
+    resolved = bridge_module.validate_file_for_upload(bot, "single:test-user", str(file_path))
+
+    assert bridge_module.EXTRA_FILE_ROOTS == [allowed_root.resolve()]
+    assert resolved == file_path.resolve()
+
+
+def test_chat_key_to_send_target_rejects_invalid_chat_key(bridge_module):
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.chat_key_to_send_target("group-user:room-only")
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "invalid chat key: group-user:room-only"
+
+
 def test_resolve_file_send_request_prefers_chat_key_over_stale_session(bridge_module):
     bot = make_bot(bridge_module)
     make_session(bridge_module, bot)
@@ -2088,6 +4410,49 @@ def test_resolve_file_send_request_falls_back_to_session_when_chat_key_invalid(b
             "filePath": str(chat_file),
             "chatKey": "single:missing",
             "sessionId": sess.session_id,
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert resolved_file == chat_file.resolve()
+
+
+def test_resolve_file_send_request_ignores_null_session_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    chat_file = chatfile_dir / "artifact.txt"
+    chat_file.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.resolve_file_send_request(
+            {
+                "filePath": str(chat_file),
+                "chatKey": "group-user:room-only",
+                "sessionId": "null",
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "invalid chatKey: group-user:room-only"
+
+
+def test_resolve_file_send_request_ignores_null_target_config_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.create_session_record(bot, "single:test-user")
+    bot.ws = SimpleNamespace(closed=False)
+    chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    chat_file = chatfile_dir / "artifact.txt"
+    chat_file.write_text("hello", encoding="utf-8")
+
+    resolved_bot, resolved_chat_key, resolved_file = bridge_module.resolve_file_send_request(
+        {
+            "filePath": str(chat_file),
+            "chatKey": "single:test-user",
+            "targetConfigId": "null",
         }
     )
 
@@ -2203,6 +4568,81 @@ def test_resolve_file_send_request_rejects_unloaded_target_bot_for_session(bridg
     assert excinfo.value.message == "bot not running: bot-1"
 
 
+def test_resolve_file_send_request_recovers_session_missing_chat_key_from_key_registry(bridge_module):
+    bot = make_bot(bridge_module, config_id="bot-1")
+    key = "single:test-user"
+    session_id = "sess-missing-chatkey"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": bot.config["id"], "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    file_path = chatfile_dir / "reply.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    bot.ws = SimpleNamespace(closed=False)
+
+    resolved_bot, resolved_chat_key, resolved_file = bridge_module.resolve_file_send_request(
+        {
+            "sessionId": session_id,
+            "filePath": str(file_path.resolve()),
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == key
+    assert resolved_file == file_path.resolve()
+
+
+def test_resolve_file_send_request_recovers_session_missing_chat_key_from_raw_bot_id_and_key_registry(bridge_module):
+    bot = make_bot(bridge_module, config_id="bot-1")
+    key = "single:test-user"
+    session_id = "sess-missing-chatkey-raw-bot"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(session_id),
+        {
+            "sessionId": session_id,
+            "botId": bot.config["id"],
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], key)
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": bot.config["id"], "chatKey": key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    file_path = chatfile_dir / "reply.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    bot.ws = SimpleNamespace(closed=False)
+
+    resolved_bot, resolved_chat_key, resolved_file = bridge_module.resolve_file_send_request(
+        {
+            "sessionId": session_id,
+            "filePath": str(file_path.resolve()),
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == key
+    assert resolved_file == file_path.resolve()
+
+
 def test_resolve_loaded_target_bot_rejects_stale_bot(bridge_module):
     bot = make_bot(bridge_module, config_id="bot-1", remote_bot_id="remote-bot-1")
     bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
@@ -2241,6 +4681,53 @@ def test_resolve_schedule_target_prefers_chat_key_over_stale_session(bridge_modu
     assert target["botName"] == bot.config["name"]
     assert target["chatKey"] == "single:test-user"
     assert target["sessionId"] == sess.session_id
+
+
+def test_resolve_schedule_target_ignores_null_session_id(bridge_module):
+    bot = make_bot(bridge_module)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.resolve_schedule_target(
+            {
+                "chatKey": "group-user:room-only",
+                "sessionId": "null",
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "invalid chatKey: group-user:room-only"
+
+
+def test_resolve_schedule_target_ignores_null_bot_name(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    target = bridge_module.resolve_schedule_target(
+        {
+            "chatKey": "single:test-user",
+            "botName": "null",
+        }
+    )
+
+    assert target["botId"] == bot.config["id"]
+    assert target["botName"] == bot.config["name"]
+    assert target["chatKey"] == "single:test-user"
+
+
+def test_resolve_schedule_target_ignores_null_target_config_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    target = bridge_module.resolve_schedule_target(
+        {
+            "chatKey": "single:test-user",
+            "targetConfigId": "null",
+        }
+    )
+
+    assert target["botId"] == bot.config["id"]
+    assert target["botName"] == bot.config["name"]
+    assert target["chatKey"] == "single:test-user"
 
 
 def test_resolve_schedule_target_falls_back_to_session_when_chat_key_invalid(bridge_module):
@@ -2407,6 +4894,40 @@ def test_submit_schedule_message_request_accepts_reply_req_id_for_template_card(
     assert stored["chatKey"] == "single:test-user"
 
 
+def test_resolve_schedule_target_prefers_reply_req_id_over_unconnected_chat_key(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = None
+    bridge_module.save_reply_url(bot, "req-1", "single:test-user", "https://example.com/response")
+
+    target = bridge_module.resolve_schedule_target(
+        {
+            "chatKey": "single:test-user",
+            "replyReqId": "req-1",
+        }
+    )
+
+    assert target["botId"] == bot.config["id"]
+    assert target["chatKey"] == "single:test-user"
+    assert target["replyReqId"] == "req-1"
+
+
+def test_resolve_schedule_target_ignores_null_reply_req_id(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    target = bridge_module.resolve_schedule_target(
+        {
+            "chatKey": "single:test-user",
+            "replyReqId": "null",
+        }
+    )
+
+    assert target["botId"] == bot.config["id"]
+    assert target["botName"] == bot.config["name"]
+    assert target["chatKey"] == "single:test-user"
+    assert target["sessionId"] == sess.session_id
+
+
 def test_normalize_bot_config_accepts_matching_secret_and_secret_file(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
 
@@ -2424,6 +4945,60 @@ def test_normalize_bot_config_accepts_matching_secret_and_secret_file(bridge_mod
 
     assert config["secret"] == "secret"
     assert config["secretFile"] == str(secret_file)
+
+
+def test_normalize_bot_config_treats_null_secret_as_missing_when_secret_file_present(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-null-secret.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "bot-id",
+            "secret": "null",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "enabled": True,
+        }
+    )
+
+    assert config["secret"] == "secret"
+    assert config["secretFile"] == str(secret_file)
+
+
+def test_normalize_bot_config_treats_null_welcome_as_empty_string(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-welcome-null.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "welcome": "null",
+            "enabled": True,
+        }
+    )
+
+    assert config["welcome"] == ""
+
+
+def test_normalize_bot_config_treats_null_name_as_default_unnamed(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-name-null.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "null",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "enabled": True,
+        }
+    )
+
+    assert config["name"] == "unnamed"
 
 
 def test_normalize_bot_config_accepts_agent_backend_and_command(bridge_module):
@@ -2444,6 +5019,43 @@ def test_normalize_bot_config_accepts_agent_backend_and_command(bridge_module):
 
     assert config["agentBackend"] == "claude"
     assert config["agentCommand"] == "claude --model sonnet"
+
+
+def test_normalize_bot_config_treats_null_agent_command_as_unset(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-agent-command-null.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "agentBackend": "codex",
+            "agentCommand": "null",
+            "enabled": True,
+        }
+    )
+
+    assert config["agentCommand"] is None
+
+
+def test_normalize_bot_config_treats_null_restart_token_as_unset(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-restart-token-null.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "id": "bot-1",
+            "name": "codex1",
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "restartToken": "null",
+        }
+    )
+
+    assert config["restartToken"] is None
 
 
 def test_normalize_bot_config_accepts_agent_run_as_fields(bridge_module):
@@ -2767,6 +5379,202 @@ async def test_process_scheduled_messages_dispatches_template_card_via_reply_req
     assert captured["chatKey"] is None
     assert captured["msgtype"] == "template_card"
     assert captured["templateCard"]["card_type"] == "button_interaction"
+    assert not pending.exists()
+    assert (bridge_module.SCHEDULE_DONE_ROOT / "job-card.json").exists()
+    assert not (bridge_module.SCHEDULE_PROCESSING_ROOT / "job-card.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_dispatches_template_card_via_reply_req_id_when_chat_key_missing(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module)
+    bridge_module.save_reply_url(bot, "req-1", "single:test-user", "https://example.com/response")
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-card-missing-chatkey.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-card-missing-chatkey",
+            "scheduleId": "sched-card-missing-chatkey",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "replyReqId": "req-1",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+            "message": "[template_card scheduled follow-up]",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    captured = {}
+
+    async def fake_submit_send_message_request(data, source="api"):
+        captured.update(data)
+        assert source == "scheduled-message"
+        return {"ok": True, "msgtype": "template_card", "chatKey": "single:test-user"}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+    await bridge_module.process_scheduled_messages_once()
+
+    assert captured["replyReqId"] == "req-1"
+    assert captured["chatKey"] is None
+    assert not pending.exists()
+    assert (bridge_module.SCHEDULE_DONE_ROOT / "job-card-missing-chatkey.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_dispatches_template_card_missing_bot_id_via_definition_owner(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module, config_id="bot-1", name="bot-a")
+    other = make_bot(bridge_module, config_id="bot-2", name="bot-b")
+    bridge_module.create_session_record(bot, "single:test-user")
+    bridge_module.create_session_record(other, "single:test-user")
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    other.status = "running"
+    other.ws = SimpleNamespace(closed=False)
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "chatKey": "single:test-user",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "message": "[template_card scheduled follow-up]",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-card-missing-botid.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-card-missing-botid",
+            "scheduleId": definition["scheduleId"],
+            "chatKey": "single:test-user",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+            "message": "[template_card scheduled follow-up]",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    captured = {}
+
+    async def fake_submit_send_message_request(data, source="api"):
+        captured.update(data)
+        assert source == "scheduled-message"
+        return {"ok": True, "msgtype": "template_card", "chatKey": "single:test-user"}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+    await bridge_module.process_scheduled_messages_once()
+
+    assert captured["targetConfigId"] == bot.config["id"]
+    assert not pending.exists()
+    assert (bridge_module.SCHEDULE_DONE_ROOT / "job-card-missing-botid.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_dispatches_template_card_with_current_bot_name_not_stale_job_name(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module, config_id="bot-1", name="bot-a")
+    bridge_module.create_session_record(bot, "single:test-user")
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-card-stale-name.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-card-stale-name",
+            "scheduleId": "sched-card-stale-name",
+            "botId": bot.config["id"],
+            "botName": "old-name",
+            "chatKey": "single:test-user",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+            "message": "[template_card scheduled follow-up]",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    captured = {}
+
+    async def fake_submit_send_message_request(data, source="api"):
+        captured.update(data)
+        assert source == "scheduled-message"
+        return {"ok": True, "msgtype": "template_card", "chatKey": "single:test-user"}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+    await bridge_module.process_scheduled_messages_once()
+
+    assert captured["botName"] == bot.config["name"]
+    assert not pending.exists()
+    assert (bridge_module.SCHEDULE_DONE_ROOT / "job-card-stale-name.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_moves_template_card_job_to_failed_on_permanent_bridge_error(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-card-failed.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-card-failed",
+            "scheduleId": "sched-card-failed",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "chatKey": "single:test-user",
+            "replyReqId": "req-missing",
+            "msgtype": "template_card",
+            "templateCard": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "follow up"},
+                "button_list": [{"text": "go", "style": 1, "key": "go"}],
+            },
+            "message": "[template_card scheduled follow-up]",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    async def fake_submit_send_message_request(_data, source="api"):
+        assert source == "scheduled-message"
+        raise bridge_module.BridgeError(404, "reply response_url not found or expired: req-missing")
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+    await bridge_module.process_scheduled_messages_once()
+
+    assert not pending.exists()
+    assert (bridge_module.SCHEDULE_FAILED_ROOT / "job-card-failed.json").exists()
+    assert not (bridge_module.SCHEDULE_PROCESSING_ROOT / "job-card-failed.json").exists()
+    assert not (bridge_module.SCHEDULE_DONE_ROOT / "job-card-failed.json").exists()
 
 
 @pytest.mark.asyncio
@@ -2813,6 +5621,56 @@ async def test_process_scheduled_messages_does_not_reenqueue_job_already_in_sess
 
     assert called == 0
     updated = bridge_module.read_json_file(processing, None)
+    assert updated["enqueuedByInstance"] == bridge_module.INSTANCE_ID
+    assert updated["enqueuedAt"] > 0
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_dispatches_job_missing_bot_id_when_definition_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": sess.session_id,
+            "chatKey": "single:test-user",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "message": "scheduled text",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-missing-bot-id.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-missing-bot-id",
+            "scheduleId": definition["scheduleId"],
+            "sessionId": sess.session_id,
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    called = []
+
+    async def fake_enqueue_message(_bot, chat_key, text, req_id, **kwargs):
+        called.append((chat_key, text, req_id, kwargs.get("schedule_id"), kwargs.get("schedule_request_id")))
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+    await bridge_module.process_scheduled_messages_once()
+
+    assert called == [("single:test-user", "scheduled text", None, definition["scheduleId"], "job-missing-bot-id")]
+    processing = bridge_module.SCHEDULE_PROCESSING_ROOT / "job-missing-bot-id.json"
+    updated = bridge_module.read_json_file(processing, None)
+    assert updated is not None
     assert updated["enqueuedByInstance"] == bridge_module.INSTANCE_ID
     assert updated["enqueuedAt"] > 0
 
@@ -2934,6 +5792,159 @@ async def test_bridge_interrupt_command_is_intercepted(bridge_module, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_cwd_command_rejected_in_team_mode(bridge_module):
+    bot = make_bot(bridge_module)
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message):
+        replies.append((req_id, message))
+
+    bridge_module.respond_info = fake_respond_info
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-cwd-team"},
+        "body": {
+            "msgtype": "text",
+            "text": {"content": "/cwd repo"},
+            "from": {"userid": "test-user"},
+        },
+    }
+
+    await bridge_module.handle_wecom_message(bot, payload)
+
+    assert replies == [("req-cwd-team", "仅 personal 模式支持 /cwd；team 模式不允许切换。")]
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_updates_personal_session_dir(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-cwd"
+    target_dir = work_dir / "services" / "api"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "thread-old"
+    sess.resume_candidates = [{"sessionId": "session-old", "threadId": "thread-old"}]
+    sess.resume_selection_expires_at = bridge_module.now_ms() + 60_000
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda current: {
+            **current,
+            "threadId": "thread-old",
+        },
+    )
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message):
+        replies.append((req_id, message))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-cwd-personal"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/cwd services/api"},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    record = bridge_module.read_session_record_by_id(sess.session_id)
+
+    assert sess.work_dir == str(target_dir.resolve())
+    assert sess.thread_id is None
+    assert sess.resume_candidates == []
+    assert sess.resume_selection_expires_at == 0
+    assert record is not None
+    assert record["cwdDir"] == str(target_dir.resolve())
+    assert record["threadId"] is None
+    assert replies == [("req-cwd-personal", f"cwd changed to {target_dir.resolve()}")]
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_rejected_while_running(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-running"
+    target_dir = work_dir / "services" / "api"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message):
+        replies.append((req_id, message))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-cwd-running"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/cwd services/api"},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    assert replies == [("req-cwd-running", "当前有任务在运行，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。")]
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_resolves_relative_paths_from_current_personal_dir(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-relative-cwd"
+    nested_dir = work_dir / "services" / "api"
+    nested_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda current: {
+            **current,
+            "cwdDir": str(nested_dir.resolve()),
+            "updatedAt": bridge_module.now_ms(),
+        },
+    )
+    sess.work_dir = str(nested_dir.resolve())
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message):
+        replies.append((req_id, message))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-cwd-parent"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/cwd .."},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    parent_dir = (nested_dir / "..").resolve()
+    record = bridge_module.read_session_record_by_id(sess.session_id)
+
+    assert sess.work_dir == str(parent_dir)
+    assert record is not None
+    assert record["cwdDir"] == str(parent_dir)
+    assert replies == [("req-cwd-parent", f"cwd changed to {parent_dir}")]
+
+
+@pytest.mark.asyncio
 async def test_resume_command_lists_candidates_for_current_chat_scope(bridge_module):
     bot = make_bot(bridge_module)
     current = make_session(bridge_module, bot, "single:test-user")
@@ -2987,6 +5998,113 @@ async def test_resume_command_lists_candidates_for_current_chat_scope(bridge_mod
 
 
 @pytest.mark.asyncio
+async def test_resume_command_lists_persisted_candidate_missing_bot_id_when_managed_lock_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "thread-current"
+    bridge_module.update_session_record(current.session_id, lambda record: {**record, "lastRunAt": bridge_module.now_ms()})
+    persisted_session_id = "sess-persisted"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(persisted_session_id),
+        {
+            "sessionId": persisted_session_id,
+            "chatKey": "group-user:room-1:test-user",
+            "threadId": "thread-persisted",
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], persisted_session_id)),
+            "createdAt": bridge_module.now_ms() - 2000,
+            "updatedAt": bridge_module.now_ms() - 2000,
+            "lastRunAt": bridge_module.now_ms() - 1000,
+            "status": "idle",
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/bridge-resume"},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    assert replies
+    content = replies[0][1]
+    assert persisted_session_id in content
+    assert len(current.resume_candidates) == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_command_lists_persisted_candidate_missing_chat_key_when_key_file_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "thread-current"
+    bridge_module.update_session_record(current.session_id, lambda record: {**record, "lastRunAt": bridge_module.now_ms()})
+    persisted_session_id = "sess-persisted-chat-missing"
+    bridge_module.write_json_atomic(
+        bridge_module.get_registry_session_file(persisted_session_id),
+        {
+            "sessionId": persisted_session_id,
+            "botId": bot.config["id"],
+            "threadId": "thread-persisted",
+            "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], persisted_session_id)),
+            "createdAt": bridge_module.now_ms() - 2000,
+            "updatedAt": bridge_module.now_ms() - 2000,
+            "lastRunAt": bridge_module.now_ms() - 1000,
+            "status": "idle",
+        },
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], "group-user:room-1:test-user")
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps(
+            {
+                "sessionId": persisted_session_id,
+                "botId": bot.config["id"],
+                "chatKey": "group-user:room-1:test-user",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/bridge-resume"},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    assert replies
+    content = replies[0][1]
+    assert persisted_session_id in content
+    assert len(current.resume_candidates) == 2
+
+
+@pytest.mark.asyncio
 async def test_resume_command_binds_selected_thread_to_current_chat(bridge_module):
     bot = make_bot(bridge_module)
     current = make_session(bridge_module, bot, "single:test-user")
@@ -3025,7 +6143,61 @@ async def test_resume_command_binds_selected_thread_to_current_chat(bridge_modul
 
     assert current.thread_id == "thread-target"
     persisted = bridge_module.read_session_record_by_id(current.session_id)
-    assert persisted.get("threadId") is None
+    assert persisted.get("threadId") == "thread-target"
+    assert current.resume_candidates == []
+    assert "已选择会话" in replies[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_resume_command_copies_recent_chat_from_selected_session(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bot.sessions["group-user:room-1:test-user"] = bridge_module.SessionState(
+        session_id=target["sessionId"],
+        work_dir=str(bridge_module.get_session_runtime_cwd(bot, "group-user:room-1:test-user")),
+        lock_file=Path(target["lockFile"]),
+        thread_id="thread-target",
+    )
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {
+            **record,
+            "lastRunAt": bridge_module.now_ms(),
+            "recentChat": [
+                {"role": "user", "text": "older user turn"},
+                {"role": "bot", "text": "older bot turn"},
+            ],
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-resume"},
+            "body": {"msgtype": "text", "text": {"content": "/bridge-resume"}, "from": {"userid": "test-user"}},
+        },
+    )
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-select"},
+            "body": {"msgtype": "text", "text": {"content": "1"}, "from": {"userid": "test-user"}},
+        },
+    )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert [item["text"] for item in current.chat] == ["older user turn", "older bot turn"]
+    assert [item["text"] for item in persisted.get("recentChat") or []] == ["older user turn", "older bot turn"]
     assert current.resume_candidates == []
     assert "已选择会话" in replies[-1][1]
 
@@ -3095,6 +6267,48 @@ async def test_bridge_status_counts_processing_and_pending_jobs(bridge_module):
 
     assert replies
     assert "scheduled=2" in replies[0][1]
+
+
+@pytest.mark.asyncio
+async def test_bridge_status_counts_job_missing_bot_id_when_definition_matches(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": sess.session_id,
+            "chatKey": "single:test-user",
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "message": "scheduled text",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    bridge_module.write_json_atomic(
+        bridge_module.SCHEDULE_PENDING_ROOT / "job-missing-botid-status.json",
+        {
+            "requestId": "job-missing-botid-status",
+            "scheduleId": definition["scheduleId"],
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() + 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message):
+        replies.append((req_id, message))
+
+    bridge_module.respond_info = fake_respond_info
+    await bridge_module.status_session_command(bot, "single:test-user", "req-2")
+
+    assert replies
+    assert "scheduled=1" in replies[0][1]
 
 
 @pytest.mark.asyncio
@@ -3261,6 +6475,61 @@ async def test_process_scheduled_messages_fails_orphaned_job_for_missing_bot(bri
     failed = bridge_module.SCHEDULE_FAILED_ROOT / "job.json"
     assert failed.exists()
     assert not processing.exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_discards_job_with_invalid_run_at(bridge_module):
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "job-invalid-runat.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "job-invalid-runat",
+            "botId": "missing-bot",
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": "bad",
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    await bridge_module.process_scheduled_messages_once()
+
+    failed = bridge_module.SCHEDULE_FAILED_ROOT / "job-invalid-runat.json"
+    assert failed.exists()
+    assert not pending.exists()
+
+
+@pytest.mark.asyncio
+async def test_process_scheduled_messages_discards_processing_job_with_invalid_enqueued_at(bridge_module):
+    bot = make_bot(bridge_module)
+    make_session(bridge_module, bot)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    processing = bridge_module.SCHEDULE_PROCESSING_ROOT / "job-invalid-enqueued.json"
+    bridge_module.write_json_atomic(
+        processing,
+        {
+            "requestId": "job-invalid-enqueued",
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+            "enqueuedAt": "bad",
+            "enqueuedByInstance": "other-instance",
+        },
+    )
+
+    async def fake_enqueue_message(*args, **kwargs):
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+    await bridge_module.process_scheduled_messages_once()
+
+    assert processing.exists()
+    updated = bridge_module.read_json_file(processing, None)
+    assert updated["enqueuedByInstance"] == bridge_module.INSTANCE_ID
+    assert isinstance(updated["enqueuedAt"], int)
 
 
 def test_process_scheduled_reminder_message_is_reenqueued_into_session(bridge_module):
@@ -3477,6 +6746,41 @@ def test_chat_key_for_bot_group_mode_shared_preserves_legacy_behavior(bridge_mod
         },
     )
     assert key == "group:group-1"
+
+
+def test_chat_key_for_bot_rejects_missing_sender_userid(bridge_module):
+    bot = make_bot(bridge_module)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.chat_key_for_bot(
+            bot,
+            {
+                "body": {
+                    "from": {},
+                }
+            },
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "message sender userid required"
+
+
+def test_chat_key_for_bot_rejects_group_message_without_chatid(bridge_module):
+    bot = make_bot(bridge_module)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.chat_key_for_bot(
+            bot,
+            {
+                "body": {
+                    "chattype": "group",
+                    "from": {"userid": "user-a"},
+                }
+            },
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "group message chatid required"
 
 
 @pytest.mark.asyncio
@@ -4141,6 +7445,24 @@ async def test_schedule_definition_lock_blocks_other_task_in_same_process(bridge
     assert "sch-lock" not in bridge_module.SCHEDULE_DEFINITION_LOCK_HANDLES
 
 
+def test_acquire_schedule_definition_lock_replaces_symlink_lock_file_without_touching_target(bridge_module):
+    schedule_id = "sched-lock"
+    lock_file = bridge_module.get_schedule_definition_lock_file(schedule_id)
+    external_lock = bridge_module.BASE_DIR / "external-schedule.lock"
+    external_lock.write_text("external", encoding="utf-8")
+    bridge_module.ensure_dir_for(lock_file)
+    lock_file.symlink_to(external_lock)
+
+    assert bridge_module.acquire_schedule_definition_lock(schedule_id) is True
+    try:
+        assert lock_file.exists()
+        assert not lock_file.is_symlink()
+    finally:
+        bridge_module.release_schedule_definition_lock(schedule_id)
+
+    assert external_lock.read_text(encoding="utf-8") == "external"
+
+
 def test_pause_schedule_definition_clears_pending_jobs(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -4458,11 +7780,818 @@ def test_remove_deleted_bots_from_memory_once_stops_tombstoned_bot(bridge_module
     assert bot.config["id"] not in bridge_module.BOTS
 
 
+def test_remove_deleted_bots_from_memory_once_preserves_newer_recreated_persisted_state(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.started_at_ms = bridge_module.now_ms() - 1000
+    bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
+    deleted_at = bridge_module.bot_tombstone_deleted_at(bot.config["botId"])
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "recreated.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": bot.config["id"],
+                "name": bot.config["name"],
+                "botId": bot.config["botId"],
+                "secretFile": str(secret_file),
+                "workDir": bot.config["workDir"],
+                "groupSessionMode": "per-user",
+                "enabled": True,
+                "createdAt": deleted_at + 1,
+                "updatedAt": deleted_at + 1,
+            }
+        ],
+    )
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": sess.session_id,
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=deleted_at + 1,
+    )
+    bridge_module.write_schedule_definition(definition)
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
+        target = bridge_module.BOTS[bot_id]
+        target.status = "stopped"
+
+    bridge_module.stop_bot = fake_stop_bot
+
+    asyncio.run(bridge_module.remove_deleted_bots_from_memory_once())
+
+    assert bot.config["id"] not in bridge_module.BOTS
+    stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert stored == [
+        {
+            "id": bot.config["id"],
+            "name": bot.config["name"],
+            "botId": bot.config["botId"],
+            "secretFile": str(secret_file),
+            "workDir": bot.config["workDir"],
+            "groupSessionMode": "per-user",
+            "enabled": True,
+            "createdAt": deleted_at + 1,
+            "updatedAt": deleted_at + 1,
+        }
+    ]
+    assert bridge_module.read_session_record_by_id(sess.session_id) is not None
+    assert bridge_module.read_schedule_definition(definition["scheduleId"]) is not None
+
+
+def test_remove_deleted_bots_from_memory_once_cleans_old_config_artifacts_when_recreated_with_new_id(
+    bridge_module,
+):
+    old_bot = make_bot(bridge_module, config_id="bot-old", remote_bot_id="bot-id")
+    sess = make_session(bridge_module, old_bot)
+    old_bot.started_at_ms = bridge_module.now_ms() - 1000
+    chatfile_dir = bridge_module.get_chatfile_dir(old_bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": sess.session_id,
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    bridge_module.mark_bot_deleted_globally(old_bot.config["id"], old_bot.config["botId"])
+    deleted_at = bridge_module.bot_tombstone_deleted_at(old_bot.config["botId"])
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "recreated-new-id.secret", "secret\n")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": "bot-new",
+                "name": "codex1",
+                "botId": old_bot.config["botId"],
+                "secretFile": str(secret_file),
+                "workDir": old_bot.config["workDir"],
+                "groupSessionMode": "per-user",
+                "enabled": True,
+                "createdAt": deleted_at + 1,
+                "updatedAt": deleted_at + 1,
+            }
+        ],
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
+        target = bridge_module.BOTS[bot_id]
+        target.status = "stopped"
+
+    bridge_module.stop_bot = fake_stop_bot
+
+    asyncio.run(bridge_module.remove_deleted_bots_from_memory_once())
+
+    assert old_bot.config["id"] not in bridge_module.BOTS
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == [
+        {
+            "id": "bot-new",
+            "name": "codex1",
+            "botId": old_bot.config["botId"],
+            "secretFile": str(secret_file),
+            "workDir": old_bot.config["workDir"],
+            "groupSessionMode": "per-user",
+            "enabled": True,
+            "createdAt": deleted_at + 1,
+            "updatedAt": deleted_at + 1,
+        }
+    ]
+    assert bridge_module.read_session_record_by_id(sess.session_id) is None
+    assert bridge_module.read_schedule_definition(definition["scheduleId"]) is None
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+    assert not bridge_module.get_template_card_state_file(old_bot.config["id"]).exists()
+
+
+def test_remove_deleted_bots_from_memory_once_cleans_malformed_persisted_entry_matching_stale_runtime_bot(
+    bridge_module,
+):
+    bot = make_bot(bridge_module)
+    bot.started_at_ms = bridge_module.now_ms() - 1000
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "name": "broken-entry",
+                "botId": bot.config["botId"],
+                "secretFile": str(write_secret_file(bridge_module.BASE_DIR / "stale-recreated.secret", "secret\n")),
+                "workDir": bot.config["workDir"],
+                "groupSessionMode": "per-user",
+                "agentBackend": "not-a-backend",
+                "enabled": True,
+                "createdAt": bridge_module.now_ms() - 1000,
+                "updatedAt": bridge_module.now_ms() - 1000,
+            }
+        ],
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
+        target = bridge_module.BOTS[bot_id]
+        target.status = "stopped"
+
+    bridge_module.stop_bot = fake_stop_bot
+    bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
+
+    asyncio.run(bridge_module.remove_deleted_bots_from_memory_once())
+
+    assert bot.config["id"] not in bridge_module.BOTS
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+
+
+def test_remove_deleted_bots_from_memory_once_does_not_preserve_newer_invalid_persisted_config(
+    bridge_module,
+):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.started_at_ms = bridge_module.now_ms() - 1000
+    chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+    bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
+    deleted_at = bridge_module.bot_tombstone_deleted_at(bot.config["botId"])
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": bot.config["id"],
+                "name": "broken-entry",
+                "botId": bot.config["botId"],
+                "secretFile": str(write_secret_file(bridge_module.BASE_DIR / "broken-newer.secret", "secret\n")),
+                "workDir": bot.config["workDir"],
+                "groupSessionMode": "per-user",
+                "agentBackend": "not-a-backend",
+                "enabled": True,
+                "createdAt": deleted_at + 1,
+                "updatedAt": deleted_at + 1,
+            }
+        ],
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
+        target = bridge_module.BOTS[bot_id]
+        target.status = "stopped"
+
+    bridge_module.stop_bot = fake_stop_bot
+
+    asyncio.run(bridge_module.remove_deleted_bots_from_memory_once())
+
+    assert bot.config["id"] not in bridge_module.BOTS
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+    assert bridge_module.read_session_record_by_id(sess.session_id) is None
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_remove_deleted_bots_from_memory_once_cleans_artifacts_for_tombstoned_bot(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.started_at_ms = bridge_module.now_ms() - 1000
+    chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+    definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": sess.session_id,
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(definition)
+    pending = bridge_module.SCHEDULE_PENDING_ROOT / "pending-job.json"
+    bridge_module.write_json_atomic(
+        pending,
+        {
+            "requestId": "pending-job",
+            "scheduleId": definition["scheduleId"],
+            "botId": bot.config["id"],
+            "sessionId": sess.session_id,
+            "chatKey": "single:test-user",
+            "message": "scheduled text",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    workspace_root = bridge_module.get_workspace_namespace_dir(bot.config["id"])
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    (workspace_root / "keep.txt").write_text("workspace", encoding="utf-8")
+    alias_dir = bridge_module.get_user_alias_dir(bot.config["id"])
+    alias_dir.mkdir(parents=True, exist_ok=True)
+    (alias_dir / "alias.json").write_text("{}", encoding="utf-8")
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": bot.config["id"],
+                "name": bot.config["name"],
+                "botId": bot.config["botId"],
+                "secretFile": str(write_secret_file(bridge_module.BASE_DIR / "persisted.secret", "secret\n")),
+                "workDir": bot.config["workDir"],
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, reason: str = "internal"):
+        target = bridge_module.BOTS[bot_id]
+        target.status = "stopped"
+
+    bridge_module.stop_bot = fake_stop_bot
+    bridge_module.mark_bot_deleted_globally(bot.config["id"], bot.config["botId"])
+
+    asyncio.run(bridge_module.remove_deleted_bots_from_memory_once())
+
+    assert bot.config["id"] not in bridge_module.BOTS
+    assert bridge_module.read_session_record_by_id(sess.session_id) is None
+    assert not pending.exists()
+    assert bridge_module.read_schedule_definition(definition["scheduleId"]) is None
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+    assert not workspace_root.exists()
+    assert not alias_dir.exists()
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
+
+
 def test_remove_bot_rejects_unknown_bot_id(bridge_module):
     with pytest.raises(bridge_module.BridgeError) as excinfo:
         asyncio.run(bridge_module.remove_bot("missing-bot"))
 
     assert excinfo.value.status_code == 404
+
+
+def test_remove_bot_cleans_malformed_session_record_artifacts(bridge_module):
+    bot = make_bot(bridge_module)
+    session_id = "sess-bad"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "botId": bot.config["id"],
+                "chatKey": "single:test-user",
+                "lockFile": "/tmp/not-managed.lock.json",
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_remove_bot_cleans_artifacts_for_malformed_session_record_missing_session_id(bridge_module):
+    bot = make_bot(bridge_module)
+    session_id = "sess-missing-id"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "botId": bot.config["id"],
+                "chatKey": "single:test-user",
+                "lockFile": "/tmp/not-managed.lock.json",
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_remove_bot_cleans_artifacts_for_session_id_referenced_only_by_key_file(bridge_module):
+    bot = make_bot(bridge_module)
+    session_id = "sess-key-only"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "chatKey": "single:test-user",
+                "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    key_file = bridge_module.get_registry_key_file(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir_for(key_file)
+    key_file.write_text(
+        json.dumps({"sessionId": session_id, "botId": bot.config["id"], "chatKey": "single:test-user"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not session_file.exists()
+    assert not key_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_remove_bot_cleans_artifacts_for_session_record_missing_bot_id_but_managed_lock(bridge_module):
+    bot = make_bot(bridge_module)
+    session_id = "sess-missing-bot-id"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "chatKey": "single:test-user",
+                "lockFile": str(bridge_module.get_managed_session_lock_file(bot.config["id"], session_id)),
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not session_file.exists()
+    assert not chatfile_dir.exists()
+    assert not codex_home.exists()
+
+
+def test_remove_bot_does_not_delete_foreign_artifacts_when_key_file_points_to_foreign_malformed_session(
+    bridge_module,
+):
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    session_id = "sess-foreign-malformed"
+    session_file = bridge_module.get_registry_session_file(session_id)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "chatKey": "single:test-user",
+                "lockFile": str(bridge_module.get_managed_session_lock_file(second.config["id"], session_id)),
+                "createdAt": bridge_module.now_ms(),
+                "updatedAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bad_key_file = bridge_module.get_registry_key_file(first.config["id"], "single:test-user")
+    bridge_module.ensure_dir_for(bad_key_file)
+    bad_key_file.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "botId": first.config["id"],
+                "chatKey": "single:test-user",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    chatfile_dir = bridge_module.get_chatfile_dir(session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(first.config["id"]))
+
+    assert session_file.exists()
+    assert chatfile_dir.exists()
+    assert codex_home.exists()
+
+
+def test_remove_bot_does_not_delete_foreign_live_artifacts_when_key_file_points_to_missing_foreign_session_record(
+    bridge_module,
+):
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    second_sess = make_session(bridge_module, second, "single:test-user")
+    session_file = bridge_module.get_registry_session_file(second_sess.session_id)
+    session_file.unlink()
+    chatfile_dir = bridge_module.get_chatfile_dir(second_sess.session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(second_sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+    bad_key_file = bridge_module.get_registry_key_file(first.config["id"], "single:test-user")
+    bridge_module.ensure_dir_for(bad_key_file)
+    bad_key_file.write_text(
+        json.dumps(
+            {
+                "sessionId": second_sess.session_id,
+                "botId": first.config["id"],
+                "chatKey": "single:test-user",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    asyncio.run(bridge_module.remove_bot(first.config["id"]))
+
+    assert chatfile_dir.exists()
+    assert codex_home.exists()
+
+
+def test_remove_bot_does_not_delete_other_bot_artifacts_when_key_file_points_to_foreign_session(bridge_module):
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    second_sess = make_session(bridge_module, second, "single:test-user")
+    chatfile_dir = bridge_module.get_chatfile_dir(second_sess.session_id)
+    bridge_module.ensure_dir(chatfile_dir)
+    (chatfile_dir / "artifact.txt").write_text("hello", encoding="utf-8")
+    codex_home = bridge_module.build_codex_home_for_subprocess(second_sess.session_id)
+    (codex_home / "state.txt").write_text("keep", encoding="utf-8")
+    bad_key_file = bridge_module.get_registry_key_file(first.config["id"], "single:test-user")
+    bridge_module.ensure_dir_for(bad_key_file)
+    bad_key_file.write_text(
+        json.dumps(
+            {
+                "sessionId": second_sess.session_id,
+                "botId": first.config["id"],
+                "chatKey": "single:test-user",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    asyncio.run(bridge_module.remove_bot(first.config["id"]))
+
+    assert bridge_module.read_session_record_by_id(second_sess.session_id) is not None
+    assert chatfile_dir.exists()
+    assert codex_home.exists()
+
+
+def test_remove_bot_cleans_malformed_schedule_definition_for_target_bot(bridge_module):
+    bot = make_bot(bridge_module)
+    malformed_schedule_id = "sched-bad"
+    definition_file = bridge_module.get_schedule_definition_file(malformed_schedule_id)
+    definition_file.parent.mkdir(parents=True, exist_ok=True)
+    definition_file.write_text(
+        json.dumps(
+            {
+                "scheduleId": malformed_schedule_id,
+                "botId": bot.config["id"],
+                "chatKey": "single:test-user",
+                "message": "hello",
+                "mode": "broken",
+                "createdAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    lock_file = bridge_module.get_schedule_definition_lock_file(malformed_schedule_id)
+    bridge_module.ensure_dir_for(lock_file)
+    lock_file.write_text("{}", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not definition_file.exists()
+    assert not lock_file.exists()
+
+
+def test_remove_bot_cleans_lock_for_malformed_schedule_definition_missing_schedule_id(bridge_module):
+    bot = make_bot(bridge_module)
+    schedule_id = "folder/evil"
+    definition_file = bridge_module.get_schedule_definition_file(schedule_id)
+    definition_file.parent.mkdir(parents=True, exist_ok=True)
+    definition_file.write_text(
+        json.dumps(
+            {
+                "botId": bot.config["id"],
+                "chatKey": "single:test-user",
+                "message": "hello",
+                "mode": "broken",
+                "createdAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    lock_file = bridge_module.get_schedule_definition_lock_file(schedule_id)
+    bridge_module.ensure_dir_for(lock_file)
+    lock_file.write_text("{}", encoding="utf-8")
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not definition_file.exists()
+    assert not lock_file.exists()
+
+
+def test_remove_bot_cleans_malformed_persisted_bot_entry_matching_wecom_bot_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "name": "broken-entry",
+                "botId": bot.config["botId"],
+                "secretFile": str(write_secret_file(bridge_module.BASE_DIR / "persisted.secret", "secret\n")),
+                "workDir": bot.config["workDir"],
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            },
+            {"id": bot.config["id"], "name": bot.config["name"], "botId": bot.config["botId"], "enabled": True},
+            {"id": "keep-bot", "name": "keep", "botId": "keep-id", "enabled": True},
+        ],
+    )
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == [
+        {
+            "id": "keep-bot",
+            "name": "keep",
+            "botId": "keep-id",
+            "enabled": True,
+            "workspaceNamespace": "keep-bot",
+            "workspaceMode": "team",
+        }
+    ]
+
+
+def test_remove_bot_cleans_malformed_schedule_definition_missing_bot_id_when_job_references_it(bridge_module):
+    bot = make_bot(bridge_module)
+    schedule_id = "sched-missing-bot-id"
+    definition_file = bridge_module.get_schedule_definition_file(schedule_id)
+    definition_file.parent.mkdir(parents=True, exist_ok=True)
+    definition_file.write_text(
+        json.dumps(
+            {
+                "chatKey": "single:test-user",
+                "message": "hello",
+                "mode": "broken",
+                "createdAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    lock_file = bridge_module.get_schedule_definition_lock_file(schedule_id)
+    bridge_module.ensure_dir_for(lock_file)
+    lock_file.write_text("{}", encoding="utf-8")
+    pending_job = bridge_module.SCHEDULE_PENDING_ROOT / "job-missing-bot.json"
+    bridge_module.write_json_atomic(
+        pending_job,
+        {
+            "requestId": "job-missing-bot",
+            "scheduleId": schedule_id,
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "message": "hello",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not definition_file.exists()
+    assert not lock_file.exists()
+    assert not pending_job.exists()
+
+
+def test_remove_bot_cleans_non_object_schedule_definition_when_current_bot_job_references_it(bridge_module):
+    bot = make_bot(bridge_module)
+    schedule_id = "sched-non-object"
+    definition_file = bridge_module.get_schedule_definition_file(schedule_id)
+    definition_file.parent.mkdir(parents=True, exist_ok=True)
+    definition_file.write_text("[]", encoding="utf-8")
+    pending_job = bridge_module.SCHEDULE_PENDING_ROOT / "job-non-object.json"
+    bridge_module.write_json_atomic(
+        pending_job,
+        {
+            "requestId": "job-non-object",
+            "scheduleId": schedule_id,
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "message": "hello",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not definition_file.exists()
+    assert not pending_job.exists()
+
+
+def test_remove_bot_does_not_delete_foreign_schedule_definition_referenced_by_malformed_job(bridge_module):
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    foreign_definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": bridge_module.create_session_record(second, "single:test-user")["sessionId"],
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(foreign_definition)
+    pending_job = bridge_module.SCHEDULE_PENDING_ROOT / "job-foreign.json"
+    bridge_module.write_json_atomic(
+        pending_job,
+        {
+            "requestId": "job-foreign",
+            "scheduleId": foreign_definition["scheduleId"],
+            "botId": first.config["id"],
+            "chatKey": "single:test-user",
+            "message": "hello",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    asyncio.run(bridge_module.remove_bot(first.config["id"]))
+
+    assert bridge_module.read_schedule_definition(foreign_definition["scheduleId"]) is not None
+    assert bridge_module.get_schedule_definition_lock_file(foreign_definition["scheduleId"]).exists() is False
+
+
+def test_remove_bot_does_not_delete_foreign_job_even_when_schedule_id_matches_removed_set(bridge_module):
+    first = make_bot(bridge_module, config_id="bot-a", remote_bot_id="bot-a-id")
+    second = make_bot(bridge_module, config_id="bot-b", remote_bot_id="bot-b-id")
+    foreign_definition = bridge_module.create_schedule_definition_record(
+        {
+            "sessionId": bridge_module.create_session_record(second, "single:test-user")["sessionId"],
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+        },
+        created_at_ms=1_800_000_500_000,
+    )
+    bridge_module.write_schedule_definition(foreign_definition)
+    foreign_job = bridge_module.SCHEDULE_PENDING_ROOT / "job-foreign-owner.json"
+    bridge_module.write_json_atomic(
+        foreign_job,
+        {
+            "requestId": "job-foreign-owner",
+            "scheduleId": foreign_definition["scheduleId"],
+            "botId": second.config["id"],
+            "chatKey": "single:test-user",
+            "message": "hello",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+    malformed_definition = bridge_module.get_schedule_definition_file("sched-bad-a")
+    malformed_definition.parent.mkdir(parents=True, exist_ok=True)
+    malformed_definition.write_text(
+        json.dumps(
+            {
+                "scheduleId": foreign_definition["scheduleId"],
+                "botId": first.config["id"],
+                "chatKey": "single:test-user",
+                "message": "hello",
+                "mode": "broken",
+                "createdAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    asyncio.run(bridge_module.remove_bot(first.config["id"]))
+
+    assert foreign_job.exists()
+
+
+def test_remove_bot_cleans_jobs_for_malformed_definition_even_when_job_bot_id_missing(bridge_module):
+    bot = make_bot(bridge_module)
+    malformed_schedule_id = "sched-bad-job"
+    definition_file = bridge_module.get_schedule_definition_file(malformed_schedule_id)
+    definition_file.parent.mkdir(parents=True, exist_ok=True)
+    definition_file.write_text(
+        json.dumps(
+            {
+                "scheduleId": malformed_schedule_id,
+                "botId": bot.config["id"],
+                "chatKey": "single:test-user",
+                "message": "hello",
+                "mode": "broken",
+                "createdAt": bridge_module.now_ms(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    pending_job = bridge_module.SCHEDULE_PENDING_ROOT / "bad-job.json"
+    bridge_module.write_json_atomic(
+        pending_job,
+        {
+            "requestId": "bad-job",
+            "scheduleId": malformed_schedule_id,
+            "chatKey": "single:test-user",
+            "message": "hello",
+            "runAt": bridge_module.now_ms() - 1000,
+            "createdAt": bridge_module.now_ms(),
+        },
+    )
+
+    asyncio.run(bridge_module.remove_bot(bot.config["id"]))
+
+    assert not definition_file.exists()
+    assert not pending_job.exists()
 
 
 def test_find_config_id_by_wecom_bot_id_prefers_existing_config(bridge_module):
@@ -4656,6 +8785,66 @@ def test_reconcile_bots_once_skips_tombstoned_persisted_bot(bridge_module):
     assert bridge_module.read_json_file(bridge_module.DATA_FILE, None) == []
 
 
+def test_reconcile_bots_once_prunes_and_stops_stale_bootstrap_managed_bot(bridge_module, monkeypatch):
+    stale_secret_file = write_secret_file(bridge_module.BASE_DIR / "stale-reconcile.secret", "stale-secret\n")
+    live_secret_file = write_secret_file(bridge_module.BASE_DIR / "live-reconcile.secret", "live-secret\n")
+    stale_bot_id = "stale-bot"
+    stale_config_id = bridge_module.default_bot_config_id(stale_bot_id)
+    stale_bot = make_bot(bridge_module, config_id=stale_config_id, name="env-bot", remote_bot_id=stale_bot_id)
+    bridge_module.write_json_atomic(
+        bridge_module.DATA_FILE,
+        [
+            {
+                "id": stale_config_id,
+                "name": "env-bot",
+                "botId": stale_bot_id,
+                "secretFile": str(stale_secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "welcome": "",
+                "groupSessionMode": "per-user",
+                "enabled": True,
+            }
+        ],
+    )
+    monkeypatch.setenv(
+        "WECOM_BOOTSTRAP_BOTS_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "live-env-bot",
+                    "botId": "live-bot",
+                    "secretFile": str(live_secret_file),
+                    "workDir": str(bridge_module.BASE_DIR),
+                }
+            ]
+        ),
+    )
+    stopped = []
+    started = []
+
+    async def fake_stop_bot(bot_id: str, persist_disable: bool = True, persist_state: bool = True, reason: str = "internal"):
+        stopped.append((bot_id, persist_disable, persist_state, reason))
+        bridge_module.BOTS.pop(bot_id, None)
+
+    async def fake_start_bot(config):
+        normalized = bridge_module.normalize_bot_config(config, allow_inline_secret=True)
+        started.append(normalized)
+        bridge_module.upsert_persisted_bot_config(normalized)
+        return bridge_module.BotState(config=normalized)
+
+    bridge_module.stop_bot = fake_stop_bot
+    bridge_module.start_bot = fake_start_bot
+
+    asyncio.run(bridge_module.reconcile_bots_once())
+
+    assert stopped == [(stale_config_id, False, False, "config_reconcile_missing")]
+    assert len(started) == 1
+    assert started[0]["botId"] == "live-bot"
+    stored = bridge_module.read_json_file(bridge_module.DATA_FILE, None)
+    assert len(stored) == 1
+    assert stored[0]["botId"] == "live-bot"
+
+
 def test_reconcile_bots_once_keeps_recreated_persisted_bot_newer_than_tombstone(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
     bridge_module.mark_bot_deleted_globally("bot-1", "bot-id")
@@ -4719,6 +8908,77 @@ def test_resolve_local_file_send_queue_root_uses_bridge_base_dir_for_relative_en
     resolved = bridge_module.resolve_local_file_send_queue_root(bridge_module.BASE_DIR)
 
     assert resolved == (bridge_module.BASE_DIR / "relative-queue").resolve()
+
+
+def test_resolve_local_send_message_queue_root_uses_runtime_root_for_relative_env(bridge_module, monkeypatch):
+    monkeypatch.setenv("BRIDGE_RUNTIME_ROOT", "runtime-root")
+    monkeypatch.setenv("LOCAL_SEND_MESSAGE_QUEUE_ROOT", "relative-queue")
+
+    resolved = bridge_module.resolve_local_send_message_queue_root(bridge_module.BASE_DIR)
+
+    assert resolved == (bridge_module.BASE_DIR / "runtime-root" / "relative-queue").resolve()
+
+
+def test_list_local_file_send_queue_path_groups_ignores_symlinked_target_dirs(bridge_module):
+    bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT = bridge_module.BASE_DIR / "local-file-send-queue"
+    bridge_module.LOCAL_FILE_SEND_PENDING_ROOT = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "pending"
+    bridge_module.LOCAL_FILE_SEND_PROCESSING_ROOT = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "processing"
+    bridge_module.LOCAL_FILE_SEND_RESULT_ROOT = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "results"
+    bridge_module.LOCAL_FILE_SEND_DONE_ROOT = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "done"
+    bridge_module.LOCAL_FILE_SEND_FAILED_ROOT = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "failed"
+    targets_root = bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT / "targets"
+    external_root = bridge_module.BASE_DIR / "external-file-send-root"
+    bridge_module.ensure_dir(external_root / "pending")
+    bridge_module.ensure_dir(targets_root)
+    (targets_root / "bot-2").symlink_to(external_root, target_is_directory=True)
+
+    groups = bridge_module.list_local_file_send_queue_path_groups()
+
+    roots = {str(item["root"]) for item in groups}
+    assert str(external_root.resolve()) not in roots
+    assert str((targets_root / "bot-2").resolve()) not in roots
+
+
+def test_list_local_send_message_queue_path_groups_ignores_symlinked_target_dirs(bridge_module):
+    bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT = bridge_module.BASE_DIR / "local-send-message-queue"
+    bridge_module.LOCAL_SEND_MESSAGE_PENDING_ROOT = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "pending"
+    bridge_module.LOCAL_SEND_MESSAGE_PROCESSING_ROOT = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "processing"
+    bridge_module.LOCAL_SEND_MESSAGE_RESULT_ROOT = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "results"
+    bridge_module.LOCAL_SEND_MESSAGE_DONE_ROOT = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "done"
+    bridge_module.LOCAL_SEND_MESSAGE_FAILED_ROOT = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "failed"
+    targets_root = bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets"
+    external_root = bridge_module.BASE_DIR / "external-send-message-root"
+    bridge_module.ensure_dir(external_root / "pending")
+    bridge_module.ensure_dir(targets_root)
+    (targets_root / "bot-2").symlink_to(external_root, target_is_directory=True)
+
+    groups = bridge_module.list_local_send_message_queue_path_groups()
+
+    roots = {str(item["root"]) for item in groups}
+    assert str(external_root.resolve()) not in roots
+    assert str((targets_root / "bot-2").resolve()) not in roots
+
+
+def test_bridge_module_rejects_file_local_file_send_queue_root(monkeypatch, tmp_path):
+    bad_root = tmp_path / "local-file-send-root.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("LOCAL_FILE_SEND_QUEUE_ROOT", str(bad_root))
+
+    with pytest.raises(Exception) as excinfo:
+        load_bridge_module()
+
+    assert str(excinfo.value) == f"LOCAL_FILE_SEND_QUEUE_ROOT is not a directory: {bad_root.resolve()}"
+
+
+def test_bridge_module_rejects_file_local_send_message_queue_root(monkeypatch, tmp_path):
+    bad_root = tmp_path / "local-send-message-root.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("LOCAL_SEND_MESSAGE_QUEUE_ROOT", str(bad_root))
+
+    with pytest.raises(Exception) as excinfo:
+        load_bridge_module()
+
+    assert str(excinfo.value) == f"LOCAL_SEND_MESSAGE_QUEUE_ROOT is not a directory: {bad_root.resolve()}"
 
 
 def test_main_loads_bots_before_starting_local_file_send_loop(bridge_module, monkeypatch):
@@ -4808,6 +9068,26 @@ def test_local_file_send_loop_recovers_after_iteration_error(bridge_module, monk
     captured = capsys.readouterr()
     assert calls["count"] == 2
     assert "[LOOP] local_file_send_loop error: boom" in captured.out
+
+
+def test_local_send_message_loop_uses_dedicated_poll_interval(bridge_module, monkeypatch):
+    sleep_calls = []
+
+    async def fake_process_local_send_message_queue_once():
+        bridge_module.SHUTDOWN_EVENT.set()
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        return None
+
+    monkeypatch.setattr(bridge_module, "LOCAL_SEND_MESSAGE_POLL_MS", 5432)
+    monkeypatch.setattr(bridge_module, "LOCAL_FILE_SEND_POLL_MS", 1111)
+    monkeypatch.setattr(bridge_module, "process_local_send_message_queue_once", fake_process_local_send_message_queue_once)
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(bridge_module.local_send_message_loop())
+
+    assert sleep_calls == [5.432]
 
 
 def test_bot_config_reconciler_loop_recovers_after_iteration_error(bridge_module, monkeypatch, capsys):
@@ -5284,6 +9564,28 @@ def test_api_healthz_reports_unhealthy_bot_when_runner_task_done(bridge_module):
         loop.close()
 
 
+def test_api_livez_stays_ok_when_healthz_is_unhealthy(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.status = "running"
+    bot.ws = SimpleNamespace(closed=False)
+    loop = asyncio.new_event_loop()
+    try:
+        done_future = loop.create_future()
+        done_future.set_result(None)
+        bot.runner_task = done_future
+        bot.upload_worker_task = loop.create_future()
+
+        response = asyncio.run(bridge_module.api_livez(SimpleNamespace()))
+        body = json.loads(response.text)
+
+        assert response.status == 200
+        assert body["ok"] is True
+        assert body["shutdown"] is False
+        assert body["botCount"] == 1
+    finally:
+        loop.close()
+
+
 def test_api_healthz_reports_unhealthy_when_no_inbound_after_subscribe(bridge_module):
     bot = make_bot(bridge_module)
     bot.status = "running"
@@ -5460,6 +9762,135 @@ def test_submit_schedule_message_request_exposes_bot_config_id_alias(bridge_modu
     assert result["sessionId"] == sess.session_id
 
 
+def test_submit_schedule_message_request_accepts_zero_delay_seconds(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    current_now = 1_800_000_300_000
+    bridge_module.now_ms = lambda: current_now
+
+    result = bridge_module.submit_schedule_message_request(
+        {
+            "sessionId": sess.session_id,
+            "delaySeconds": 0,
+            "message": "run once",
+        }
+    )
+
+    assert result["scheduleId"]
+    assert result["requestedRunAt"] == current_now
+
+
+def test_submit_schedule_message_request_rejects_zero_run_at_as_not_in_future(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.submit_schedule_message_request(
+            {
+                "sessionId": sess.session_id,
+                "runAt": 0,
+                "message": "run once",
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "runAt must be in the future"
+
+
+def test_submit_schedule_message_request_treats_null_timezone_as_utc(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    result = bridge_module.submit_schedule_message_request(
+        {
+            "sessionId": sess.session_id,
+            "message": "run once",
+            "runAt": bridge_module.now_ms() + 60_000,
+            "timezone": "null",
+        }
+    )
+
+    stored = bridge_module.read_schedule_definition(result["scheduleId"])
+    assert stored is not None
+    assert stored["timezone"] == "UTC"
+
+
+def test_normalize_schedule_definition_coerces_string_false_enabled(bridge_module):
+    normalized = bridge_module.normalize_schedule_definition(
+        {
+            "scheduleId": "sched-1",
+            "botId": "bot-1",
+            "chatKey": "single:test-user",
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "timezone": "UTC",
+            "enabled": "false",
+            "createdAt": bridge_module.now_ms(),
+            "updatedAt": bridge_module.now_ms(),
+        }
+    )
+
+    assert normalized is not None
+    assert normalized["enabled"] is False
+
+
+def test_submit_schedule_message_request_treats_null_schedule_id_as_generated(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    result = bridge_module.submit_schedule_message_request(
+        {
+            "sessionId": sess.session_id,
+            "message": "run once",
+            "runAt": bridge_module.now_ms() + 60_000,
+            "scheduleId": "null",
+        }
+    )
+
+    assert result["scheduleId"] != "null"
+
+
+def test_submit_schedule_definition_request_treats_null_schedule_policies_as_defaults(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    result = bridge_module.submit_schedule_definition_request(
+        {
+            "sessionId": sess.session_id,
+            "message": "daily summary",
+            "mode": "cron",
+            "cron": "* * * * *",
+            "misfirePolicy": "null",
+            "concurrencyPolicy": "null",
+        }
+    )
+
+    stored = bridge_module.read_schedule_definition(result["scheduleId"])
+    assert stored is not None
+    assert stored["misfirePolicy"] == "fire_once_now"
+    assert stored["concurrencyPolicy"] == "skip_if_running"
+
+
+def test_submit_schedule_definition_request_rejects_zero_max_runs_from_maxRuns_field(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.submit_schedule_definition_request(
+            {
+                "sessionId": sess.session_id,
+                "message": "daily summary",
+                "mode": "cron",
+                "cron": "* * * * *",
+                "maxRuns": 0,
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "maxRuns must be > 0"
+
+
 @pytest.mark.asyncio
 async def test_api_get_schedule_and_list_expose_bot_config_id_alias(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
@@ -5559,6 +9990,42 @@ async def test_handle_wecom_message_updates_inbound_and_heartbeat_ack_times(brid
 
     assert bot.last_inbound_at_ms == second
     assert bot.last_heartbeat_ack_at_ms == first
+
+
+@pytest.mark.asyncio
+async def test_create_request_future_rejects_empty_req_id(bridge_module):
+    bot = make_bot(bridge_module)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.create_request_future(bot, "")
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "req_id required"
+
+
+@pytest.mark.asyncio
+async def test_create_request_future_rejects_duplicate_pending_req_id(bridge_module):
+    bot = make_bot(bridge_module)
+    first = bridge_module.create_request_future(bot, "req-1")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.create_request_future(bot, "req-1")
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.message == "duplicate pending request: req-1"
+    assert bot.pending_requests["req-1"] is first
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_future_strips_req_id_whitespace(bridge_module):
+    bot = make_bot(bridge_module)
+    future = bridge_module.create_request_future(bot, "req-1")
+
+    handled = bridge_module.resolve_request_future(bot, " req-1 ", {"headers": {"req_id": " req-1 "}})
+
+    assert handled is True
+    assert future.done() is True
+    assert "req-1" not in bot.pending_requests
 
 
 @pytest.mark.asyncio
@@ -5745,9 +10212,11 @@ async def test_handle_wecom_template_card_event_allows_repeatable_refresh_progre
         },
     )
 
-    assert len(sent) == 1
-    assert sent[0]["cmd"] == "aibot_respond_update_msg"
-    updated_card = sent[0]["body"]["template_card"]
+    assert len(sent) == 2
+    assert sent[0]["cmd"] == "aibot_respond_msg"
+    assert sent[0]["body"]["stream"]["finish"] is False
+    assert sent[1]["cmd"] == "aibot_respond_update_msg"
+    updated_card = sent[1]["body"]["template_card"]
     assert updated_card["main_title"]["desc"] == "当前进度: 30%"
     assert "30%" in updated_card["sub_title_text"]
     assert enqueued == []
@@ -6213,6 +10682,30 @@ def test_submit_send_message_request_sends_template_card(monkeypatch, bridge_mod
     assert "taskId" not in result
 
 
+def test_submit_send_message_request_accepts_string_zero_errcode(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    async def fake_send_ws_payload_with_ack(_bot, _payload, _timeout_sec):
+        return {"errcode": "0", "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    result = asyncio.run(
+        bridge_module.submit_send_message_request(
+            {
+                "chatKey": "single:test-user",
+                "msgtype": "markdown",
+                "content": "hello",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["msgtype"] == "markdown"
+
+
 def test_submit_send_message_request_returns_task_id_for_interaction_card(monkeypatch, bridge_module):
     bot = make_bot(bridge_module)
     bot.ws = SimpleNamespace(closed=False)
@@ -6350,6 +10843,36 @@ async def test_handle_wecom_message_saves_response_url_for_text_callback(bridge_
     assert bot.reply_urls["req-msg-1"]["responseUrl"].startswith("https://qyapi.weixin.qq.com/cgi-bin/aibot/response")
 
 
+@pytest.mark.asyncio
+async def test_handle_wecom_message_ignores_text_callback_without_sender_userid(bridge_module):
+    bot = make_bot(bridge_module)
+    called = False
+
+    async def fake_enqueue_message(_bot, _key, _text, _req_id, **_kwargs):
+        nonlocal called
+        called = True
+        return True
+
+    bridge_module.enqueue_message = fake_enqueue_message
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-msg-missing-user"},
+            "body": {
+                "msgtype": "text",
+                "chattype": "single",
+                "text": {"content": "hello"},
+                "from": {},
+                "response_url": "https://qyapi.weixin.qq.com/cgi-bin/aibot/response?response_code=abc",
+            },
+        },
+    )
+
+    assert called is False
+    assert "req-msg-missing-user" not in bot.reply_urls
+
+
 def test_resolve_message_send_request_supports_reply_req_id(bridge_module):
     bot = make_bot(bridge_module)
     bot.ws = SimpleNamespace(closed=False)
@@ -6367,6 +10890,72 @@ def test_resolve_message_send_request_supports_reply_req_id(bridge_module):
     assert resolved_chat_key == "single:test-user"
     assert payload_data["content"] == "follow up"
     assert reply_req_id == "req-1"
+
+
+def test_resolve_message_send_request_prefers_reply_req_id_over_unconnected_chat_key(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = None
+    bridge_module.save_reply_url(bot, "req-1", "single:test-user", "https://example.com/response")
+
+    resolved_bot, resolved_chat_key, payload_data, reply_req_id = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "replyReqId": "req-1",
+            "msgtype": "markdown",
+            "content": "follow up",
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert payload_data["content"] == "follow up"
+    assert reply_req_id == "req-1"
+
+
+def test_resolve_message_send_request_ignores_null_reply_req_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    resolved_bot, resolved_chat_key, payload_data, reply_req_id = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "replyReqId": "null",
+            "msgtype": "markdown",
+            "content": "follow up",
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert payload_data["content"] == "follow up"
+    assert reply_req_id is None
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_message_tolerates_non_dict_headers_and_body(bridge_module):
+    bot = make_bot(bridge_module)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_event_callback",
+            "headers": "bad",
+            "body": "bad",
+            "response_url": "https://example.com/response",
+        },
+    )
+
+    assert bot.reply_urls == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_message_ignores_non_dict_payload(bridge_module):
+    bot = make_bot(bridge_module)
+
+    await bridge_module.handle_wecom_message(bot, ["bad"])
+
+    assert bot.reply_urls == {}
 
 
 @pytest.mark.asyncio
@@ -6438,16 +11027,170 @@ async def test_send_reply_url_message_uses_response_url_body_without_chat_target
     assert stored["req-1"]["consumed"] is True
 
 
+@pytest.mark.asyncio
+async def test_send_reply_url_message_succeeds_when_state_disappears_after_send(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.save_reply_url(bot, "req-1", "single:test-user", "https://example.com/response")
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, content_type=None):
+            return {"errcode": 0, "errmsg": "ok"}
+
+    class FakePostContext:
+        async def __aenter__(self):
+            bot.reply_urls.pop("req-1", None)
+            return FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def post(self, url, json=None, timeout=None):
+            return FakePostContext()
+
+    bridge_module.HTTP_SESSION = FakeSession()
+
+    result = await bridge_module.send_reply_url_message(
+        bot,
+        "req-1",
+        {"msgtype": "markdown", "content": "follow up"},
+    )
+
+    assert result["ok"] is True
+    assert "req-1" not in bot.reply_urls
+
+
+@pytest.mark.asyncio
+async def test_send_reply_url_message_rejects_invalid_errcode_shape(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bridge_module.save_reply_url(bot, "req-1", "single:test-user", "https://example.com/response")
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self, content_type=None):
+            return {"errcode": "bad", "errmsg": "oops"}
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def post(self, url, json=None, timeout=None):
+            return FakePostContext()
+
+    bridge_module.HTTP_SESSION = FakeSession()
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        await bridge_module.send_reply_url_message(
+            bot,
+            "req-1",
+            {"msgtype": "markdown", "content": "follow up"},
+        )
+
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.message == "response_url send failed: invalid errcode"
+
+
+@pytest.mark.asyncio
+async def test_send_reply_url_message_rejects_missing_response_url(monkeypatch, bridge_module):
+    bot = make_bot(bridge_module)
+    bot.reply_urls["req-1"] = {
+        "chatKey": "single:test-user",
+        "capturedAtMs": bridge_module.now_ms(),
+        "consumed": False,
+    }
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        await bridge_module.send_reply_url_message(
+            bot,
+            "req-1",
+            {"msgtype": "markdown", "content": "follow up"},
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.message == "reply response_url not found or expired: req-1"
+
+
 def test_build_template_card_update_payload_uses_update_template_card_response_type(bridge_module):
     payload = bridge_module.build_template_card_update_payload(
         "req-update-1",
-        {"card_type": "button_interaction", "main_title": {"title": "updated"}},
+        {
+            "card_type": "button_interaction",
+            "main_title": {"title": "updated"},
+            "button_list": [{"text": "go", "key": "go"}],
+        },
     )
 
     assert payload["cmd"] == "aibot_respond_update_msg"
     assert payload["headers"]["req_id"] == "req-update-1"
     assert payload["body"]["response_type"] == "update_template_card"
     assert payload["body"]["template_card"]["card_type"] == "button_interaction"
+
+
+def test_build_template_card_update_payload_rejects_invalid_payload(bridge_module):
+    with pytest.raises(ValueError) as excinfo:
+        bridge_module.build_template_card_update_payload(
+            "req-update-1",
+            {"card_type": "button_interaction", "main_title": {"title": "updated"}},
+        )
+
+    assert str(excinfo.value) == "button_interaction.button_list required"
+
+
+def test_build_template_card_update_payload_rejects_empty_req_id(bridge_module):
+    with pytest.raises(ValueError) as excinfo:
+        bridge_module.build_template_card_update_payload(
+            "",
+            {
+                "card_type": "button_interaction",
+                "main_title": {"title": "updated"},
+                "button_list": [{"text": "go", "key": "go"}],
+            },
+        )
+
+    assert str(excinfo.value) == "reqId required"
+
+
+def test_normalize_bot_config_rejects_non_directory_agent_runtime_root(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
+    bad_root = bridge_module.BASE_DIR / "claude-runtime.txt"
+    bad_root.write_text("not a dir", encoding="utf-8")
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.normalize_bot_config(
+            {
+                "botId": "bot-id",
+                "secretFile": str(secret_file),
+                "workDir": str(bridge_module.BASE_DIR),
+                "groupSessionMode": "per-user",
+                "agentRuntimeRoot": str(bad_root),
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == f"agentRuntimeRoot is not a directory: {bad_root.resolve()}"
+
+
+def test_normalize_bot_config_treats_null_agent_runtime_root_as_unset(bridge_module):
+    secret_file = write_secret_file(bridge_module.BASE_DIR / "bot-null.secret", "secret\n")
+
+    config = bridge_module.normalize_bot_config(
+        {
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentRuntimeRoot": "null",
+        }
+    )
+
+    assert config["agentRuntimeRoot"] is None
 
 
 def test_build_proactive_template_card_payload_marks_group_owner(bridge_module):
@@ -6503,6 +11246,81 @@ def test_resolve_message_send_request_allows_missing_task_id_for_interaction_car
     assert reply_req_id is None
 
 
+def test_resolve_message_send_request_ignores_null_bot_name(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    resolved_bot, resolved_chat_key, payload_data, reply_req_id = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "botName": "null",
+            "msgtype": "markdown",
+            "content": "hello",
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert payload_data["content"] == "hello"
+    assert reply_req_id is None
+
+
+def test_resolve_message_send_request_ignores_null_session_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.resolve_message_send_request(
+            {
+                "chatKey": "group-user:room-only",
+                "sessionId": "null",
+                "msgtype": "markdown",
+                "content": "hello",
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "invalid chatKey: group-user:room-only"
+
+
+def test_resolve_message_send_request_ignores_null_target_config_id(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    resolved_bot, resolved_chat_key, payload_data, reply_req_id = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "targetConfigId": "null",
+            "msgtype": "markdown",
+            "content": "hello",
+        }
+    )
+
+    assert resolved_bot is bot
+    assert resolved_chat_key == "single:test-user"
+    assert payload_data["content"] == "hello"
+    assert reply_req_id is None
+
+
+def test_resolve_message_send_request_treats_null_feedback_id_as_missing(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    _resolved_bot, _resolved_chat_key, payload_data, _reply_req_id = bridge_module.resolve_message_send_request(
+        {
+            "chatKey": "single:test-user",
+            "msgtype": "markdown",
+            "content": "hello",
+            "feedbackId": "null",
+        }
+    )
+
+    assert payload_data["feedbackId"] is None
+
+
 def test_extract_template_card_owner_user_id_supports_new_and_legacy_formats(bridge_module):
     assert bridge_module.extract_template_card_owner_user_id("task-1--owner--user-a--uniq--abcdef") == "user-a"
     assert bridge_module.extract_template_card_owner_user_id("task-1__owner__user-a__uniq__abcdef") == "user-a"
@@ -6546,6 +11364,119 @@ async def test_process_local_send_message_queue_writes_success_result(bridge_mod
 
 
 @pytest.mark.asyncio
+async def test_process_local_send_message_queue_treats_zero_expires_at_as_expired(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    request_id = "local-msg-zero-expiry"
+    queue_paths = bridge_module.get_local_send_message_queue_paths(bot.config["id"])
+    for root in ("pending", "processing", "results", "done", "failed"):
+        with contextlib.suppress(FileNotFoundError):
+            (queue_paths[root] / f"{request_id}.json").unlink()
+    bridge_module.write_json_atomic(
+        queue_paths["pending"] / f"{request_id}.json",
+        {
+            "requestId": request_id,
+            "chatKey": "single:test-user",
+            "msgtype": "markdown",
+            "content": "hello",
+            "requestedAt": bridge_module.now_ms(),
+            "timeoutMs": 120000,
+            "expiresAt": 0,
+        },
+    )
+    called = False
+
+    async def fake_submit_send_message_request(_data, source="api"):
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+
+    await bridge_module.process_local_send_message_queue_once()
+
+    assert called is False
+    result = bridge_module.read_json_file(queue_paths["results"] / f"{request_id}.json", None)
+    assert result["ok"] is False
+    assert result["statusCode"] == 408
+    assert (queue_paths["failed"] / f"{request_id}.json").exists()
+
+
+def test_submit_local_send_message_request_preserves_zero_timeout_ms(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+
+    result = bridge_module.submit_local_send_message_request(
+        {
+            "chatKey": "single:test-user",
+            "msgtype": "markdown",
+            "content": "hello",
+            "timeoutMs": 0,
+        }
+    )
+
+    queue_paths = bridge_module.get_local_send_message_queue_paths(bot.config["id"])
+    stored = bridge_module.read_json_file(queue_paths["pending"] / f"{result['requestId']}.json", None)
+    assert stored["timeoutMs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_process_local_send_message_queue_sanitizes_slashed_request_id(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.create_session_record(bot, "single:test-user")
+    request_id = "folder-sanitize/local-msg"
+    queue_paths = bridge_module.get_local_send_message_queue_paths(bot.config["id"])
+    default_paths = bridge_module.get_local_send_message_queue_paths()
+    safe_name = bridge_module.local_queue_request_file_name(request_id)
+    pending_file = queue_paths["pending"] / safe_name
+    result_file = queue_paths["results"] / safe_name
+    done_file = queue_paths["done"] / safe_name
+    nested_dir = queue_paths["pending"] / "folder-sanitize"
+    with contextlib.suppress(FileNotFoundError):
+        pending_file.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        result_file.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        done_file.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        (default_paths["pending"] / safe_name).unlink()
+    if nested_dir.exists():
+        shutil.rmtree(nested_dir, ignore_errors=True)
+
+    result = bridge_module.submit_local_send_message_request(
+        {
+            "requestId": request_id,
+            "chatKey": "single:test-user",
+            "targetConfigId": bot.config["id"],
+            "msgtype": "markdown",
+            "content": "hello",
+        }
+    )
+
+    async def fake_submit_send_message_request(data, source="api"):
+        assert data["requestId"] == request_id
+        assert source == "local-command"
+        return {"ok": True, "chatKey": "single:test-user", "msgtype": "markdown"}
+
+    monkeypatch.setattr(bridge_module, "submit_send_message_request", fake_submit_send_message_request)
+
+    await bridge_module.process_local_send_message_queue_once()
+
+    assert result["ok"] is True
+    assert result["requestId"] == request_id
+    assert pending_file.exists() is False
+    assert (default_paths["pending"] / safe_name).exists() is False
+    assert result_file.exists() is True
+    assert done_file.exists() is True
+    assert nested_dir.exists() is False
+    stored = bridge_module.read_json_file(result_file, None)
+    assert stored["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_process_local_send_message_queue_requeues_transient_503(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     bot.ws = SimpleNamespace(closed=False)
@@ -6577,6 +11508,47 @@ async def test_process_local_send_message_queue_requeues_transient_503(bridge_mo
 
     assert (queue_paths["pending"] / f"{request_id}.json").exists()
     assert not (queue_paths["results"] / f"{request_id}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_local_send_message_queue_cleans_up_stale_result_files(bridge_module):
+    bridge_module.ensure_local_send_message_dirs()
+    old_result = bridge_module.LOCAL_SEND_MESSAGE_RESULT_ROOT / "old.json"
+    fresh_result = bridge_module.LOCAL_SEND_MESSAGE_RESULT_ROOT / "fresh.json"
+    retained_result = bridge_module.LOCAL_SEND_MESSAGE_RESULT_ROOT / "retained.json"
+    bridge_module.write_json_atomic(
+        old_result,
+        {
+            "ok": False,
+            "statusCode": 504,
+            "error": "expired",
+            "processedAt": bridge_module.now_ms() - bridge_module.LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS - 1000,
+        },
+    )
+    bridge_module.write_json_atomic(
+        fresh_result,
+        {
+            "ok": True,
+            "message": "sent",
+            "processedAt": bridge_module.now_ms(),
+        },
+    )
+    bridge_module.write_json_atomic(
+        retained_result,
+        {
+            "ok": False,
+            "statusCode": 409,
+            "error": "keep",
+            "processedAt": bridge_module.now_ms() - bridge_module.LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS - 1000,
+            "retainUntil": bridge_module.now_ms() + 60_000,
+        },
+    )
+
+    await bridge_module.process_local_send_message_queue_once()
+
+    assert not old_result.exists()
+    assert fresh_result.exists()
+    assert retained_result.exists()
 
 
 @pytest.mark.asyncio
@@ -6660,6 +11632,33 @@ async def test_upload_and_send_file_routes_group_user_key_to_group_chat(bridge_m
 
 
 @pytest.mark.asyncio
+async def test_upload_and_send_file_accepts_string_zero_errcode(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    bot.ws = SimpleNamespace(closed=False)
+    file_path = bridge_module.BASE_DIR / "reply.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
+        if payload["cmd"] == "aibot_upload_media_init":
+            return {"errcode": "0", "body": {"upload_id": "upload-1"}}
+        if payload["cmd"] == "aibot_upload_media_finish":
+            return {"errcode": "0", "body": {"media_id": "media-1"}}
+        if payload["cmd"] == "aibot_send_msg":
+            return {"errcode": "0", "body": {}}
+        raise AssertionError(payload["cmd"])
+
+    async def fake_send_ws_payload(_bot, payload):
+        future = _bot.pending_requests.pop(payload["headers"]["req_id"], None)
+        if future and not future.done():
+            future.set_result({"errcode": "0"})
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    monkeypatch.setattr(bridge_module, "send_ws_payload", fake_send_ws_payload)
+
+    await bridge_module.upload_and_send_file(bot, "single:test-user", str(file_path))
+
+
+@pytest.mark.asyncio
 async def test_download_incoming_media_keeps_same_named_files(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -6688,6 +11687,43 @@ async def test_download_incoming_media_keeps_same_named_files(bridge_module, mon
     assert first["path"] != second["path"]
     assert Path(first["path"]).read_bytes() == b"first"
     assert Path(second["path"]).read_bytes() == b"second"
+
+
+def test_decrypt_media_buffer_rejects_invalid_aes_key_in_classic_bridge(bridge_module):
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        bridge_module.decrypt_media_buffer(b"abc", "abcd")
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.message == "invalid aes key"
+
+
+@pytest.mark.asyncio
+async def test_download_incoming_media_skips_broken_symlink_name(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    chatfile_dir = bridge_module.ensure_session_workspace_dirs(bot, "single:test-user")["chatfile"]
+    assert chatfile_dir is not None
+    external_dir = bridge_module.BASE_DIR / "external-media-target"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    broken_target = external_dir / "report.txt"
+    (chatfile_dir / "report.txt").symlink_to(broken_target)
+
+    async def fake_download_buffer(_url: str):
+        return {"data": b"payload", "contentType": "text/plain", "contentDisposition": ""}
+
+    monkeypatch.setattr(bridge_module, "download_buffer", fake_download_buffer)
+
+    result = await bridge_module.download_incoming_media(
+        bot,
+        sess,
+        "single:test-user",
+        "file",
+        {"url": "https://example.test/file/1", "filename": "report.txt"},
+    )
+
+    assert Path(result["path"]).name == "report-1.txt"
+    assert not broken_target.exists()
+    assert Path(result["path"]).read_bytes() == b"payload"
 
 
 @pytest.mark.asyncio
@@ -7093,6 +12129,49 @@ async def test_process_local_file_send_queue_fails_expired_request_before_retry(
 
 
 @pytest.mark.asyncio
+async def test_process_local_file_send_queue_treats_zero_expires_at_as_expired(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module, config_id="bot-2", remote_bot_id="remote-bot-2")
+    bot.ws = SimpleNamespace(closed=True)
+    make_session(bridge_module, bot)
+    queue_paths = bridge_module.get_local_file_send_queue_paths(bot.config["id"])
+    bridge_module.ensure_local_file_send_dirs([bot.config["id"]])
+    chatfile_dir = bridge_module.get_chatfile_dir(bot.config["id"], "single:test-user")
+    bridge_module.ensure_dir(chatfile_dir)
+    file_path = chatfile_dir / "reply.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    request_file = queue_paths["pending"] / "zero-expired-bot.json"
+    bridge_module.write_json_atomic(
+        request_file,
+        {
+            "requestId": "zero-expired-bot",
+            "chatKey": "single:test-user",
+            "targetConfigId": bot.config["id"],
+            "filePath": str(file_path.resolve()),
+            "requestedAt": bridge_module.now_ms(),
+            "timeoutMs": 120000,
+            "expiresAt": 0,
+        },
+    )
+    called = False
+
+    async def fake_upload_and_send_file(_bot, _chat_key, _file_path, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(bridge_module, "upload_and_send_file", fake_upload_and_send_file)
+
+    await bridge_module.process_local_file_send_queue_once()
+
+    assert called is False
+    result = json.loads((queue_paths["results"] / "zero-expired-bot.json").read_text("utf-8"))
+    assert result["ok"] is False
+    assert result["statusCode"] == 504
+    assert "expired before delivery" in result["error"]
+    assert (queue_paths["failed"] / "zero-expired-bot.json").exists()
+    assert not (queue_paths["processing"] / "zero-expired-bot.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_process_local_file_send_queue_backfills_deadline_for_legacy_request(bridge_module, monkeypatch):
     bot = make_bot(bridge_module, config_id="bot-2", remote_bot_id="remote-bot-2")
     bot.ws = SimpleNamespace(closed=True)
@@ -7397,6 +12476,27 @@ async def test_process_local_file_send_queue_finalizes_existing_success_result_b
     result = json.loads((queue_paths["results"] / "completed-bot.json").read_text("utf-8"))
     assert result["ok"] is True
     assert result["message"] == "sent reply.txt"
+
+
+def test_write_local_file_send_result_sanitizes_slashed_request_id(bridge_module):
+    queue_paths = bridge_module.get_local_file_send_queue_paths("bot-1")
+    bridge_module.ensure_local_file_send_dirs(["bot-1"])
+    request_id = "folder-sanitize/file-send"
+    safe_name = bridge_module.local_queue_request_file_name(request_id)
+    result_file = queue_paths["results"] / safe_name
+    nested_dir = queue_paths["results"] / "folder-sanitize"
+    with contextlib.suppress(FileNotFoundError):
+        result_file.unlink()
+    if nested_dir.exists():
+        shutil.rmtree(nested_dir, ignore_errors=True)
+
+    bridge_module.write_local_file_send_result(request_id, {"ok": True, "message": "sent"}, queue_paths)
+
+    assert result_file.exists() is True
+    assert nested_dir.exists() is False
+    loaded = bridge_module.read_local_file_send_result(request_id, queue_paths)
+    assert loaded["ok"] is True
+    assert loaded["message"] == "sent"
 
 
 @pytest.mark.asyncio
@@ -7971,14 +13071,7 @@ async def test_enqueue_message_sends_queue_status_when_session_busy(bridge_modul
     sess = make_session(bridge_module, bot)
     sess.running = True
     payloads = []
-
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            payloads.append(payload)
-
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, payloads.append)
 
     result = await bridge_module.enqueue_message(bot, "single:test-user", "queued", "req-1")
 
@@ -8038,14 +13131,7 @@ async def test_enqueue_message_reports_lease_conflict_instead_of_silent_drop(bri
     bot = make_bot(bridge_module)
     make_session(bridge_module, bot)
     responses = []
-
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            responses.append(payload)
-
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, responses.append)
     monkeypatch.setattr(bridge_module, "acquire_session_lease", lambda *_args, **_kwargs: False)
 
     accepted = await bridge_module.enqueue_message(bot, "single:test-user", "hello", "req-1")
@@ -8065,17 +13151,14 @@ async def test_enqueue_message_uses_proactive_for_attachment_notice_after_queue_
     stream_payloads = []
     proactive_payloads = []
 
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            stream_payloads.append(payload)
-
     async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec, **kwargs):
-        proactive_payloads.append(payload)
+        if payload["cmd"] == "aibot_respond_msg":
+            stream_payloads.append(payload)
+        else:
+            proactive_payloads.append(payload)
         return {"errcode": 0, "body": {}}
 
-    bot.ws = FakeWS()
+    bot.ws = SimpleNamespace(closed=False)
     monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
 
     result = await bridge_module.enqueue_message(bot, "single:test-user", "queued", "req-1")
@@ -8085,6 +13168,27 @@ async def test_enqueue_message_uses_proactive_for_attachment_notice_after_queue_
     assert len(proactive_payloads) == 1
     assert proactive_payloads[0]["cmd"] == "aibot_send_msg"
     assert "Attachments are still downloading" in proactive_payloads[0]["body"]["markdown"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_message_does_not_cache_queue_notice_when_ack_times_out(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    bot.ws = SimpleNamespace(closed=False)
+
+    async def fake_send_ws_payload_with_ack(_bot, _payload, _timeout_sec, **_kwargs):
+        raise bridge_module.BridgeError(504, "websocket ack timeout")
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    accepted = await bridge_module.enqueue_message(bot, "single:test-user", "queued", "req-1")
+
+    assert accepted is True
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+    assert "req-1" in sess.reply_proactive_req_ids
+    assert sess.queue == [{"text": "queued", "reqId": "req-1", "scheduledJobFile": None, "scheduleId": None, "scheduleRequestId": None}]
 
 
 @pytest.mark.asyncio
@@ -8146,14 +13250,7 @@ async def test_respond_info_keeps_intermediate_reply_open(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     payloads = []
-
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            payloads.append(payload)
-
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, payloads.append)
     bridge_module.register_reply_session(bot, "req-1", sess)
 
     await bridge_module.respond_info(bot, "req-1", "processing", final=False)
@@ -8162,6 +13259,25 @@ async def test_respond_info_keeps_intermediate_reply_open(bridge_module):
     assert payloads[0]["body"]["stream"]["finish"] is False
     assert payloads[1]["body"]["stream"]["finish"] is True
     assert "req-1" not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_respond_info_caches_final_reply_when_ack_times_out(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.register_reply_session(bot, "req-1", sess)
+
+    async def fake_send_ws_payload_with_ack(_bot, _payload, _timeout_sec, **_kwargs):
+        raise bridge_module.BridgeError(504, "websocket ack timeout")
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+
+    await bridge_module.respond_info(bot, "req-1", "done")
+
+    assert sess.pending_final_payload is not None
+    assert sess.pending_final_payload["body"]["stream"]["content"] == "done"
+    assert "req-1" in bot.reply_sessions
 
 
 @pytest.mark.asyncio
@@ -8215,14 +13331,7 @@ async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     sent_payloads = []
-
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            sent_payloads.append(payload)
-
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, sent_payloads.append)
 
     delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "x" * 8000)
 
@@ -8232,6 +13341,22 @@ async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
     assert sent_payloads[1]["body"]["stream"]["finish"] is False
     assert sent_payloads[2]["body"]["stream"]["finish"] is False
     assert "".join(item["body"]["stream"]["content"] for item in sent_payloads) == "x" * 8000
+
+
+@pytest.mark.asyncio
+async def test_send_session_status_preserves_only_unsent_tail_after_partial_failure(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sent_payloads = []
+    expected = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, False)
+    bot.ws = make_flaky_acking_ws(bot, fail_on_send_number=2, on_send=sent_payloads.append)
+
+    delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "x" * 8000)
+
+    assert delivered is False
+    assert sent_payloads == [expected[0]]
+    assert sess.pending_stream_payloads == expected[1:]
+    assert sess.pending_stream_payload == expected[-1]
 
 
 @pytest.mark.asyncio
@@ -8247,6 +13372,22 @@ async def test_send_or_store_session_payloads_cache_multi_chunk_final_reply(brid
     assert sess.pending_final_payloads is not None
     assert len(sess.pending_final_payloads) == 3
     assert sess.pending_final_payloads[-1]["body"]["stream"]["finish"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_or_store_session_payloads_preserves_only_unsent_tail_after_partial_failure(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+    sent = []
+    bot.ws = make_flaky_acking_ws(bot, fail_on_send_number=2, on_send=sent.append)
+
+    delivered = await bridge_module.send_or_store_session_payloads(bot, "single:test-user", sess, payloads, True)
+
+    assert delivered is False
+    assert sent == [payloads[0]]
+    assert sess.pending_final_payloads == payloads[1:]
+    assert sess.pending_final_payload == payloads[-1]
 
 
 @pytest.mark.asyncio
@@ -8316,19 +13457,13 @@ async def test_flush_cached_final_reply_resumes_queue(bridge_module, monkeypatch
     sess.queue.append({"text": "next", "reqId": "req-2"})
     started = []
 
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            started.append(("sent", payload["body"]["stream"]["content"]))
-
     def fake_process_queue(_bot, _sess, key):
         started.append(("queue", key))
 
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, lambda payload: started.append(("sent", payload["body"]["stream"]["content"])))
     monkeypatch.setattr(bridge_module, "process_queue", fake_process_queue)
 
-    await bridge_module.flush_session_pending_payloads(bot, "single:test-user", sess)
+    await bridge_module.flush_all_pending_session_payloads(bot)
 
     assert started == [("sent", "final"), ("queue", "single:test-user")]
     assert sess.pending_final_payload is None
@@ -8343,22 +13478,134 @@ async def test_flush_cached_multi_chunk_final_reply_resumes_queue(bridge_module,
     sess.queue.append({"text": "next", "reqId": "req-2"})
     started = []
 
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            started.append(("sent", payload["body"]["stream"]["finish"], payload["body"]["stream"]["content"]))
-
     def fake_process_queue(_bot, _sess, key):
         started.append(("queue", key))
 
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(
+        bot,
+        lambda payload: started.append(("sent", payload["body"]["stream"]["finish"], payload["body"]["stream"]["content"])),
+    )
     monkeypatch.setattr(bridge_module, "process_queue", fake_process_queue)
 
-    await bridge_module.flush_session_pending_payloads(bot, "single:test-user", sess)
+    await bridge_module.flush_all_pending_session_payloads(bot)
 
     assert len([item for item in started if item[0] == "sent"]) == 3
     assert started[-1] == ("queue", "single:test-user")
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_ack_only_message_flushes_cached_final_reply(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+    sess.pending_final_payloads = payloads[1:]
+    sess.pending_final_payload = dict(payloads[-1])
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "headers": {"req_id": "ack-1"},
+            "errcode": 0,
+            "errmsg": "ok",
+        },
+    )
+
+    assert sent == payloads[1:]
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_ack_only_message_flushes_cached_final_reply_for_string_zero_errcode(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+    sess.pending_final_payloads = payloads[1:]
+    sess.pending_final_payload = dict(payloads[-1])
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "headers": {"req_id": "ack-1"},
+            "errcode": "0",
+            "errmsg": "ok",
+        },
+    )
+
+    assert sent == payloads[1:]
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_ack_only_message_accepts_late_single_cached_final_reply_and_resumes_queue(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    req_id = "req-1"
+    payload = bridge_module.build_session_text_payload("single:test-user", sess, req_id, "Received image. You can continue asking.", True)
+    assert payload is not None
+    bridge_module.register_reply_session(bot, req_id, sess)
+    sess.pending_final_payload = dict(payload)
+    sess.pending_final_payloads = [dict(payload)]
+    sess.queue.append({"text": "next", "reqId": "req-2"})
+    started = []
+
+    def fake_process_queue(_bot, _sess, key):
+        started.append(key)
+
+    monkeypatch.setattr(bridge_module, "process_queue", fake_process_queue)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "headers": {"req_id": req_id},
+            "errcode": 0,
+            "errmsg": "ok",
+        },
+    )
+
+    assert started == ["single:test-user"]
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+    assert req_id not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_flush_cached_final_reply_does_not_reenter_on_chunk_ack(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
+    sess.pending_final_payloads = payloads
+    sess.pending_final_payload = dict(payloads[-1])
+    sent = []
+
+    class ReentrantAckWS:
+        closed = False
+
+        async def send_json(self, payload):
+            sent.append(payload)
+            await bridge_module.handle_wecom_message(
+                bot,
+                {
+                    "headers": {"req_id": payload["headers"]["req_id"]},
+                    "errcode": 0,
+                    "errmsg": "ok",
+                },
+            )
+
+    bot.ws = ReentrantAckWS()
+
+    await bridge_module.flush_all_pending_session_payloads(bot)
+
+    assert sent == payloads
     assert sess.pending_final_payload is None
     assert sess.pending_final_payloads is None
 
@@ -8391,14 +13638,7 @@ async def test_stream_status_closes_reply_when_max_age_reached(bridge_module, mo
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     payloads = []
-
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            payloads.append(payload)
-
-    bot.ws = FakeWS()
+    bot.ws = make_acking_ws(bot, payloads.append)
     bridge_module.register_reply_session(bot, "req-1", sess)
     sess.reply_started_at["req-1"] = time.time() - bridge_module.REPLY_MAX_AGE_FALLBACK_SEC - 1
 
@@ -8467,17 +13707,14 @@ async def test_send_session_status_closes_stream_before_proactive_after_max_age(
     stream_payloads = []
     proactive_payloads = []
 
-    class FakeWS:
-        closed = False
-
-        async def send_json(self, payload):
-            stream_payloads.append(payload)
-
     async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec, **kwargs):
-        proactive_payloads.append(payload)
+        if payload["cmd"] == "aibot_respond_msg":
+            stream_payloads.append(payload)
+        else:
+            proactive_payloads.append(payload)
         return {"errcode": 0, "body": {}}
 
-    bot.ws = FakeWS()
+    bot.ws = SimpleNamespace(closed=False)
     monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
     bridge_module.register_reply_session(bot, "req-1", sess)
     sess.reply_started_at["req-1"] = time.time() - bridge_module.REPLY_MAX_AGE_FALLBACK_SEC - 1
@@ -8917,6 +14154,60 @@ def test_build_codex_home_for_subprocess_skips_same_file_copy_when_base_home_is_
     assert (session_home / "config.toml").read_text(encoding="utf-8") == "model = 'x'\n"
 
 
+def test_build_codex_home_for_subprocess_replaces_broken_symlinked_root_state_file(bridge_module):
+    (bridge_module.DEFAULT_CODEX_HOME / "installation_id").write_text("install-1", encoding="utf-8")
+    session_home = bridge_module.get_session_codex_home_root("sess-broken-root-file")
+    bridge_module.ensure_dir(session_home)
+    stale = session_home / "installation_id"
+    stale.symlink_to(bridge_module.BASE_DIR / "missing-installation-id")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-broken-root-file")
+
+    restored = codex_home / "installation_id"
+    assert restored.exists()
+    assert not restored.is_symlink()
+    assert restored.read_text(encoding="utf-8") == "install-1"
+
+
+def test_build_codex_home_for_subprocess_replaces_directory_blocking_root_state_file(bridge_module):
+    (bridge_module.DEFAULT_CODEX_HOME / "installation_id").write_text("install-1", encoding="utf-8")
+    session_home = bridge_module.get_session_codex_home_root("sess-root-dir-block")
+    bridge_module.ensure_dir(session_home / "installation_id")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-root-dir-block")
+
+    restored = codex_home / "installation_id"
+    assert restored.exists()
+    assert not restored.is_dir()
+    assert restored.read_text(encoding="utf-8") == "install-1"
+
+
+def test_build_codex_home_for_subprocess_tolerates_file_default_codex_home(bridge_module):
+    file_home = bridge_module.BASE_DIR / "codex-home.txt"
+    file_home.write_text("not a dir", encoding="utf-8")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = file_home
+    try:
+        codex_home = bridge_module.build_codex_home_for_subprocess("sess-file-home")
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+    assert codex_home.exists()
+    assert (codex_home / "skills").is_dir()
+    assert not (codex_home / "installation_id").exists()
+
+
+def test_build_codex_home_for_subprocess_tolerates_file_skills_root(bridge_module):
+    bridge_module.ensure_dir(bridge_module.DEFAULT_CODEX_HOME)
+    skills_file = bridge_module.DEFAULT_CODEX_HOME / "skills"
+    skills_file.write_text("not a dir", encoding="utf-8")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-file-skills")
+
+    assert (codex_home / "skills").is_dir()
+    assert not (codex_home / "skills").is_symlink()
+
+
 def test_build_codex_base_args_uses_resolved_codex_command(monkeypatch, bridge_module):
     monkeypatch.setattr(bridge_module.shutil, "which", lambda name: "/usr/local/bin/codex" if name == "codex" else None)
 
@@ -9183,8 +14474,10 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
     sess = make_session(bridge_module, bot)
     sess.running = True
     sess.thread_id = "019e6e10-fa64-73c2-9be5-4fdf694161ea"
+    sess.chat = [{"role": "user", "text": "older user turn"}, {"role": "bot", "text": "older bot turn"}]
     payloads = []
     invocations = []
+    processes = []
 
     class FakeProcess:
         def __init__(self, *, returncode: int, stdout_events: list[dict[str, object]], stderr_lines: list[str]):
@@ -9210,21 +14503,24 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
     async def fake_create_subprocess_exec(*args, **kwargs):
         invocations.append(list(args))
         if len(invocations) == 1:
-            return FakeProcess(
+            process = FakeProcess(
                 returncode=1,
                 stdout_events=[],
                 stderr_lines=[
                     "2026-05-28T10:15:41.542083Z ERROR codex_core::session: failed to record rollout items: thread 019e6e10-fa64-73c2-9be5-4fdf694161ea not found"
                 ],
             )
-        return FakeProcess(
-            returncode=0,
-            stdout_events=[
-                {"type": "thread.started", "thread_id": "thread-from-second-exec"},
-                {"type": "item.completed", "item": {"type": "agent_message", "text": "final answer"}},
-            ],
-            stderr_lines=[],
-        )
+        else:
+            process = FakeProcess(
+                returncode=0,
+                stdout_events=[
+                    {"type": "thread.started", "thread_id": "thread-from-second-exec"},
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "final answer"}},
+                ],
+                stderr_lines=[],
+            )
+        processes.append(process)
+        return process
 
     async def fake_send_session_status(_bot, _key, _sess, _req_id, content):
         payloads.append((False, content))
@@ -9244,6 +14540,10 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
     assert invocations[0][1:3] == ["exec", "resume"]
     assert invocations[1][1:2] == ["exec"]
     assert "resume" not in invocations[1]
+    second_prompt = bytes(processes[1].stdin.buffer).decode("utf-8")
+    assert "[RecentConversation]" in second_prompt
+    assert "older user turn" in second_prompt
+    assert "older bot turn" in second_prompt
     assert sess.thread_id == "thread-from-second-exec"
     assert payloads[-1] == (True, "final answer")
 

@@ -163,5 +163,5 @@ async def test_multi_user_runtime_recycles_chat_without_losing_stable_session_id
     assert reply == "ok"
     assert stored is not None
     assert stored.session_id == stable_session_id
-    assert stored.thread_id is None
+    assert stored.thread_id == "thread-after-idle"
     assert runtime.session_threads["single:alice"] == "thread-after-idle"

@@ -64,6 +64,7 @@ class WeComBotRuntime:
     wecom_status: str | None = None
     last_error: str | None = None
     last_status: str | None = None
+    pending_payload_flush_in_progress: bool = False
     resume_candidates: dict[str, list[dict[str, str | int]]] = field(default_factory=dict)
     resume_selection_expires_at: dict[str, int] = field(default_factory=dict)
     template_card_payloads: dict[str, dict] = field(default_factory=dict)
@@ -127,6 +128,7 @@ class ResolvedSkillSpace:
 @dataclass(frozen=True)
 class WorkspaceRuntimeContext:
     workspace: WorkspaceRef
+    workspace_mode: WorkspaceMode
     cwd_dir: Path
     chatfile_dir: Path
     export_dir: Path
@@ -147,7 +149,9 @@ class SessionRecord:
     chat_key: str
     workspace_id: str
     workspace_scope: WorkspaceScope
+    workspace_mode: WorkspaceMode
     cwd_dir: Path
+    skill_dir: Path
     chatfile_dir: Path
     workfile_dir: Path | None
     roomfile_dir: Path | None
@@ -155,6 +159,7 @@ class SessionRecord:
     updated_at: int
     thread_id: str | None = None
     last_run_at: int | None = None
+    recent_chat: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -254,6 +259,7 @@ class ScheduleDefinition:
     misfire_policy: str
     concurrency_policy: str
     run_at_ms: int | None = None
+    bot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -264,3 +270,4 @@ class ScheduledJob:
     message: str
     run_at: int
     created_at: int
+    bot_id: str | None = None

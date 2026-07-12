@@ -13,7 +13,12 @@ from .models import (
     WeComTemplateCardSelection,
     WeComTextMessage,
 )
-from .template_card_validation import enrich_template_card_for_delivery
+from .template_card_validation import (
+    enrich_template_card_for_delivery,
+    require_non_empty_string,
+    validate_feedback_id,
+    validate_template_card_update_payload,
+)
 
 _UID_COUNTER = itertools.count()
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
@@ -23,15 +28,32 @@ PROACTIVE_TEXT_MAX_CHARS = max(256, int(os.environ.get("PROACTIVE_TEXT_MAX_CHARS
 STREAM_TEXT_MAX_CHARS = max(256, int(os.environ.get("STREAM_TEXT_MAX_CHARS", "3500")))
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
 def uid() -> str:
     return f"{int(time.time() * 1000):x}-{next(_UID_COUNTER):x}"
 
 
+def _as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def chat_key_from_message(payload: dict) -> str:
-    body = payload.get("body") or {}
-    if body.get("chattype") == "group" and body.get("chatid"):
-        return f"group-user:{body['chatid']}:{((body.get('from') or {}).get('userid') or 'unknown')}"
-    return f"single:{((body.get('from') or {}).get('userid') or 'unknown')}"
+    body = _as_dict(payload.get("body"))
+    user_id = str(_as_dict(body.get("from")).get("userid") or "").strip()
+    if not user_id:
+        raise ValueError("message sender userid required")
+    if body.get("chattype") == "group":
+        chat_id = str(body.get("chatid") or "").strip()
+        if not chat_id:
+            raise ValueError("group message chatid required")
+        return f"group-user:{chat_id}:{user_id}"
+    return f"single:{user_id}"
 
 
 def chat_key_to_user_id(chat_key: str) -> str | None:
@@ -45,11 +67,23 @@ def chat_key_to_user_id(chat_key: str) -> str | None:
 
 
 def chat_key_to_send_target(chat_key: str) -> tuple[int, str]:
-    if chat_key.startswith("group-user:"):
-        parts = chat_key.split(":", 2)
-        return 2, parts[1]
-    chat_type_name, chat_id = chat_key.split(":", 1)
-    return (2 if chat_type_name == "group" else 1), chat_id
+    text = str(chat_key or "").strip()
+    if text.startswith("group-user:"):
+        parts = text.split(":", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            return 2, parts[1]
+        raise ValueError(f"invalid chat key: {chat_key}")
+    if text.startswith("group:"):
+        room_id = text.split(":", 1)[1]
+        if room_id:
+            return 2, room_id
+        raise ValueError(f"invalid chat key: {chat_key}")
+    if text.startswith("single:"):
+        user_id = text.split(":", 1)[1]
+        if user_id:
+            return 1, user_id
+        raise ValueError(f"invalid chat key: {chat_key}")
+    raise ValueError(f"invalid chat key: {chat_key}")
 
 
 def format_group_user_mention(user_id: str | None) -> str:
@@ -120,8 +154,9 @@ def _resolve_message_body(message: OutboundMessage) -> dict:
 
 def _resolve_message_body_with_options(message: OutboundMessage, *, truncate_markdown: bool) -> dict:
     msgtype = str(message.msgtype or "").strip()
+    feedback_id = validate_feedback_id(message.feedback_id) if message.feedback_id else None
     if msgtype == "markdown":
-        resolved_mention_user_id = str(message.mention_user_id or "").strip()
+        resolved_mention_user_id = _normalize_optional_text(message.mention_user_id) or ""
         if not resolved_mention_user_id and message.chat_key.startswith("group-user:"):
             resolved_mention_user_id = str(chat_key_to_user_id(message.chat_key) or "").strip()
         markdown_content = prepend_group_user_mention(str(message.content or ""), resolved_mention_user_id)
@@ -130,8 +165,8 @@ def _resolve_message_body_with_options(message: OutboundMessage, *, truncate_mar
         markdown = {
             "content": markdown_content
         }
-        if message.feedback_id:
-            markdown["feedback"] = {"id": str(message.feedback_id)}
+        if feedback_id:
+            markdown["feedback"] = {"id": feedback_id}
         return {
             "msgtype": "markdown",
             "markdown": markdown,
@@ -142,9 +177,9 @@ def _resolve_message_body_with_options(message: OutboundMessage, *, truncate_mar
             dict(message.template_card or {}),
             unique_token=uid(),
         )
-        if message.feedback_id:
+        if feedback_id:
             card_feedback = dict(card.get("feedback") or {})
-            card_feedback["id"] = str(message.feedback_id)
+            card_feedback["id"] = feedback_id
             card["feedback"] = card_feedback
         return {"msgtype": "template_card", "template_card": card}
     if msgtype in {"file", "image", "voice"}:
@@ -240,10 +275,10 @@ def strip_text_mentions(content: str, bot_name: str | None = None) -> str:
 
 def normalize_bridge_command_text(content: str, bot_name: str | None = None) -> str:
     text = strip_text_mentions(content, bot_name)
-    if text.startswith("/bridge-"):
+    if text.startswith("/bridge-") or text.startswith("/cwd"):
         return text
     fallback = LEADING_MENTION_RE.sub("", str(content or ""), count=1).strip()
-    return fallback if fallback.startswith("/bridge-") else str(content or "").strip()
+    return fallback if fallback.startswith("/bridge-") or fallback.startswith("/cwd") else str(content or "").strip()
 
 
 def build_subscribe_payload(bot: BotConfig, *, req_id: str | None = None) -> dict:
@@ -257,20 +292,24 @@ def build_subscribe_payload(bot: BotConfig, *, req_id: str | None = None) -> dic
 
 
 def build_text_response_payload(req_id: str, session_id: str, content: str, *, final: bool) -> dict:
+    req_text = require_non_empty_string(req_id, "reqId")
+    session_text = require_non_empty_string(session_id, "sessionId")
     return {
         "cmd": "aibot_respond_msg",
-        "headers": {"req_id": req_id},
-        "body": {"msgtype": "stream", "stream": {"id": session_id, "finish": final, "content": content}},
+        "headers": {"req_id": req_text},
+        "body": {"msgtype": "stream", "stream": {"id": session_text, "finish": final, "content": content}},
     }
 
 
 def build_template_card_update_payload(request: TemplateCardUpdateRequest) -> dict:
+    req_id = require_non_empty_string(request.req_id, "reqId")
+    template_card = validate_template_card_update_payload(request.template_card)
     return {
         "cmd": "aibot_respond_update_msg",
-        "headers": {"req_id": request.req_id},
+        "headers": {"req_id": req_id},
         "body": {
             "response_type": "update_template_card",
-            "template_card": dict(request.template_card or {}),
+            "template_card": dict(template_card),
         },
     }
 
@@ -293,20 +332,24 @@ def build_text_response_payloads(req_id: str, session_id: str, content: str, *, 
 def parse_text_callback(payload: dict) -> WeComTextMessage | None:
     if payload.get("cmd") != "aibot_msg_callback":
         return None
-    body = payload.get("body") or {}
+    body = _as_dict(payload.get("body"))
     if body.get("msgtype") != "text":
         return None
+    try:
+        chat_key = chat_key_from_message(payload)
+    except ValueError:
+        return None
     return WeComTextMessage(
-        req_id=str((payload.get("headers") or {}).get("req_id") or ""),
-        chat_key=chat_key_from_message(payload),
-        content=str(((body.get("text") or {}).get("content")) or ""),
+        req_id=str(_as_dict(payload.get("headers")).get("req_id") or ""),
+        chat_key=chat_key,
+        content=str((_as_dict(body.get("text")).get("content")) or ""),
         raw_payload=payload,
     )
 
 
 def extract_response_url(payload: dict) -> str | None:
-    body = payload.get("body") or {}
-    headers = payload.get("headers") or {}
+    body = _as_dict(payload.get("body"))
+    headers = _as_dict(payload.get("headers"))
     for candidate in (
         body.get("response_url"),
         body.get("responseUrl"),
@@ -324,25 +367,35 @@ def extract_response_url(payload: dict) -> str | None:
 def parse_template_card_event(payload: dict) -> WeComTemplateCardEvent | None:
     if payload.get("cmd") != "aibot_event_callback":
         return None
-    body = payload.get("body") or {}
+    body = _as_dict(payload.get("body"))
     if body.get("msgtype") != "event":
         return None
-    event = body.get("event") or {}
+    event = _as_dict(body.get("event"))
     if event.get("eventtype") != "template_card_event":
         return None
-    card_event = event.get("template_card_event") or {}
+    card_event = _as_dict(event.get("template_card_event"))
     selected_items = []
-    for item in ((card_event.get("selected_items") or {}).get("selected_item") or []):
-        option_ids = tuple(str(option_id) for option_id in (((item.get("option_ids") or {}).get("option_id")) or []) if str(option_id))
+    for item in (_as_dict(card_event.get("selected_items")).get("selected_item") or []):
+        if not isinstance(item, dict):
+            continue
+        option_ids = tuple(
+            str(option_id)
+            for option_id in (_as_dict(item.get("option_ids")).get("option_id") or [])
+            if str(option_id)
+        )
         selected_items.append(
             WeComTemplateCardSelection(
                 question_key=str(item.get("question_key") or ""),
                 option_ids=option_ids,
             )
         )
+    try:
+        chat_key = chat_key_from_message(payload)
+    except ValueError:
+        return None
     return WeComTemplateCardEvent(
-        req_id=str((payload.get("headers") or {}).get("req_id") or ""),
-        chat_key=chat_key_from_message(payload),
+        req_id=str(_as_dict(payload.get("headers")).get("req_id") or ""),
+        chat_key=chat_key,
         card_type=str(card_event.get("card_type") or ""),
         event_key=str(card_event.get("event_key") or ""),
         task_id=str(card_event.get("task_id") or "") or None,
@@ -352,4 +405,10 @@ def parse_template_card_event(payload: dict) -> WeComTemplateCardEvent | None:
 
 
 def is_subscribe_ok(payload: dict) -> bool:
-    return payload.get("errcode") == 0
+    raw_errcode = payload.get("errcode")
+    if raw_errcode in (None, ""):
+        return False
+    try:
+        return int(raw_errcode) == 0
+    except (TypeError, ValueError):
+        return False

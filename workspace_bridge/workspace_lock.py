@@ -10,6 +10,8 @@ from .models import WorkspaceRef
 @contextmanager
 def workspace_lock(workspace: WorkspaceRef) -> Iterator[None]:
     workspace.lock_file.parent.mkdir(parents=True, exist_ok=True)
+    if workspace.lock_file.is_symlink():
+        workspace.lock_file.unlink(missing_ok=True)
     with open(workspace.lock_file, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:

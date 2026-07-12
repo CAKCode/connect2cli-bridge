@@ -37,11 +37,15 @@ def validate_button_list(value, field: str = "button_interaction.button_list") -
     if len(value) > 6:
         raise ValueError(f"{field} exceeds 6 items")
     normalized = []
+    seen_keys: set[str] = set()
     for index, item in enumerate(value, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"{field}[{index}] must be an object")
         require_non_empty_string(item.get("text"), f"{field}[{index}].text")
-        require_non_empty_string(item.get("key"), f"{field}[{index}].key")
+        key = require_non_empty_string(item.get("key"), f"{field}[{index}].key")
+        if key in seen_keys:
+            raise ValueError(f"{field}[{index}].key duplicates a previous key")
+        seen_keys.add(key)
         normalized.append(dict(item))
     return normalized
 
@@ -63,10 +67,14 @@ def validate_checkbox(value) -> dict:
         raise ValueError("vote_interaction.checkbox.option_list required")
     if len(option_list) > 20:
         raise ValueError("vote_interaction.checkbox.option_list exceeds 20 items")
+    seen_option_ids: set[str] = set()
     for index, item in enumerate(option_list, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"vote_interaction.checkbox.option_list[{index}] must be an object")
-        require_non_empty_string(item.get("id"), f"vote_interaction.checkbox.option_list[{index}].id")
+        option_id = require_non_empty_string(item.get("id"), f"vote_interaction.checkbox.option_list[{index}].id")
+        if option_id in seen_option_ids:
+            raise ValueError(f"vote_interaction.checkbox.option_list[{index}].id duplicates a previous id")
+        seen_option_ids.add(option_id)
         require_non_empty_string(item.get("text"), f"vote_interaction.checkbox.option_list[{index}].text")
     return dict(value)
 
@@ -76,22 +84,32 @@ def validate_select_list(value) -> list[dict]:
         raise ValueError("multiple_interaction.select_list required")
     if len(value) > 3:
         raise ValueError("multiple_interaction.select_list exceeds 3 items")
+    seen_question_keys: set[str] = set()
     for index, item in enumerate(value, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"multiple_interaction.select_list[{index}] must be an object")
-        require_non_empty_string(item.get("question_key"), f"multiple_interaction.select_list[{index}].question_key")
+        question_key = require_non_empty_string(item.get("question_key"), f"multiple_interaction.select_list[{index}].question_key")
+        if question_key in seen_question_keys:
+            raise ValueError(f"multiple_interaction.select_list[{index}].question_key duplicates a previous question_key")
+        seen_question_keys.add(question_key)
         option_list = item.get("option_list")
         if not isinstance(option_list, list) or not option_list:
             raise ValueError(f"multiple_interaction.select_list[{index}].option_list required")
+        seen_option_ids: set[str] = set()
         for option_index, option in enumerate(option_list, start=1):
             if not isinstance(option, dict):
                 raise ValueError(
                     f"multiple_interaction.select_list[{index}].option_list[{option_index}] must be an object"
                 )
-            require_non_empty_string(
+            option_id = require_non_empty_string(
                 option.get("id"),
                 f"multiple_interaction.select_list[{index}].option_list[{option_index}].id",
             )
+            if option_id in seen_option_ids:
+                raise ValueError(
+                    f"multiple_interaction.select_list[{index}].option_list[{option_index}].id duplicates a previous id"
+                )
+            seen_option_ids.add(option_id)
             require_non_empty_string(
                 option.get("text"),
                 f"multiple_interaction.select_list[{index}].option_list[{option_index}].text",
@@ -104,6 +122,12 @@ def validate_template_card_payload(template_card: dict, *, require_interaction_t
         raise ValueError("templateCard must be a JSON object")
     card = dict(template_card)
     card_type = require_non_empty_string(card.get("card_type"), "templateCard.card_type")
+    if "feedback" in card and card.get("feedback") is not None:
+        if not isinstance(card.get("feedback"), dict):
+            raise ValueError("templateCard.feedback must be an object")
+        feedback = dict(card.get("feedback") or {})
+        feedback["id"] = validate_feedback_id(feedback.get("id"), "templateCard.feedback.id")
+        card["feedback"] = feedback
 
     if card_type == "text_notice":
         has_title = bool(str(((card.get("main_title") or {}).get("title")) or "").strip())
@@ -147,6 +171,8 @@ def validate_template_card_payload(template_card: dict, *, require_interaction_t
         card["submit_button"] = validate_submit_button(card.get("submit_button"), "multiple_interaction.submit_button")
         if require_interaction_task_id and card.get("task_id"):
             validate_task_id(card.get("task_id"), "multiple_interaction.task_id")
+    else:
+        raise ValueError(f"unsupported templateCard.card_type: {card_type}")
 
     return card
 

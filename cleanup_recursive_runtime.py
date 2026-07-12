@@ -14,7 +14,11 @@ def main() -> int:
     args = parser.parse_args()
 
     runtime_root = Path(args.runtime_root).expanduser().resolve()
-    matches = find_nested_runtime_dirs(runtime_root)
+    try:
+        matches = find_nested_runtime_dirs(runtime_root)
+    except ValueError as exc:
+        print(str(exc), file=__import__("sys").stderr)
+        return 2
     print(f"runtime_root={runtime_root}")
     print(f"matches={len(matches)}")
     for path in matches[:20]:

@@ -46,6 +46,21 @@ is_truthy() {
   return 1
 }
 
+require_safe_name_component() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    ""|"."|"..")
+      echo "$label must not be empty, '.' or '..'" >&2
+      exit 1
+      ;;
+    */*)
+      echo "$label must not contain '/': $value" >&2
+      exit 1
+      ;;
+  esac
+}
+
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
@@ -59,6 +74,49 @@ run_cmd() {
     return 0
   fi
   "$@"
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+expand_user_path() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).expanduser())
+PY
+}
+
+normalize_repo_url() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+raw = sys.argv[1].strip().rstrip("/")
+if raw.endswith(".git"):
+    raw = raw[:-4]
+
+if "://" in raw:
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower().strip()
+    path = parsed.path.lstrip("/").strip()
+    if host and path:
+        print(f"{host}/{path}")
+    else:
+        print(raw)
+elif "@" in raw and ":" in raw.split("@", 1)[1]:
+    user_host, path = raw.split(":", 1)
+    host = user_host.split("@", 1)[1].lower().strip()
+    path = path.lstrip("/").strip()
+    if host and path:
+        print(f"{host}/{path}")
+    else:
+        print(raw)
+else:
+    print(raw)
+PY
 }
 
 while [ "$#" -gt 0 ]; do
@@ -122,15 +180,18 @@ require_command sh
 REPO_SLUG="$(basename "$GITHUB_REPO")"
 REPO_SLUG="${REPO_SLUG%.git}"
 [ -n "$REPO_SLUG" ] || { echo "failed to derive repository name from: $GITHUB_REPO" >&2; exit 1; }
+require_safe_name_component "$REPO_SLUG" "--github-repo repository name"
 
 if [ -z "$BOT_NAME" ]; then
   BOT_NAME="$(printf '%s' "$REPO_SLUG" | tr ' /:@' '_' | tr -cd 'A-Za-z0-9._-')"
 fi
 [ -n "$BOT_NAME" ] || BOT_NAME="default"
+require_safe_name_component "$BOT_NAME" "--bot-name"
 
 if [ -z "$WORK_ROOT" ]; then
   WORK_ROOT="$SCRIPT_DIR/bot-workdirs"
 fi
+WORK_ROOT="$(expand_user_path "$WORK_ROOT")"
 
 TARGET_REPO_DIR="$WORK_ROOT/$REPO_SLUG"
 SECRET_FILE="$SCRIPT_DIR/.secrets/$BOT_NAME.secret"
@@ -152,6 +213,15 @@ if [ ! -d "$SCRIPT_DIR/.secrets" ]; then
 fi
 
 if [ -d "$TARGET_REPO_DIR/.git" ]; then
+  existing_origin="$(git -C "$TARGET_REPO_DIR" remote get-url origin 2>/dev/null || true)"
+  if [ -z "$existing_origin" ]; then
+    echo "existing git repo has no origin remote: $TARGET_REPO_DIR" >&2
+    exit 1
+  fi
+  if [ "$(normalize_repo_url "$existing_origin")" != "$(normalize_repo_url "$GITHUB_REPO")" ]; then
+    echo "existing git repo origin mismatch: $existing_origin != $GITHUB_REPO" >&2
+    exit 1
+  fi
   echo "Reusing existing git repo: $TARGET_REPO_DIR"
 elif [ -e "$TARGET_REPO_DIR" ]; then
   echo "target path exists but is not a git repo: $TARGET_REPO_DIR" >&2
@@ -183,18 +253,18 @@ if is_truthy "$DRY_RUN"; then
   printf '[dry-run] write .env: %s\n' "$ENV_FILE"
 else
   cat > "$ENV_FILE" <<EOF
-BRIDGE_BIND=$BRIDGE_BIND
-WORK_DIR=$TARGET_REPO_DIR
-CODEX_EXEC_MODE=host
-BRIDGE_WATCHDOG_ENABLED=true
+BRIDGE_BIND=$(shell_quote "$BRIDGE_BIND")
+WORK_DIR=$(shell_quote "$TARGET_REPO_DIR")
+CODEX_EXEC_MODE=$(shell_quote "host")
+BRIDGE_WATCHDOG_ENABLED=$(shell_quote "true")
 
-WECOM_BOT_CONFIG_ID=$BOT_NAME
-WECOM_BOT_NAME=$BOT_NAME
-WECOM_BOT_ID=$BOT_ID
-WECOM_BOT_SECRET_FILE=$SECRET_FILE
-WECOM_BOT_WORK_DIR=$TARGET_REPO_DIR
-WECOM_BOT_GROUP_SESSION_MODE=per-user
-WECOM_BOT_ENABLED=true
+WECOM_BOT_CONFIG_ID=$(shell_quote "$BOT_NAME")
+WECOM_BOT_NAME=$(shell_quote "$BOT_NAME")
+WECOM_BOT_ID=$(shell_quote "$BOT_ID")
+WECOM_BOT_SECRET_FILE=$(shell_quote "$SECRET_FILE")
+WECOM_BOT_WORK_DIR=$(shell_quote "$TARGET_REPO_DIR")
+WECOM_BOT_GROUP_SESSION_MODE=$(shell_quote "per-user")
+WECOM_BOT_ENABLED=$(shell_quote "true")
 EOF
 fi
 

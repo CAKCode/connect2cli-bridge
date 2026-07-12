@@ -16,6 +16,7 @@ from workspace_bridge.execution import (
     run_text_message_once,
     stream_text_message_once,
 )
+from workspace_bridge.reply_state import cache_reply_payload, get_or_create_reply_state
 from workspace_bridge.service import APP_SCHEDULE_TASK_KEY, APP_WECOM_RUNTIME_KEY, APP_WECOM_TASK_KEY, create_app
 from workspace_bridge.models import WeComBotRuntime
 from workspace_bridge.wecom_protocol import WeComTextMessage
@@ -41,6 +42,29 @@ def make_config(tmp_path: Path, *, wecom_enabled: bool = False):
             "WECOM_ENABLED": "true" if wecom_enabled else "false",
         }
     )
+
+
+def make_acking_runtime_ws(runtime: WeComBotRuntime, *, on_send=None, fail_on_send_number: int | None = None, error: Exception | None = None):
+    failure = error or RuntimeError("socket closed")
+
+    class AckingWS:
+        def __init__(self) -> None:
+            self.sent = []
+            self.send_count = 0
+
+        async def send_json(self, payload: dict) -> None:
+            self.send_count += 1
+            if fail_on_send_number is not None and self.send_count == fail_on_send_number:
+                raise failure
+            self.sent.append(payload)
+            if on_send is not None:
+                on_send(payload)
+            req_id = ((payload.get("headers") or {}).get("req_id"))
+            future = runtime.pending_requests.get(req_id) if req_id else None
+            if future is not None and not future.done():
+                future.set_result({"headers": {"req_id": req_id}, "errcode": 0, "body": {}})
+
+    return AckingWS()
 
 
 async def test_run_text_message_once_executes_override_and_returns_output(tmp_path: Path) -> None:
@@ -129,7 +153,7 @@ async def test_stream_text_message_once_emits_status_then_final(tmp_path: Path) 
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
 
@@ -562,7 +586,7 @@ async def test_execute_and_deliver_message_uses_runtime_thread_state_when_final_
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     runtime.session_threads[message.chat_key] = "thread-resume"
     original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
@@ -646,7 +670,7 @@ async def test_stream_text_message_once_uses_claude_resume_without_local_history
         agent_run_as_group=None,
     )
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     runtime.session_threads["single:alice"] = "550e8400-e29b-41d4-a716-446655440000"
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     invocations: list[tuple[str, ...]] = []
@@ -715,7 +739,47 @@ async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_
     assert invocation.env["CODEX_HOME"].startswith(str((tmp_path / "claude-runtime").resolve()))
     assert invocation.env["TMPDIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
     assert invocation.cwd == launch.cwd
-    assert invocation.env["WECOM_BRIDGE_WORKFILE_DIR"] == str(launch.runtime_context.workfile_dir)
+
+
+async def test_run_text_message_once_persists_claude_session_id_from_result_payload(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record
+
+    bot = build_bot_from_app_config(config)
+    bot = replace(
+        bot,
+        agent_backend="claude",
+        agent_command="claude",
+    )
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+
+    def fake_run_invocation(_invocation):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "result": "done",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        session_id, reply = await run_text_message_once(config, bot, message)
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "done"
+    assert stored is not None
+    assert stored.thread_id == "550e8400-e29b-41d4-a716-446655440000"
 
 
 async def test_stream_text_message_once_falls_back_to_local_history_for_claude_when_resume_session_missing(tmp_path: Path) -> None:
@@ -769,7 +833,7 @@ async def test_stream_text_message_once_falls_back_to_local_history_for_claude_w
         agent_run_as_group=None,
     )
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     runtime.session_threads["single:alice"] = "550e8400-e29b-41d4-a716-446655440000"
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="current turn", raw_payload={})
     runtime_session = SimpleNamespace(chat=[{"role": "user", "text": "older user turn"}, {"role": "bot", "text": "older bot turn"}])
@@ -807,6 +871,93 @@ async def test_stream_text_message_once_falls_back_to_local_history_for_claude_w
     assert len(invocations) == 2
     assert "--resume" in invocations[0]
     assert "--resume" not in invocations[1]
+    assert "[RecentConversation]" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+    assert "older user turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+    assert "older bot turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
+
+
+async def test_stream_text_message_once_falls_back_to_local_history_for_codex_when_resume_session_missing(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.buffer = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.buffer.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    runtime.session_threads["single:alice"] = "550e8400-e29b-41d4-a716-446655440000"
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="current turn", raw_payload={})
+    runtime_session = SimpleNamespace(chat=[{"role": "user", "text": "older user turn"}, {"role": "bot", "text": "older bot turn"}])
+    runtime.sessions = {"single:alice": runtime_session}
+    invocations: list[tuple[str, ...]] = []
+    processes: list[FakeProcess] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        invocations.append(tuple(args))
+        if len(invocations) == 1:
+            process = FakeProcess(
+                stdout_text="",
+                stderr_text="2026-05-28T11:17:33.253308Z ERROR codex_core::session: failed to record rollout items: thread 550e8400-e29b-41d4-a716-446655440000 not found",
+                returncode=1,
+            )
+        else:
+            process = FakeProcess(
+                stdout_text=json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                stderr_text="",
+                returncode=0,
+            )
+        processes.append(process)
+        return process
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    assert session_id.startswith("session-")
+    assert reply == "done"
+    assert len(invocations) == 2
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert "resume" not in invocations[1]
     assert "[RecentConversation]" in processes[1].stdin.buffer.decode("utf-8", "ignore")
     assert "older user turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
     assert "older bot turn" in processes[1].stdin.buffer.decode("utf-8", "ignore")
@@ -915,13 +1066,9 @@ async def test_send_or_cache_runtime_payload_clears_transient_last_error_after_s
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
 
-    class RecordingWS:
-        async def send_json(self, _payload: dict) -> None:
-            return None
-
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = RecordingWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     runtime.last_error = "socket closed"
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
 
@@ -931,23 +1078,44 @@ async def test_send_or_cache_runtime_payload_clears_transient_last_error_after_s
     assert runtime.last_error is None
 
 
+async def test_send_or_cache_runtime_payload_accepts_string_zero_ack_errcode(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import send_or_cache_runtime_payload
+
+    class StringAckWS:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            req_id = ((payload.get("headers") or {}).get("req_id"))
+            future = runtime.pending_requests.get(req_id) if req_id else None
+            if future is not None and not future.done():
+                future.set_result({"headers": {"req_id": req_id}, "errcode": "0", "body": {}})
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = StringAckWS()
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+
+    delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "final", final=True)
+
+    assert delivered is True
+    assert runtime.last_error is None
+    assert runtime.pending_finals == {}
+
+
 async def test_send_or_cache_runtime_payload_keeps_only_unsent_chunks_after_partial_send_failure(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
     from workspace_bridge.wecom_protocol import build_text_response_payloads
 
-    sent: list[dict] = []
-
-    class FlakyWS:
-        async def send_json(self, payload: dict) -> None:
-            if sent:
-                raise RuntimeError("socket closed")
-            sent.append(payload)
-
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FlakyWS()
+    sent: list[dict] = []
+    runtime.ws = make_acking_runtime_ws(runtime, on_send=sent.append, fail_on_send_number=2)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     content = "x" * 8000
     expected = build_text_response_payloads("req-1", "session-1", content, final=True)
@@ -961,20 +1129,269 @@ async def test_send_or_cache_runtime_payload_keeps_only_unsent_chunks_after_part
     assert runtime.reply_states["req-1"].pending_final_payloads == expected[1:]
 
 
+async def test_flush_cached_runtime_payloads_ignores_non_object_deferred_job_file(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import flush_cached_runtime_payloads
+
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    state = get_or_create_reply_state(runtime, "job:req-1", "session-1", "single:alice")
+    payload = {"headers": {"req_id": "job:req-1"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True, payloads=[payload])
+    runtime.pending_finals["job:req-1"] = [payload]
+    pending_root = config.runtime_root / "schedules" / "pending"
+    pending_root.mkdir(parents=True, exist_ok=True)
+    (pending_root / "0000000000000-req-1.json").write_text("[]", encoding="utf-8")
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.pending_finals == {}
+    assert (pending_root / "0000000000000-req-1.json").exists()
+
+
+async def test_flush_cached_runtime_payloads_ignores_malformed_file_before_matching_job(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import flush_cached_runtime_payloads
+    from workspace_bridge.schedule import ScheduleDefinition, schedule_pending_root, write_schedule_definition, write_scheduled_job
+    from workspace_bridge.models import ScheduledJob
+
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    request_id = "req-1"
+    schedule_id = "schedule-1"
+    state = get_or_create_reply_state(runtime, f"job:{request_id}", "session-1", "single:alice")
+    payload = {"headers": {"req_id": f"job:{request_id}"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True, payloads=[payload])
+    runtime.pending_finals[f"job:{request_id}"] = [payload]
+    write_schedule_definition(
+        config.runtime_root,
+        ScheduleDefinition(
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            cron=None,
+            timezone_name=None,
+            next_run_at=0,
+            enabled=True,
+            max_runs=3,
+            run_count=0,
+            misfire_policy="fire_once_now",
+            concurrency_policy="skip_if_running",
+            run_at_ms=0,
+            bot_id=config.bot_id,
+        ),
+    )
+    pending_root = schedule_pending_root(config.runtime_root)
+    bad_file = pending_root / "0000000000000-bad.json"
+    bad_file.write_text("[]", encoding="utf-8")
+    good_file = pending_root / "0000000000001-req-1.json"
+    write_scheduled_job(
+        good_file,
+        ScheduledJob(
+            request_id=request_id,
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            run_at=1,
+            created_at=1,
+            bot_id=config.bot_id,
+        ),
+    )
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.pending_finals == {}
+    assert bad_file.exists()
+    assert not good_file.exists()
+    assert (config.runtime_root / "schedules" / "done" / good_file.name).exists()
+
+
+async def test_flush_cached_runtime_payloads_removes_symlinked_nonmatching_job_before_matching_job(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import flush_cached_runtime_payloads
+    from workspace_bridge.schedule import ScheduleDefinition, schedule_pending_root, write_schedule_definition, write_scheduled_job
+    from workspace_bridge.models import ScheduledJob
+
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    request_id = "req-1"
+    schedule_id = "schedule-1"
+    state = get_or_create_reply_state(runtime, f"job:{request_id}", "session-1", "single:alice")
+    payload = {"headers": {"req_id": f"job:{request_id}"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True, payloads=[payload])
+    runtime.pending_finals[f"job:{request_id}"] = [payload]
+    write_schedule_definition(
+        config.runtime_root,
+        ScheduleDefinition(
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            cron=None,
+            timezone_name=None,
+            next_run_at=0,
+            enabled=True,
+            max_runs=3,
+            run_count=0,
+            misfire_policy="fire_once_now",
+            concurrency_policy="skip_if_running",
+            run_at_ms=0,
+            bot_id=config.bot_id,
+        ),
+    )
+    pending_root = schedule_pending_root(config.runtime_root)
+    external_job = tmp_path / "external-job.json"
+    external_job.write_text("{}", encoding="utf-8")
+    symlink_job = pending_root / "0000000000000-foreign.json"
+    symlink_job.symlink_to(external_job)
+    good_file = pending_root / "0000000000001-req-1.json"
+    write_scheduled_job(
+        good_file,
+        ScheduledJob(
+            request_id=request_id,
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            run_at=1,
+            created_at=1,
+            bot_id=config.bot_id,
+        ),
+    )
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.pending_finals == {}
+    assert not __import__("os").path.lexists(symlink_job)
+    assert external_job.exists()
+    assert not good_file.exists()
+    assert (config.runtime_root / "schedules" / "done" / good_file.name).exists()
+
+
+async def test_flush_cached_runtime_payloads_finalizes_deferred_job_with_encoded_request_id(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import flush_cached_runtime_payloads
+    from workspace_bridge.schedule import ScheduleDefinition, schedule_done_marker_file, schedule_pending_root, write_schedule_definition, write_scheduled_job
+    from workspace_bridge.models import ScheduledJob
+
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    request_id = "folder/evil-123"
+    schedule_id = "folder/evil"
+    state = get_or_create_reply_state(runtime, f"job:{request_id}", "session-1", "single:alice")
+    payload = {"headers": {"req_id": f"job:{request_id}"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True, payloads=[payload])
+    runtime.pending_finals[f"job:{request_id}"] = [payload]
+    write_schedule_definition(
+        config.runtime_root,
+        ScheduleDefinition(
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            cron=None,
+            timezone_name=None,
+            next_run_at=0,
+            enabled=True,
+            max_runs=3,
+            run_count=0,
+            misfire_policy="fire_once_now",
+            concurrency_policy="skip_if_running",
+            run_at_ms=0,
+            bot_id=config.bot_id,
+        ),
+    )
+    pending_file = schedule_pending_root(config.runtime_root) / "0000000000123-folder%2Fevil-123.json"
+    write_scheduled_job(
+        pending_file,
+        ScheduledJob(
+            request_id=request_id,
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            run_at=123,
+            created_at=1,
+            bot_id=config.bot_id,
+        ),
+    )
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.pending_finals == {}
+    assert f"job:{request_id}" not in runtime.reply_states
+    assert not pending_file.exists()
+    assert (config.runtime_root / "schedules" / "done" / pending_file.name).exists()
+    assert schedule_done_marker_file(config.runtime_root, schedule_id).exists()
+
+
+async def test_flush_cached_runtime_payloads_replaces_broken_done_marker_symlink(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import flush_cached_runtime_payloads
+    from workspace_bridge.schedule import ScheduleDefinition, schedule_done_marker_file, schedule_pending_root, write_schedule_definition, write_scheduled_job
+    from workspace_bridge.models import ScheduledJob
+
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    request_id = "req-1"
+    schedule_id = "schedule-1"
+    state = get_or_create_reply_state(runtime, f"job:{request_id}", "session-1", "single:alice")
+    payload = {"headers": {"req_id": f"job:{request_id}"}, "body": {"msgtype": "stream"}}
+    cache_reply_payload(state, payload, final=True, payloads=[payload])
+    runtime.pending_finals[f"job:{request_id}"] = [payload]
+    write_schedule_definition(
+        config.runtime_root,
+        ScheduleDefinition(
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            cron=None,
+            timezone_name=None,
+            next_run_at=0,
+            enabled=True,
+            max_runs=3,
+            run_count=0,
+            misfire_policy="fire_once_now",
+            concurrency_policy="skip_if_running",
+            run_at_ms=0,
+            bot_id=config.bot_id,
+        ),
+    )
+    pending_file = schedule_pending_root(config.runtime_root) / "0000000000000-req-1.json"
+    write_scheduled_job(
+        pending_file,
+        ScheduledJob(
+            request_id=request_id,
+            schedule_id=schedule_id,
+            chat_key="single:alice",
+            message="hello",
+            run_at=0,
+            created_at=1,
+            bot_id=config.bot_id,
+        ),
+    )
+    done_marker = schedule_done_marker_file(config.runtime_root, schedule_id)
+    done_marker.symlink_to(tmp_path / "missing-done-marker.json")
+
+    await flush_cached_runtime_payloads(runtime)
+
+    assert runtime.pending_finals == {}
+    assert not pending_file.exists()
+    assert done_marker.exists()
+    assert not done_marker.is_symlink()
+    assert done_marker.read_text(encoding="utf-8") == "{}"
+
+
 async def test_send_or_cache_runtime_payload_sends_stream_chunks_in_order(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
 
-    sent: list[dict] = []
-
-    class RecordingWS:
-        async def send_json(self, payload: dict) -> None:
-            sent.append(payload)
-
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = RecordingWS()
+    sent: list[dict] = []
+    runtime.ws = make_acking_runtime_ws(runtime, on_send=sent.append)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
 
     delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "x" * 8000, final=True)
@@ -992,15 +1409,10 @@ async def test_send_or_cache_runtime_payload_sends_proactive_chunks_in_order(tmp
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.execution import send_or_cache_runtime_payload
 
-    sent: list[dict] = []
-
-    class RecordingWS:
-        async def send_json(self, payload: dict) -> None:
-            sent.append(payload)
-
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = RecordingWS()
+    sent: list[dict] = []
+    runtime.ws = make_acking_runtime_ws(runtime, on_send=sent.append)
     message = WeComTextMessage(req_id="", chat_key="group-user:room-1:alice", content="hello", raw_payload={})
 
     delivered = await send_or_cache_runtime_payload(runtime, message, "session-1", "x" * 5000, final=True)
@@ -1067,7 +1479,7 @@ async def test_run_text_message_once_prefers_output_file_text_over_json_stdout(t
     assert reply == "final from output file"
 
 
-async def test_run_text_message_once_does_not_persist_thread_id_from_stdout(tmp_path: Path) -> None:
+async def test_run_text_message_once_persists_thread_id_from_stdout(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.runtime import load_session_record
@@ -1102,7 +1514,109 @@ async def test_run_text_message_once_does_not_persist_thread_id_from_stdout(tmp_
     stored = load_session_record(bot.runtime_root, session_id)
     assert reply == "done"
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "thread-123"
+    assert tuple(item["role"] for item in stored.recent_chat) == ("user", "bot")
+    assert stored.recent_chat[0]["text"] == "hello"
+    assert stored.recent_chat[1]["text"] == "done"
+
+
+async def test_stream_text_message_once_uses_persisted_thread_and_recent_chat_after_runtime_restart(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record, prepare_session_run, update_session_record
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.buffer = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.buffer.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, stdout_text: str, stderr_text: str, returncode: int = 0) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self._stdout = stdout_text.encode("utf-8")
+            self._stderr = stderr_text.encode("utf-8")
+            self.returncode = None
+            self._planned_returncode = returncode
+
+        async def communicate(self):
+            self.returncode = self._planned_returncode
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            self.returncode = self._planned_returncode
+            return self.returncode
+
+    bot = build_bot_from_app_config(config)
+    runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
+    runtime.ws = make_acking_runtime_ws(runtime)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="current turn", raw_payload={})
+    launch = prepare_session_run(bot, message.chat_key)
+    update_session_record(
+        bot.runtime_root,
+        launch.session.session_id,
+        lambda current: replace(
+            current,
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            recent_chat=(
+                {"role": "user", "text": "older user turn"},
+                {"role": "bot", "text": "older bot turn"},
+            ),
+        ),
+    )
+    invocations: list[tuple[str, ...]] = []
+    processes: list[FakeProcess] = []
+
+    original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        invocations.append(tuple(args))
+        if len(invocations) == 1:
+            process = FakeProcess(
+                stdout_text="",
+                stderr_text="2026-05-28T11:17:33.253308Z ERROR codex_core::session: failed to record rollout items: thread 550e8400-e29b-41d4-a716-446655440000 not found",
+                returncode=1,
+            )
+        else:
+            process = FakeProcess(
+                stdout_text=json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                stderr_text="",
+                returncode=0,
+            )
+        processes.append(process)
+        return process
+
+    execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    try:
+        session_id, reply = await stream_text_message_once(config, runtime, message)
+    finally:
+        execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert reply == "done"
+    assert len(invocations) == 2
+    assert invocations[0][0:3] == ("codex", "exec", "resume")
+    assert invocations[1][0:2] == ("codex", "exec")
+    fallback_prompt = processes[1].stdin.buffer.decode("utf-8", "ignore")
+    assert "[RecentConversation]" in fallback_prompt
+    assert "older user turn" in fallback_prompt
+    assert "older bot turn" in fallback_prompt
+    assert stored is not None
+    assert tuple(item["text"] for item in stored.recent_chat) == (
+        "older user turn",
+        "older bot turn",
+        "current turn",
+        "done",
+    )
 
 
 async def test_run_text_message_once_updates_last_run_at_on_failure(tmp_path: Path) -> None:
@@ -1188,7 +1702,7 @@ async def test_run_text_message_once_retries_fresh_exec_when_resume_thread_not_f
     assert invocations[1][0:2] == ("codex", "exec")
     assert "resume" not in invocations[1]
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "thread-456"
 
 
 async def test_run_text_message_once_raises_on_nonzero_exit(tmp_path: Path) -> None:
@@ -1261,7 +1775,47 @@ async def test_run_text_message_once_does_not_retry_when_thread_not_found_only_a
     assert len(invocations) == 1
     assert reply == "explain why thread 019e6e4d-4d11-78a2-9636-843225e13202 not found can happen"
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "019e6e4d-4d11-78a2-9636-843225e13202"
+
+
+async def test_run_text_message_once_does_not_resume_when_persisted_thread_id_is_null(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+
+    bot = build_bot_from_app_config(config)
+    message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
+    original_run_invocation = execution_module.run_invocation
+    invocations: list[tuple[str, ...]] = []
+
+    def fake_run_invocation(invocation):
+        invocations.append(tuple(invocation.argv))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-123"}, ensure_ascii=False),
+                    json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "done"}}, ensure_ascii=False),
+                ]
+            ),
+            stderr="",
+        )
+
+    execution_module.run_invocation = fake_run_invocation
+    try:
+        launch = execution_module.prepare_session_run(bot, message.chat_key)
+        execution_module.update_session_record(
+            bot.runtime_root,
+            launch.session.session_id,
+            lambda current: replace(current, thread_id="null"),
+        )
+        _session_id, reply = await run_text_message_once(config, bot, message)
+    finally:
+        execution_module.run_invocation = original_run_invocation
+
+    assert reply == "done"
+    assert len(invocations) == 1
+    assert invocations[0][0:2] == ("codex", "exec")
+    assert "resume" not in invocations[0]
 
 
 async def test_stream_text_message_once_uses_json_stdout_when_output_file_missing(tmp_path: Path) -> None:
@@ -1277,7 +1831,7 @@ async def test_stream_text_message_once_uses_json_stdout_when_output_file_missin
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     class FakeStdin:
         def write(self, _data: bytes) -> None:
@@ -1382,7 +1936,7 @@ async def test_stream_text_message_once_uses_fresh_codex_invocation_without_over
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     captured: dict[str, object] = {}
 
@@ -1472,7 +2026,7 @@ async def test_stream_text_message_once_retries_fresh_exec_when_resume_thread_no
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     invocations: list[tuple[str, ...]] = []
 
@@ -1513,7 +2067,7 @@ async def test_stream_text_message_once_retries_fresh_exec_when_resume_thread_no
     assert invocations[0][0:3] == ("codex", "exec", "resume")
     assert invocations[1][0:2] == ("codex", "exec")
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "thread-789"
     assert runtime.session_threads[message.chat_key] == "thread-789"
 
 
@@ -1569,7 +2123,7 @@ async def test_stream_text_message_once_retries_fresh_exec_when_resume_stdin_bre
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     invocations: list[tuple[str, ...]] = []
 
@@ -1604,7 +2158,7 @@ async def test_stream_text_message_once_retries_fresh_exec_when_resume_stdin_bre
     assert invocations[0][0:3] == ("codex", "exec", "resume")
     assert invocations[1][0:2] == ("codex", "exec")
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "thread-stdin-fallback"
     assert runtime.session_threads[message.chat_key] == "thread-stdin-fallback"
 
 
@@ -1650,7 +2204,7 @@ async def test_stream_text_message_once_does_not_retry_when_thread_not_found_onl
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     invocations: list[tuple[str, ...]] = []
 
@@ -1683,7 +2237,7 @@ async def test_stream_text_message_once_does_not_retry_when_thread_not_found_onl
     assert len(invocations) == 1
     assert reply == "thread 019e6e4d-4d11-78a2-9636-843225e13202 not found is one possible failure mode"
     assert stored is not None
-    assert stored.thread_id is None
+    assert stored.thread_id == "019e6e4d-4d11-78a2-9636-843225e13202"
     assert runtime.session_threads[message.chat_key] == "019e6e4d-4d11-78a2-9636-843225e13202"
 
 
@@ -1725,7 +2279,7 @@ async def test_stream_text_message_once_uses_communicate_when_available(tmp_path
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
 
     original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
@@ -1780,7 +2334,7 @@ async def test_stream_text_message_once_returns_stderr_text_on_nonzero_exit(tmp_
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
     original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
 
@@ -1834,7 +2388,7 @@ async def test_stream_text_message_once_updates_last_run_at_on_failure(tmp_path:
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     launch = prepare_session_run(bot, "single:alice")
     before = load_session_record(bot.runtime_root, launch.session.session_id)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
@@ -1876,7 +2430,7 @@ async def test_bridge_reset_removes_workspace_bridge_chatfile_and_codex_home(tmp
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     launch = prepare_session_run(bot, "single:alice")
     chatfile_dir = launch.runtime_context.chatfile_dir
     chatfile_dir.mkdir(parents=True, exist_ok=True)
@@ -1952,7 +2506,7 @@ async def test_stream_text_message_once_streams_latest_message_during_run(tmp_pa
 
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
-    runtime.ws = FakeWS()
+    runtime.ws = make_acking_runtime_ws(runtime)
     message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="hello", raw_payload={})
 
     original_prepare_session_run = execution_module.prepare_session_run

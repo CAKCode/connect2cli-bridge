@@ -55,8 +55,10 @@ from workspace_bridge import codex_runtime
 from workspace_bridge.template_card_validation import (
     enrich_template_card_for_delivery,
     extract_template_card_owner_user_id,
+    require_non_empty_string,
     validate_feedback_id,
     validate_template_card_payload,
+    validate_template_card_update_payload,
 )
 
 
@@ -70,6 +72,8 @@ def resolve_shared_runtime_root(base_dir: Optional[Path] = None) -> Path:
         path = (root_base_dir / path).resolve()
     else:
         path = path.resolve()
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"BRIDGE_SHARED_RUNTIME_ROOT is not a directory: {path}")
     return path
 
 
@@ -83,6 +87,8 @@ def resolve_runtime_root(base_dir: Optional[Path] = None) -> Path:
         path = (root_base_dir / path).resolve()
     else:
         path = path.resolve()
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"BRIDGE_RUNTIME_ROOT is not a directory: {path}")
     return path
 
 
@@ -99,13 +105,33 @@ def resolve_local_file_send_queue_root(base_dir: Optional[Path] = None) -> Path:
     return path
 
 
+def resolve_local_send_message_queue_root(base_dir: Optional[Path] = None) -> Path:
+    runtime_root = resolve_runtime_root(base_dir)
+    raw = str(os.environ.get("LOCAL_SEND_MESSAGE_QUEUE_ROOT") or "").strip()
+    if not raw:
+        return (runtime_root / ".local-send-message-queue").resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (runtime_root / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def require_directory_path(path: Path, *, label: str) -> Path:
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {path}")
+    return path
+
+
 HOST, PORT = resolve_host_port()
 BRIDGE_API_BASE = build_bridge_api_base(HOST, PORT)
 DEFAULT_WORK_DIR = os.environ.get("WORK_DIR", "/home/jenkins")
 DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser().resolve()
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "").strip()
 BRIDGE_BASIC_AUTH = os.environ.get("BRIDGE_BASIC_AUTH", "").strip()
-CODEX_EXEC_MODE = (os.environ.get("CODEX_EXEC_MODE", "host").strip().lower() or "host")
+_RAW_CODEX_EXEC_MODE = os.environ.get("CODEX_EXEC_MODE", "host").strip().lower()
+CODEX_EXEC_MODE = "host" if _RAW_CODEX_EXEC_MODE in {"", "null", "none"} else _RAW_CODEX_EXEC_MODE
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 
 MAX_JSON_BODY = int(os.environ.get("MAX_JSON_BODY", 1024 * 1024))
@@ -119,6 +145,7 @@ SUBPROCESS_STREAM_LIMIT = max(64 * 1024, int(os.environ.get("SUBPROCESS_STREAM_L
 SUBPROCESS_STREAM_READ_SIZE = max(4096, int(os.environ.get("SUBPROCESS_STREAM_READ_SIZE", 16 * 1024)))
 SUBPROCESS_STREAM_MAX_LINE = max(16 * 1024, int(os.environ.get("SUBPROCESS_STREAM_MAX_LINE", 256 * 1024)))
 PROACTIVE_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("PROACTIVE_SEND_ACK_TIMEOUT_SEC", 10)))
+REPLY_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("REPLY_SEND_ACK_TIMEOUT_SEC", 10)))
 WEBSOCKET_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("WEBSOCKET_SEND_TIMEOUT_SEC", 5)))
 STATUS_STREAM_INTERVAL_SEC = max(1, int(os.environ.get("STATUS_STREAM_INTERVAL_SEC", 2)))
 STATUS_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_TIMEOUT_SEC", 1)))
@@ -142,6 +169,9 @@ SESSION_LEASE_TTL_MS = int(os.environ.get("SESSION_LEASE_TTL", 30000))
 SESSION_LEASE_RENEW_MS = max(3000, SESSION_LEASE_TTL_MS // 3)
 RECENT_EVENT_TTL = 10 * 60
 MAX_STREAM_CONTENT = 8000
+MAX_SESSION_CHAT_ITEMS = 200
+MAX_PERSISTED_SESSION_CHAT_ITEMS = 50
+MAX_COMPAT_HISTORY_ITEMS = 12
 
 DATA_FILE = Path(os.environ.get("BOTS_FILE", str(BASE_DIR / ".bots.json"))).expanduser().resolve()
 SHARED_RUNTIME_ROOT = resolve_shared_runtime_root(BASE_DIR)
@@ -158,7 +188,10 @@ TEMPLATE_CARD_STATE_ROOT = SHARED_RUNTIME_ROOT / ".template-card-state"
 LOCAL_FILE_SEND_COMMAND = BASE_DIR / "send_file.py"
 LOCAL_SEND_MESSAGE_COMMAND = BASE_DIR / "send_message.py"
 LOCAL_SCHEDULE_MESSAGE_COMMAND = BASE_DIR / "schedule_message.py"
-LOCAL_FILE_SEND_QUEUE_ROOT = resolve_local_file_send_queue_root()
+LOCAL_FILE_SEND_QUEUE_ROOT = require_directory_path(
+    resolve_local_file_send_queue_root(),
+    label="LOCAL_FILE_SEND_QUEUE_ROOT",
+)
 LOCAL_FILE_SEND_PENDING_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "pending"
 LOCAL_FILE_SEND_PROCESSING_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "processing"
 LOCAL_FILE_SEND_RESULT_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "results"
@@ -167,16 +200,16 @@ LOCAL_FILE_SEND_FAILED_ROOT = LOCAL_FILE_SEND_QUEUE_ROOT / "failed"
 LOCAL_FILE_SEND_POLL_MS = int(os.environ.get("LOCAL_FILE_SEND_POLL_MS", 1000))
 LOCAL_FILE_SEND_DEFAULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_TIMEOUT_MS", "120000")))
 LOCAL_FILE_SEND_RESULT_RETENTION_MS = max(60000, int(os.environ.get("LOCAL_FILE_SEND_RESULT_RETENTION_MS", str(86400000))))
-LOCAL_SEND_MESSAGE_QUEUE_ROOT = (
-    Path(os.environ.get("LOCAL_SEND_MESSAGE_QUEUE_ROOT", str(INSTANCE_RUNTIME_ROOT / ".local-send-message-queue")))
-    .expanduser()
-    .resolve()
+LOCAL_SEND_MESSAGE_QUEUE_ROOT = require_directory_path(
+    resolve_local_send_message_queue_root(),
+    label="LOCAL_SEND_MESSAGE_QUEUE_ROOT",
 )
 LOCAL_SEND_MESSAGE_PENDING_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "pending"
 LOCAL_SEND_MESSAGE_PROCESSING_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "processing"
 LOCAL_SEND_MESSAGE_RESULT_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "results"
 LOCAL_SEND_MESSAGE_DONE_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "done"
 LOCAL_SEND_MESSAGE_FAILED_ROOT = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "failed"
+LOCAL_SEND_MESSAGE_POLL_MS = int(os.environ.get("LOCAL_SEND_MESSAGE_POLL_MS", str(LOCAL_FILE_SEND_POLL_MS)))
 LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS = max(1000, int(os.environ.get("LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS", "120000")))
 LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS = max(60000, int(os.environ.get("LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS", str(86400000))))
 SCHEDULE_ROOT = SHARED_RUNTIME_ROOT / ".scheduled-messages"
@@ -195,10 +228,13 @@ VALID_WORKSPACE_MODES = {"personal", "team"}
 VALID_AGENT_BACKENDS = {"codex", "claude"}
 
 EXTRA_FILE_ROOTS = [
-    Path(item.strip()).resolve()
+    Path(item.strip()).expanduser().resolve()
     for item in os.environ.get("FILE_SEND_ROOTS", "").split(",")
     if item.strip()
 ]
+for _file_send_root in EXTRA_FILE_ROOTS:
+    if _file_send_root.exists() and not _file_send_root.is_dir():
+        raise RuntimeError(f"FILE_SEND_ROOTS entry is not a directory: {_file_send_root}")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9]*[a-z]")
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
@@ -318,6 +354,7 @@ class BotState:
     last_inbound_at_ms: Optional[int] = None
     last_heartbeat_ack_at_ms: Optional[int] = None
     task_restart_counts: dict[str, int] = field(default_factory=dict)
+    pending_payload_flush_in_progress: bool = False
 
 
 def uid() -> str:
@@ -350,8 +387,14 @@ def resolve_codex_command() -> list[str]:
     return ["codex"]
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def normalize_agent_command(value: Any) -> Optional[str]:
     text = str(value or "").strip()
+    if text.lower() in {"none", "null"}:
+        return None
     return text or None
 
 
@@ -494,6 +537,36 @@ def local_file_send_namespace(value: Any) -> Optional[str]:
     return quote(text, safe="._-")
 
 
+def local_queue_request_file_component(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "request"
+    return quote(text, safe="._-")
+
+
+def local_queue_request_file_name(request_id: Any) -> str:
+    return f"{local_queue_request_file_component(request_id)}.json"
+
+
+def local_queue_request_file_path(root: Path, request_id: Any) -> Path:
+    return root / local_queue_request_file_name(request_id)
+
+
+def local_queue_request_id_from_job_file(job_file: Path) -> str:
+    stem = str(job_file.stem).strip()
+    return unquote(stem) if stem else ""
+
+
+def local_queue_request_path_candidates(root: Path, request_id: Any) -> list[Path]:
+    text = str(request_id or "").strip()
+    candidates = [local_queue_request_file_path(root, text)]
+    if text and "/" not in text and "\\" not in text:
+        legacy = root / f"{text}.json"
+        if legacy not in candidates:
+            candidates.append(legacy)
+    return candidates
+
+
 def build_local_file_send_queue_paths(root: Path) -> dict[str, Path]:
     return {
         "root": root,
@@ -513,6 +586,8 @@ def get_local_file_send_queue_paths(target_config_id: Optional[str] = None) -> d
 
 
 def get_local_file_send_target_config_id_for_root(root: Path) -> Optional[str]:
+    if root.is_symlink():
+        return None
     resolved = root.resolve()
     default_root = LOCAL_FILE_SEND_QUEUE_ROOT.resolve()
     if resolved == default_root:
@@ -532,7 +607,7 @@ def get_local_file_send_queue_paths_for_job_file(job_file: Path) -> dict[str, Pa
 
 
 def get_local_file_send_queue_paths_for_request(data: dict[str, Any]) -> dict[str, Path]:
-    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
+    target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
     return get_local_file_send_queue_paths(target_config_id)
 
 
@@ -555,6 +630,8 @@ def get_local_send_message_queue_paths(target_config_id: Optional[str] = None) -
 
 
 def get_local_send_message_target_config_id_for_root(root: Path) -> Optional[str]:
+    if root.is_symlink():
+        return None
     resolved = root.resolve()
     default_root = LOCAL_SEND_MESSAGE_QUEUE_ROOT.resolve()
     if resolved == default_root:
@@ -623,10 +700,13 @@ def prune_reply_url_state_items(items: dict[str, dict[str, Any]]) -> dict[str, d
         req_text = str(req_id).strip()
         if not req_text or not isinstance(item, dict):
             continue
+        response_url = str(item.get("responseUrl") or "").strip()
+        if not response_url:
+            continue
         captured_at = normalize_optional_int(item.get("capturedAtMs")) or 0
         if captured_at <= 0 or now_value - captured_at >= WECOM_REPLY_URL_TTL_MS:
             continue
-        normalized[req_text] = dict(item)
+        normalized[req_text] = {**dict(item), "responseUrl": response_url}
     return normalized
 
 
@@ -672,7 +752,7 @@ def list_local_send_message_queue_path_groups() -> list[dict[str, Path]]:
     targets_root = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets"
     if targets_root.exists():
         for root in sorted(targets_root.iterdir()):
-            if not root.is_dir():
+            if not root.is_dir() or root.is_symlink():
                 continue
             root_str = str(root.resolve())
             if root_str in seen_roots:
@@ -694,6 +774,22 @@ def list_local_send_message_queue_path_groups() -> list[dict[str, Path]]:
     return queue_path_groups
 
 
+def list_all_local_send_message_queue_path_groups() -> list[dict[str, Path]]:
+    queue_path_groups = [get_local_send_message_queue_paths()]
+    seen_roots = {str(queue_path_groups[0]["root"])}
+    targets_root = LOCAL_SEND_MESSAGE_QUEUE_ROOT / "targets"
+    if targets_root.exists():
+        for root in sorted(targets_root.iterdir()):
+            if not root.is_dir() or root.is_symlink():
+                continue
+            root_str = str(root.resolve())
+            if root_str in seen_roots:
+                continue
+            queue_path_groups.append(build_local_send_message_queue_paths(root.resolve()))
+            seen_roots.add(root_str)
+    return queue_path_groups
+
+
 def ensure_local_send_message_dirs(target_config_ids: Optional[list[str]] = None) -> None:
     for path_group in [get_local_send_message_queue_paths(), *(get_local_send_message_queue_paths(item) for item in (target_config_ids or []))]:
         for path in path_group.values():
@@ -705,7 +801,7 @@ def write_local_send_message_result(request_id: str, payload: dict[str, Any], qu
     ensure_dir(queue_paths["results"])
     retain_until = normalize_optional_int(payload.get("retainUntil") or payload.get("retain_until"))
     write_json_atomic(
-        queue_paths["results"] / f"{request_id}.json",
+        local_queue_request_file_path(queue_paths["results"], request_id),
         {
             **payload,
             "processedAt": now_ms(),
@@ -725,6 +821,30 @@ def finalize_local_send_message_job(processing_file: Path, ok: bool) -> None:
             processing_file.unlink()
         except FileNotFoundError:
             pass
+
+
+def cleanup_stale_local_send_message_result_files(current_ms: Optional[int] = None) -> None:
+    now_value = current_ms if current_ms is not None else now_ms()
+    for paths in list_all_local_send_message_queue_path_groups():
+        result_root = paths["results"]
+        if not result_root.exists():
+            continue
+        for result_file in result_root.glob("*.json"):
+            payload = read_json_file(result_file, None)
+            processed_at = normalize_optional_int((payload or {}).get("processedAt")) if isinstance(payload, dict) else None
+            retain_until = normalize_optional_int((payload or {}).get("retainUntil") or (payload or {}).get("retain_until")) if isinstance(payload, dict) else None
+            if processed_at is None:
+                try:
+                    processed_at = int(result_file.stat().st_mtime * 1000)
+                except FileNotFoundError:
+                    continue
+            result_expires_at = max(processed_at + LOCAL_SEND_MESSAGE_RESULT_RETENTION_MS, retain_until or 0)
+            if now_value < result_expires_at:
+                continue
+            try:
+                result_file.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def should_process_local_file_send_target_config(target_config_id: Optional[str]) -> bool:
@@ -759,7 +879,7 @@ def list_local_file_send_queue_path_groups() -> list[dict[str, Path]]:
     targets_root = LOCAL_FILE_SEND_QUEUE_ROOT / "targets"
     if targets_root.exists():
         for root in sorted(targets_root.iterdir()):
-            if not root.is_dir():
+            if not root.is_dir() or root.is_symlink():
                 continue
             root_str = str(root.resolve())
             if root_str in seen_roots:
@@ -787,7 +907,7 @@ def list_all_local_file_send_queue_path_groups() -> list[dict[str, Path]]:
     targets_root = LOCAL_FILE_SEND_QUEUE_ROOT / "targets"
     if targets_root.exists():
         for root in sorted(targets_root.iterdir()):
-            if not root.is_dir():
+            if not root.is_dir() or root.is_symlink():
                 continue
             root_str = str(root.resolve())
             if root_str in seen_roots:
@@ -798,13 +918,16 @@ def list_all_local_file_send_queue_path_groups() -> list[dict[str, Path]]:
 
 
 def local_file_send_request_expires_at_ms(request: dict[str, Any]) -> Optional[int]:
-    expires_at = normalize_optional_int(request.get("expiresAt") or request.get("expires_at"))
+    expires_at_value = request.get("expiresAt") if "expiresAt" in request else request.get("expires_at")
+    expires_at = normalize_optional_int(expires_at_value)
     if expires_at is not None:
         return expires_at
-    requested_at = normalize_optional_int(request.get("requestedAt") or request.get("requested_at"))
+    requested_at_value = request.get("requestedAt") if "requestedAt" in request else request.get("requested_at")
+    requested_at = normalize_optional_int(requested_at_value)
     if requested_at is None:
         return None
-    timeout_ms = normalize_optional_int(request.get("timeoutMs") or request.get("timeout_ms"))
+    timeout_ms_value = request.get("timeoutMs") if "timeoutMs" in request else request.get("timeout_ms")
+    timeout_ms = normalize_optional_int(timeout_ms_value)
     return requested_at + max(1000, timeout_ms if timeout_ms is not None else LOCAL_FILE_SEND_DEFAULT_TIMEOUT_MS)
 
 
@@ -813,7 +936,8 @@ def ensure_local_file_send_request_deadline(request: dict[str, Any], job_file: P
     changed = False
     normalized = dict(request)
 
-    requested_at = normalize_optional_int(normalized.get("requestedAt") or normalized.get("requested_at"))
+    requested_at_value = normalized.get("requestedAt") if "requestedAt" in normalized else normalized.get("requested_at")
+    requested_at = normalize_optional_int(requested_at_value)
     if requested_at is None:
         try:
             requested_at = int(job_file.stat().st_mtime * 1000)
@@ -822,13 +946,15 @@ def ensure_local_file_send_request_deadline(request: dict[str, Any], job_file: P
         normalized["requestedAt"] = requested_at
         changed = True
 
-    timeout_ms = normalize_optional_int(normalized.get("timeoutMs") or normalized.get("timeout_ms"))
+    timeout_ms_value = normalized.get("timeoutMs") if "timeoutMs" in normalized else normalized.get("timeout_ms")
+    timeout_ms = normalize_optional_int(timeout_ms_value)
     if timeout_ms is None:
         timeout_ms = LOCAL_FILE_SEND_DEFAULT_TIMEOUT_MS
         normalized["timeoutMs"] = timeout_ms
         changed = True
 
-    expires_at = normalize_optional_int(normalized.get("expiresAt") or normalized.get("expires_at"))
+    expires_at_value = normalized.get("expiresAt") if "expiresAt" in normalized else normalized.get("expires_at")
+    expires_at = normalize_optional_int(expires_at_value)
     if expires_at is None:
         normalized["expiresAt"] = requested_at + max(1000, timeout_ms)
         changed = True
@@ -953,7 +1079,8 @@ def mark_local_file_send_processing_sending(
 
 
 def local_file_send_request_retain_until_ms(request: dict[str, Any]) -> Optional[int]:
-    retain_until = normalize_optional_int(request.get("retainUntil") or request.get("retain_until"))
+    retain_until_value = request.get("retainUntil") if "retainUntil" in request else request.get("retain_until")
+    retain_until = normalize_optional_int(retain_until_value)
     if retain_until is not None:
         return retain_until
     expires_at = local_file_send_request_expires_at_ms(request)
@@ -963,9 +1090,11 @@ def local_file_send_request_retain_until_ms(request: dict[str, Any]) -> Optional
 
 
 def read_local_file_send_result(request_id: str, queue_paths: dict[str, Path]) -> Optional[dict[str, Any]]:
-    result_file = queue_paths["results"] / f"{request_id}.json"
-    payload = read_json_file(result_file, None)
-    return payload if isinstance(payload, dict) else None
+    for result_file in local_queue_request_path_candidates(queue_paths["results"], request_id):
+        payload = read_json_file(result_file, None)
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def cleanup_stale_local_file_send_result_files(current_ms: Optional[int] = None) -> None:
@@ -977,7 +1106,11 @@ def cleanup_stale_local_file_send_result_files(current_ms: Optional[int] = None)
         for result_file in result_root.glob("*.json"):
             payload = read_json_file(result_file, None)
             processed_at = normalize_optional_int((payload or {}).get("processedAt")) if isinstance(payload, dict) else None
-            retain_until = normalize_optional_int((payload or {}).get("retainUntil") or (payload or {}).get("retain_until")) if isinstance(payload, dict) else None
+            retain_until = (
+                normalize_optional_int((payload or {}).get("retainUntil") if "retainUntil" in (payload or {}) else (payload or {}).get("retain_until"))
+                if isinstance(payload, dict)
+                else None
+            )
             if processed_at is None:
                 try:
                     processed_at = int(result_file.stat().st_mtime * 1000)
@@ -1113,9 +1246,9 @@ def bot_health_snapshot(bot: BotState) -> dict[str, Any]:
 
 
 def summarize_inbound_payload(payload: dict[str, Any]) -> str:
-    headers = payload.get("headers") or {}
-    body = payload.get("body") or {}
-    event = body.get("event") or {}
+    headers = _as_dict(payload.get("headers"))
+    body = _as_dict(payload.get("body"))
+    event = _as_dict(body.get("event"))
     parts = [
         f"cmd={str(payload.get('cmd') or '-').strip() or '-'}",
         f"reqId={str(headers.get('req_id') or '-').strip() or '-'}",
@@ -1131,8 +1264,8 @@ def summarize_inbound_payload(payload: dict[str, Any]) -> str:
 
 
 def extract_response_url(message: dict[str, Any]) -> Optional[str]:
-    body = message.get("body") or {}
-    headers = message.get("headers") or {}
+    body = _as_dict(message.get("body"))
+    headers = _as_dict(message.get("headers"))
     for candidate in (
         body.get("response_url"),
         body.get("responseUrl"),
@@ -1161,12 +1294,15 @@ def get_reply_url_state(bot: BotState, req_id: str) -> Optional[dict[str, Any]]:
     state = dict(bot.reply_urls.get(req_text) or {})
     if not state:
         return None
+    response_url = str(state.get("responseUrl") or "").strip()
+    if not response_url:
+        return None
     captured_at = normalize_optional_int(state.get("capturedAtMs")) or 0
     if captured_at <= 0 or now_ms() - captured_at >= WECOM_REPLY_URL_TTL_MS:
         return None
     if state.get("consumed") is True:
         return None
-    return state
+    return {**state, "responseUrl": response_url}
 
 
 def supervise_bot_task(bot: BotState, attr_name: str, task_name: str, factory: Any) -> asyncio.Task:
@@ -1305,44 +1441,63 @@ def cleanup_orphan_session_codex_homes() -> int:
     registry_root = SESSION_REGISTRY_ROOT / "sessions"
     if registry_root.exists():
         for session_file in registry_root.glob("*.json"):
-            record = normalize_session_record(read_json_file(session_file, None))
-            if record:
-                persisted_session_ids.add(str(record["sessionId"]))
+            raw = read_json_file(session_file, None)
+            record = normalize_session_record(raw) if isinstance(raw, dict) else None
+            candidate_session_ids = {
+                session_id
+                for session_id in {
+                    str((record or {}).get("sessionId") or ""),
+                    str((raw or {}).get("sessionId") or "") if isinstance(raw, dict) else "",
+                    str(session_file.stem or ""),
+                }
+                if safe_session_id(session_id)
+            }
+            persisted_session_ids.update(candidate_session_ids)
     removed = 0
     for child in sessions_root.iterdir():
-        if not child.is_dir():
+        if not child.is_dir() and not child.is_symlink():
             continue
         if child.name in persisted_session_ids:
             continue
-        remove_tree_if_exists(child)
-        removed += 1
+        if remove_tree_if_exists(child):
+            removed += 1
     return removed
 
 
-def cleanup_stale_session_codex_homes(current_ms: Optional[int] = None) -> int:
+def cleanup_stale_session_codex_homes(current_ms: Optional[int] = None, active_session_ids: Optional[set[str]] = None) -> int:
     now = now_ms() if current_ms is None else int(current_ms)
     sessions_root = SESSION_REGISTRY_ROOT / "sessions"
     if not sessions_root.exists():
         return 0
+    active_ids = {str(item).strip() for item in (active_session_ids or set()) if str(item).strip()}
     removed = 0
     for session_file in sessions_root.glob("*.json"):
-        record = normalize_session_record(read_json_file(session_file, None))
-        if not record:
+        raw = read_json_file(session_file, None)
+        if not isinstance(raw, dict):
             continue
-        lease_expires_at = int(record.get("leaseExpiresAt") or 0)
+        record = normalize_session_record(raw)
+        current = record if record is not None else raw
+        lease_expires_at = int(normalize_optional_int(current.get("leaseExpiresAt")) or 0)
         if lease_expires_at > now:
             continue
-        last_seen_ms = int(record.get("lastRunAt") or record.get("updatedAt") or record.get("createdAt") or 0)
+        last_seen_ms = int(
+            normalize_optional_int(current.get("lastRunAt"))
+            or normalize_optional_int(current.get("updatedAt"))
+            or normalize_optional_int(current.get("createdAt"))
+            or 0
+        )
         if (now - last_seen_ms) <= SESSION_TTL * 1000:
             continue
-        session_id = str(record.get("sessionId") or "").strip()
+        session_id = str((record or {}).get("sessionId") or raw.get("sessionId") or session_file.stem).strip()
         if not session_id:
             continue
-        home_dir = get_session_codex_home_root(session_id)
-        if not home_dir.exists():
+        if session_id in active_ids:
             continue
-        remove_tree_if_exists(home_dir)
-        removed += 1
+        home_dir = get_session_codex_home_root(session_id)
+        if not home_dir.exists() and not home_dir.is_symlink():
+            continue
+        if remove_tree_if_exists(home_dir):
+            removed += 1
     return removed
 
 
@@ -1360,6 +1515,66 @@ def get_registry_session_file(session_id: str) -> Path:
 
 def get_managed_session_lock_file(bot_id: str, session_id: str) -> Path:
     return SESSION_LOCK_ROOT / bot_id / f"{session_id}.lock.json"
+
+
+def legacy_managed_session_lock_file(bot_id: str, session_id: str) -> Path:
+    return legacy_shared_runtime_root() / ".session-locks" / bot_id / f"{session_id}.lock.json"
+
+
+def safe_session_id(session_id: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._:-]+", str(session_id or "").strip()))
+
+
+def bot_id_from_managed_session_lock_file(lock_file: str, session_id: str) -> Optional[str]:
+    raw = str(lock_file or "").strip()
+    if not raw or not safe_session_id(session_id):
+        return None
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        return None
+    candidate_roots = [
+        SESSION_LOCK_ROOT.resolve(),
+        (legacy_shared_runtime_root() / ".session-locks").resolve(),
+    ]
+    expected_name = f"{session_id}.lock.json"
+    for root in candidate_roots:
+        try:
+            relative = resolved.relative_to(root)
+        except Exception:
+            continue
+        if len(relative.parts) == 2 and relative.parts[1] == expected_name:
+            return relative.parts[0]
+    return None
+
+
+def managed_session_lock_file_matches(bot_id: str, session_id: str, lock_file: str) -> bool:
+    raw = str(lock_file or "").strip()
+    if not raw:
+        return False
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    candidates = [
+        get_managed_session_lock_file(bot_id, session_id).resolve(),
+        legacy_managed_session_lock_file(bot_id, session_id).resolve(),
+    ]
+    return any(resolved == candidate for candidate in candidates)
+
+
+def raw_session_record_matches_bot(bot_id: str, raw: Any, *, session_file: Optional[Path] = None) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    raw_bot_id = str(raw.get("botId") or "").strip()
+    if raw_bot_id:
+        return raw_bot_id == bot_id
+    session_id = str(raw.get("sessionId") or "").strip()
+    if not session_id and session_file is not None:
+        session_id = str(session_file.stem or "").strip()
+    if not safe_session_id(session_id):
+        return False
+    return managed_session_lock_file_matches(bot_id, session_id, str(raw.get("lockFile") or "").strip())
 
 
 def workspace_slug(value: Any, fallback: str = "unknown") -> str:
@@ -1538,6 +1753,8 @@ def default_workspace_mode_for_backend(backend: str) -> str:
 
 def normalize_workspace_mode(value: Any, *, default_backend: str = "codex", fallback_for_missing: Optional[str] = None) -> str:
     mode = str(value or "").strip().lower().replace("_", "-")
+    if mode in {"none", "null"}:
+        mode = ""
     if not mode:
         mode = fallback_for_missing or default_workspace_mode_for_backend(default_backend)
     aliases = {
@@ -1565,7 +1782,26 @@ def get_session_runtime_cwd(bot: BotState, key: str, *, session_id: Optional[str
             return paths["workfile"].resolve()
         if paths["roomfile"] is not None:
             return paths["roomfile"].resolve()
+    if session_id:
+        record = read_session_record_by_id(session_id)
+        if record:
+            override = str(record.get("cwdDir") or "").strip()
+            if override:
+                return resolve_personal_cwd_for_bot(bot, override)
     return paths["workDir"].resolve()
+
+
+def resolve_personal_cwd_for_bot(bot: BotState, cwd: Any) -> Path:
+    base_dir = Path(str(bot.config.get("workDir") or DEFAULT_WORK_DIR)).expanduser().resolve()
+    candidate = Path(str(cwd or "")).expanduser()
+    resolved = (base_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    if not resolved.exists():
+        raise BridgeError(400, f"cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise BridgeError(400, f"cwd is not a directory: {resolved}")
+    if not path_contains(base_dir, resolved):
+        raise BridgeError(400, f"cwd must stay within workDir: {base_dir}")
+    return resolved
 
 
 def path_contains(candidate: Path, target: Path) -> bool:
@@ -1670,8 +1906,10 @@ def copy_missing_tree_contents_filtered(source: Path, target: Path, *, target_ro
             continue
         destination = target / child.name
         try:
+            if destination.is_symlink() and not destination.exists():
+                destination.unlink(missing_ok=True)
             if child.is_symlink():
-                if destination.exists():
+                if destination.exists() or destination.is_symlink():
                     continue
                 ensure_dir_for(destination)
                 os.symlink(os.readlink(child), destination)
@@ -1679,7 +1917,7 @@ def copy_missing_tree_contents_filtered(source: Path, target: Path, *, target_ro
             if child.is_dir():
                 copy_missing_tree_contents_filtered(child, destination, target_root=target_root)
                 continue
-            if not child.is_file() or destination.exists():
+            if not child.is_file() or destination.exists() or destination.is_symlink():
                 continue
             ensure_dir_for(destination)
             shutil.copy2(child, destination, follow_symlinks=False)
@@ -1795,7 +2033,7 @@ def get_bridge_codex_home_root() -> Path:
 
 
 def get_session_codex_home_root(session_id: str) -> Path:
-    return (get_bridge_codex_home_root() / "sessions" / workspace_slug(session_id)).resolve()
+    return get_bridge_codex_home_root() / "sessions" / workspace_slug(session_id)
 
 
 def get_user_alias_dir(alias_scope: str) -> Path:
@@ -1883,10 +2121,16 @@ def get_persisted_bot_configs_lock_file() -> Path:
     return DATA_FILE.with_name(f"{DATA_FILE.name}.lock")
 
 
+def _prepare_flock_lock_file(lock_file: Path) -> Path:
+    ensure_dir_for(lock_file)
+    if lock_file.is_symlink():
+        lock_file.unlink(missing_ok=True)
+    return lock_file
+
+
 @contextmanager
 def persisted_bot_configs_lock() -> Any:
-    lock_file = get_persisted_bot_configs_lock_file()
-    ensure_dir_for(lock_file)
+    lock_file = _prepare_flock_lock_file(get_persisted_bot_configs_lock_file())
     with open(lock_file, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -1942,25 +2186,82 @@ def mark_bot_deleted_globally(bot_id: str, wecom_bot_id: Optional[str] = None) -
     )
 
 
+def normalize_session_chat_items(items: Any, *, limit: int = MAX_PERSISTED_SESSION_CHAT_ITEMS) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if role not in {"user", "bot"} or not text:
+            continue
+        current: dict[str, Any] = {"role": role, "text": text}
+        source = str(item.get("from") or "").strip()
+        if source:
+            current["from"] = source
+        ts = normalize_optional_int(item.get("time"))
+        if ts is not None:
+            current["time"] = ts
+        normalized.append(current)
+    if len(normalized) > limit:
+        normalized = normalized[-limit:]
+    return normalized
+
+
+def trim_session_chat_in_memory(sess: SessionState, *, limit: int = MAX_SESSION_CHAT_ITEMS) -> None:
+    if len(sess.chat) > limit:
+        del sess.chat[: len(sess.chat) - limit]
+
+
+def session_recent_chat_snapshot(sess: SessionState) -> list[dict[str, Any]]:
+    return normalize_session_chat_items(sess.chat)
+
+
+def persist_session_recent_chat(sess: SessionState) -> None:
+    update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "recentChat": session_recent_chat_snapshot(sess),
+        },
+    )
+
+
+def append_session_chat_message(sess: SessionState, item: dict[str, Any], *, persist: bool = False) -> None:
+    sess.chat.append(dict(item))
+    trim_session_chat_in_memory(sess)
+    if persist:
+        persist_session_recent_chat(sess)
+
+
 def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not isinstance(record, dict):
         return None
     try:
         session_id = str(record["sessionId"]).strip()
-        bot_id = str(record["botId"]).strip()
+        bot_id = str(record.get("botId") or "").strip()
         chat_key = str(record["chatKey"]).strip()
         lock_file = str(record["lockFile"]).strip()
         created_at = int(record["createdAt"])
         updated_at = int(record.get("updatedAt") or created_at)
     except (KeyError, TypeError, ValueError):
         return None
+    if not bot_id:
+        bot_id = str(bot_id_from_managed_session_lock_file(lock_file, session_id) or "").strip()
     if not session_id or not bot_id or not chat_key or not lock_file:
+        return None
+    if not safe_session_id(session_id):
+        return None
+    if not managed_session_lock_file_matches(bot_id, session_id, lock_file):
         return None
     return {
         "sessionId": session_id,
         "botId": bot_id,
         "chatKey": chat_key,
         "lockFile": lock_file,
+        "cwdDir": str(record.get("cwdDir") or "").strip() or None,
         "createdAt": created_at,
         "updatedAt": updated_at,
         "lastRunAt": normalize_optional_int(record.get("lastRunAt")),
@@ -1970,6 +2271,7 @@ def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[
         "leaseExpiresAt": normalize_optional_int(record.get("leaseExpiresAt")),
         "activeScheduleId": str(record.get("activeScheduleId") or "").strip() or None,
         "threadId": str(record.get("threadId") or "").strip() or None,
+        "recentChat": normalize_session_chat_items(record.get("recentChat")),
     }
 
 
@@ -1997,7 +2299,35 @@ def sanitize_all_session_records() -> None:
 
 
 def read_session_record_by_id(session_id: str) -> Optional[dict[str, Any]]:
-    return normalize_session_record(read_json_file(get_registry_session_file(session_id), None))
+    session_file = get_registry_session_file(session_id)
+    raw = read_json_file(session_file, None)
+    record = normalize_session_record(raw)
+    if record is not None:
+        return record
+    if not isinstance(raw, dict):
+        return None
+    session_id_text = str(raw.get("sessionId") or session_id).strip()
+    if not safe_session_id(session_id_text):
+        return None
+    inferred_bot_id = str(raw.get("botId") or "").strip()
+    if not inferred_bot_id:
+        inferred_bot_id = str(bot_id_from_managed_session_lock_file(str(raw.get("lockFile") or "").strip(), session_id_text) or "").strip()
+    if not inferred_bot_id:
+        return None
+    inferred_chat_key = chat_key_for_session_id_from_key_root(inferred_bot_id, session_id_text)
+    if not inferred_chat_key:
+        return None
+    record = normalize_session_record(
+        {
+            **raw,
+            "sessionId": session_id_text,
+            "botId": inferred_bot_id,
+            "chatKey": inferred_chat_key,
+        }
+    )
+    if record is not None:
+        write_session_record(record)
+    return record
 
 
 def read_session_key_entry(bot_id: str, key: str) -> Optional[dict[str, Any]]:
@@ -2005,11 +2335,40 @@ def read_session_key_entry(bot_id: str, key: str) -> Optional[dict[str, Any]]:
     if not isinstance(key_entry, dict):
         return None
     session_id = str(key_entry.get("sessionId") or "").strip()
-    entry_bot_id = str(key_entry.get("botId") or "").strip()
-    chat_key = str(key_entry.get("chatKey") or "").strip()
+    entry_bot_id = str(key_entry.get("botId") or bot_id).strip()
+    chat_key = str(key_entry.get("chatKey") or key).strip()
     if not session_id or entry_bot_id != bot_id or chat_key != key:
         return None
     return {"sessionId": session_id, "botId": entry_bot_id, "chatKey": chat_key}
+
+
+def chat_key_for_session_id_from_key_root(bot_id: str, session_id: str) -> str:
+    text = str(session_id or "").strip()
+    if not safe_session_id(text):
+        return ""
+    key_root = SESSION_REGISTRY_ROOT / "keys" / bot_id
+    if not key_root.exists():
+        return ""
+    best_key = ""
+    best_sort_key: tuple[int, int, str] | None = None
+    for key_file in key_root.glob("*.json"):
+        key_entry = read_json_file(key_file, None)
+        if not isinstance(key_entry, dict):
+            continue
+        if str(key_entry.get("sessionId") or "").strip() != text:
+            continue
+        candidate_key = str(key_entry.get("chatKey") or unquote(key_file.stem)).strip()
+        if not candidate_key:
+            continue
+        sort_key = (
+            int(normalize_optional_int(key_entry.get("updatedAt")) or 0),
+            int(normalize_optional_int(key_entry.get("createdAt")) or 0),
+            candidate_key,
+        )
+        if best_sort_key is None or sort_key > best_sort_key:
+            best_sort_key = sort_key
+            best_key = candidate_key
+    return best_key
 
 
 def build_session_key_entry(record: dict[str, Any]) -> dict[str, Any]:
@@ -2029,6 +2388,19 @@ def read_session_record_by_key_unlocked(bot_id: str, key: str) -> Optional[dict[
         if not key_entry:
             continue
         record = read_session_record_by_id(key_entry["sessionId"])
+        if record is None:
+            raw_record = read_json_file(get_registry_session_file(key_entry["sessionId"]), None)
+            if raw_session_record_matches_bot(bot_id, raw_record, session_file=get_registry_session_file(key_entry["sessionId"])):
+                record = normalize_session_record(
+                    {
+                        **dict(raw_record or {}),
+                        "sessionId": key_entry["sessionId"],
+                        "botId": bot_id,
+                        "chatKey": candidate_key,
+                    }
+                )
+                if record is not None:
+                    write_session_record(record)
         if not record:
             continue
         if str(record.get("botId") or "") != bot_id or str(record.get("chatKey") or "") != candidate_key:
@@ -2063,8 +2435,10 @@ def read_session_record_by_key(bot_id: str, key: str) -> Optional[dict[str, Any]
     record = read_session_record_by_key_unlocked(bot_id, key)
     if record:
         key_file = get_registry_key_file(bot_id, key)
-        if not key_file.exists():
-            write_json_atomic(key_file, build_session_key_entry(record))
+        desired_key = build_session_key_entry(record)
+        current_key = read_json_file(key_file, None)
+        if current_key != desired_key:
+            write_json_atomic(key_file, desired_key)
         return record
     with session_key_lock(bot_id, key):
         return repair_session_record_by_key_unlocked(bot_id, key)
@@ -2076,10 +2450,21 @@ def find_session_record_by_bot_and_key(bot_id: str, key: str) -> Optional[dict[s
         return None
     candidates: list[dict[str, Any]] = []
     for session_file in sessions_root.glob("*.json"):
-        record = normalize_session_record(read_json_file(session_file, None))
-        if not record:
-            continue
-        if str(record.get("botId") or "") != bot_id or str(record.get("chatKey") or "") != key:
+        raw = read_json_file(session_file, None)
+        record = normalize_session_record(raw)
+        if record is None:
+            if not raw_session_record_matches_bot(bot_id, raw, session_file=session_file):
+                continue
+            if not isinstance(raw, dict) or str(raw.get("chatKey") or "").strip() != key:
+                continue
+            record = normalize_session_record(
+                {
+                    **raw,
+                    "sessionId": str(raw.get("sessionId") or session_file.stem).strip(),
+                    "botId": bot_id,
+                }
+            )
+        if not record or str(record.get("botId") or "") != bot_id or str(record.get("chatKey") or "") != key:
             continue
         candidates.append(record)
     if not candidates:
@@ -2088,10 +2473,50 @@ def find_session_record_by_bot_and_key(bot_id: str, key: str) -> Optional[dict[s
     return candidates[-1]
 
 
+def session_ids_referenced_by_key_root(bot_id: str) -> set[str]:
+    session_ids: set[str] = set()
+    key_root = SESSION_REGISTRY_ROOT / "keys" / bot_id
+    if not key_root.exists():
+        return session_ids
+    for key_file in key_root.glob("*.json"):
+        raw = read_json_file(key_file, None)
+        if not isinstance(raw, dict):
+            continue
+        session_id = str(raw.get("sessionId") or "").strip()
+        if safe_session_id(session_id):
+            session_file = get_registry_session_file(session_id)
+            if session_file.exists():
+                raw_session = read_json_file(session_file, None)
+                if not isinstance(raw_session, dict):
+                    continue
+                session_owner = str(raw_session.get("botId") or "").strip()
+                if session_owner:
+                    if session_owner != bot_id:
+                        continue
+                else:
+                    lock_file = str(raw_session.get("lockFile") or "").strip()
+                    if not managed_session_lock_file_matches(bot_id, session_id, lock_file):
+                        continue
+            else:
+                foreign_live_owner = next(
+                    (
+                        runtime_bot_id
+                        for runtime_bot_id, runtime_bot in BOTS.items()
+                        if runtime_bot_id != bot_id
+                        and not bot_instance_is_stale(runtime_bot)
+                        and any(sess.session_id == session_id for sess in runtime_bot.sessions.values())
+                    ),
+                    None,
+                )
+                if foreign_live_owner is not None:
+                    continue
+            session_ids.add(session_id)
+    return session_ids
+
+
 @contextmanager
 def session_key_lock(bot_id: str, key: str) -> Any:
-    lock_file = get_registry_key_lock_file(bot_id, key)
-    ensure_dir_for(lock_file)
+    lock_file = _prepare_flock_lock_file(get_registry_key_lock_file(bot_id, key))
     with open(lock_file, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -2125,9 +2550,15 @@ def create_session_record(bot: BotState, key: str) -> dict[str, Any]:
                 "botId": bot.config["id"],
                 "chatKey": key,
                 "lockFile": str(get_managed_session_lock_file(bot.config["id"], session_id)),
+                "cwdDir": (
+                    str(Path(str(bot.config.get("workDir") or DEFAULT_WORK_DIR)).expanduser().resolve())
+                    if bot_workspace_mode(bot.config) == "personal"
+                    else None
+                ),
                 "createdAt": now_ms(),
                 "updatedAt": now_ms(),
                 "status": "idle",
+                "recentChat": [],
             }
         )
         if not record:
@@ -2165,6 +2596,8 @@ def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
     for _ in range(2):
         try:
             ensure_dir_for(lock_file)
+            if lock_file.is_symlink():
+                lock_file.unlink(missing_ok=True)
             fd = os.open(str(lock_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(next_lease, ensure_ascii=False, indent=2))
@@ -2183,11 +2616,13 @@ def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
             return True
         except FileExistsError:
             current = read_lease(lock_file)
+            current = current if isinstance(current, dict) else None
             if current and current.get("instanceId") == INSTANCE_ID:
                 write_lease(lock_file, next_lease)
                 sess.lease_owned = True
                 return True
-            if not current or current.get("expiresAt", 0) <= now:
+            expires_at = normalize_optional_int(current.get("expiresAt")) if current else None
+            if not current or expires_at is None or expires_at <= now:
                 try:
                     lock_file.unlink()
                 except FileNotFoundError:
@@ -2203,6 +2638,7 @@ def renew_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
     if not sess.lease_owned:
         return False
     current = read_lease(sess.lock_file)
+    current = current if isinstance(current, dict) else None
     if not current or current.get("instanceId") != INSTANCE_ID:
         sess.lease_owned = False
         add_log(bot, f"[{key}] session lease lost")
@@ -2224,6 +2660,7 @@ def renew_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
 
 def release_session_lease(bot: BotState, key: str, sess: SessionState) -> None:
     current = read_lease(sess.lock_file)
+    current = current if isinstance(current, dict) else None
     if current and current.get("instanceId") == INSTANCE_ID:
         try:
             sess.lock_file.unlink()
@@ -2358,7 +2795,7 @@ def acquire_bot_runtime_lock(bot: BotState) -> bool:
     if bot.runtime_lock_handle is not None:
         return True
     lock_file = get_bot_runtime_lock_file(bot.config["botId"])
-    ensure_dir_for(lock_file)
+    lock_file = _prepare_flock_lock_file(lock_file)
     handle = open(lock_file, "a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2371,7 +2808,7 @@ def acquire_bot_runtime_lock(bot: BotState) -> bool:
 
 def bot_runtime_lock_held_elsewhere(wecom_bot_id: str) -> bool:
     lock_file = get_bot_runtime_lock_file(wecom_bot_id)
-    ensure_dir_for(lock_file)
+    lock_file = _prepare_flock_lock_file(lock_file)
     handle = open(lock_file, "a+", encoding="utf-8")
     try:
         try:
@@ -2396,8 +2833,8 @@ def release_bot_runtime_lock(bot: BotState) -> None:
 
 
 def message_sender_userid(message: dict[str, Any]) -> str:
-    body = message.get("body") or {}
-    return str(((body.get("from") or {}).get("userid")) or "unknown")
+    body = _as_dict(message.get("body"))
+    return str((_as_dict(body.get("from")).get("userid")) or "unknown")
 
 
 def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
@@ -2421,34 +2858,39 @@ def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
 
 def normalize_bridge_command_text(content: str, bot_name: Optional[str] = None) -> str:
     text = strip_text_mentions(content, bot_name)
-    if text.startswith("/bridge-"):
+    if text.startswith("/bridge-") or text.startswith("/cwd"):
         return text
     fallback = LEADING_MENTION_RE.sub("", content or "", count=1).strip()
-    return fallback if fallback.startswith("/bridge-") else (content or "").strip()
+    return fallback if fallback.startswith("/bridge-") or fallback.startswith("/cwd") else (content or "").strip()
 
 
 def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
-    body = message.get("body") or {}
+    body = _as_dict(message.get("body"))
     msg_type = str(body.get("msgtype") or "").strip()
     if msg_type == "text":
-        return str(((body.get("text") or {}).get("content") or "")).strip()
+        return str((_as_dict(body.get("text")).get("content") or "")).strip()
     if msg_type == "image":
-        return str(((body.get("image") or {}).get("url") or "")).strip()
+        return str((_as_dict(body.get("image")).get("url") or "")).strip()
     if msg_type == "file":
-        file_body = body.get("file") or {}
+        file_body = _as_dict(body.get("file"))
         return str(file_body.get("file_id") or file_body.get("fileId") or file_body.get("filename") or "").strip()
     if msg_type == "mixed":
-        return json.dumps(body.get("mixed") or {}, ensure_ascii=False, sort_keys=True)
+        return json.dumps(_as_dict(body.get("mixed")), ensure_ascii=False, sort_keys=True)
     return ""
 
 
 def chat_key_for_bot(bot: BotState, message: dict[str, Any]) -> str:
-    body = message.get("body") or {}
+    body = _as_dict(message.get("body"))
     raw_sender_user_id = message_sender_userid(message)
+    if raw_sender_user_id == "unknown":
+        raise BridgeError(400, "message sender userid required")
     remember_workspace_user_alias(workspace_namespace_for_bot(bot.config), raw_sender_user_id)
-    if body.get("chattype") == "group" and body.get("chatid"):
+    if body.get("chattype") == "group":
+        chat_id = str(body.get("chatid") or "").strip()
+        if not chat_id:
+            raise BridgeError(400, "group message chatid required")
         if str(bot.config.get("groupSessionMode") or "per-user") == "per-user":
-            return f"group-user:{body['chatid']}:{raw_sender_user_id}"
+            return f"group-user:{chat_id}:{raw_sender_user_id}"
         return f"group:{body['chatid']}"
     return f"single:{raw_sender_user_id}"
 
@@ -2693,7 +3135,7 @@ async def close_reply_stream_for_proactive(bot: BotState, key: str, sess: Sessio
     notice_payload = build_session_text_payload(key, sess, req_id, build_reply_window_expired_notice(), True)
     if notice_payload:
         try:
-            await send_session_ws_payload(bot, sess, notice_payload)
+            await send_session_payload(bot, sess, notice_payload)
         except Exception as exc:
             add_log(bot, f"[{key}] stream close notice skipped req_id={req_id}: {exc}")
     mark_reply_proactive(sess, req_id)
@@ -2753,12 +3195,105 @@ async def send_session_ws_payload_with_ack(
         sess.send_lock.release()
 
 
+def session_payload_ack_timeout(payload: dict[str, Any]) -> Optional[int]:
+    req_id = payload_req_id(payload)
+    if not req_id:
+        return None
+    cmd = str(payload.get("cmd") or "").strip()
+    if cmd == "aibot_send_msg":
+        return PROACTIVE_SEND_ACK_TIMEOUT_SEC
+    if cmd == "aibot_respond_msg":
+        return REPLY_SEND_ACK_TIMEOUT_SEC
+    return None
+
+
+def require_ack_success(response: dict[str, Any], stage: str, *, required_body_key: Optional[str] = None) -> dict[str, Any]:
+    raw_errcode = response.get("errcode", 0)
+    try:
+        errcode = int(raw_errcode if raw_errcode not in (None, "") else 0)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(502, f"{stage} failed: invalid errcode") from exc
+    if errcode != 0:
+        errmsg = str(response.get("errmsg") or "").strip()
+        raise BridgeError(502, f"{stage} failed: {errcode} {errmsg}".strip())
+    body = response.get("body")
+    if not isinstance(body, dict):
+        body = {}
+    if required_body_key and not body.get(required_body_key):
+        raise BridgeError(502, f"{stage} failed: missing {required_body_key}")
+    return body
+
+
+def has_explicit_zero_errcode(payload: dict[str, Any]) -> bool:
+    raw_errcode = payload.get("errcode")
+    if raw_errcode in (None, ""):
+        return False
+    try:
+        return int(raw_errcode) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def session_payload_ack_error(payload: dict[str, Any], response: dict[str, Any]) -> Optional[BridgeError]:
+    cmd = str(payload.get("cmd") or "").strip()
+    stage = "proactive send" if cmd == "aibot_send_msg" else "reply send"
+    try:
+        require_ack_success(response, stage)
+    except BridgeError as exc:
+        return exc
+    return None
+
+
+async def send_session_payload(
+    bot: BotState,
+    sess: SessionState,
+    payload: dict[str, Any],
+    *,
+    send_timeout_sec: Optional[int] = None,
+    lock_timeout_sec: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    ack_timeout_sec = session_payload_ack_timeout(payload)
+    if ack_timeout_sec:
+        response = await send_session_ws_payload_with_ack(
+            bot,
+            sess,
+            payload,
+            ack_timeout_sec,
+            send_timeout_sec=send_timeout_sec,
+            lock_timeout_sec=lock_timeout_sec,
+        )
+        error = session_payload_ack_error(payload, response)
+        if error is not None:
+            raise error
+        return response
+    await send_session_ws_payload(
+        bot,
+        sess,
+        payload,
+        send_timeout_sec=send_timeout_sec,
+        lock_timeout_sec=lock_timeout_sec,
+    )
+    return None
+
+
 def chat_key_to_send_target(key: str) -> tuple[int, str]:
-    if key.startswith("group-user:"):
-        parts = key.split(":", 2)
-        return 2, parts[1]
-    chat_type_name, chat_id = key.split(":", 1)
-    return (2 if chat_type_name == "group" else 1), chat_id
+    text = str(key or "").strip()
+    if text.startswith("group-user:"):
+        parts = text.split(":", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            return 2, parts[1]
+        raise BridgeError(400, f"invalid chat key: {key}")
+    if text.startswith("group:"):
+        room_id = text.split(":", 1)[1]
+        if room_id:
+            return 2, room_id
+        raise BridgeError(400, f"invalid chat key: {key}")
+    if text.startswith("single:"):
+        user_id = text.split(":", 1)[1]
+        if user_id:
+            return 1, user_id
+        raise BridgeError(400, f"invalid chat key: {key}")
+    raise BridgeError(400, f"invalid chat key: {key}")
 
 
 def limit_proactive_text(content: str) -> str:
@@ -2831,7 +3366,7 @@ def proactive_reply_mention_user_id(key: str, sess: SessionState, req_id: Option
 
 
 def proactive_chat_mention_user_id(key: str, mention_user_id: Optional[str] = None) -> Optional[str]:
-    explicit = str(mention_user_id or "").strip()
+    explicit = normalize_optional_string(mention_user_id) or ""
     if explicit:
         return explicit
     if key.startswith("group-user:"):
@@ -2939,7 +3474,7 @@ async def send_transient_session_status(
     if not payload or not bot.ws or bot.ws.closed:
         return False
     try:
-        await send_session_ws_payload(bot, sess, payload)
+        await send_session_payload(bot, sess, payload)
         return True
     except Exception as exc:
         add_log(bot, f"[{key}] transient status send skipped: {exc}")
@@ -2967,9 +3502,10 @@ async def send_session_status(
     if not payloads:
         return False
     if bot.ws and not bot.ws.closed:
+        failed_index: Optional[int] = None
         try:
-            for payload in payloads:
-                await send_session_ws_payload(
+            for index, payload in enumerate(payloads):
+                await send_session_payload(
                     bot,
                     sess,
                     payload,
@@ -2980,6 +3516,7 @@ async def send_session_status(
             sess.pending_stream_payloads = None
             return True
         except Exception as exc:
+            failed_index = index if 'index' in locals() else 0
             add_log(bot, f"[{key}] stream status deferred req_id={payload_req_id(payloads[-1]) or '-'}: {exc}")
             add_event_log(
                 bot,
@@ -2989,8 +3526,9 @@ async def send_session_status(
                 reqId=payload_req_id(payloads[-1]) or None,
                 reason=str(exc),
             )
-    sess.pending_stream_payload = dict(payloads[-1])
-    sess.pending_stream_payloads = clone_payload_sequence(payloads)
+    remaining_payloads = payloads[failed_index:] if 'failed_index' in locals() and failed_index is not None else payloads
+    sess.pending_stream_payload = dict(remaining_payloads[-1])
+    sess.pending_stream_payloads = clone_payload_sequence(remaining_payloads)
     return False
 
 
@@ -3029,9 +3567,10 @@ async def send_or_store_session_payloads(
     req_id = payload_req_id(outgoing_payloads[-1])
     payload_kind = "final" if final else "stream"
     if bot.ws and not bot.ws.closed:
+        failed_index: Optional[int] = None
         try:
-            for outgoing_payload in outgoing_payloads:
-                await send_session_ws_payload(bot, sess, outgoing_payload)
+            for index, outgoing_payload in enumerate(outgoing_payloads):
+                await send_session_payload(bot, sess, outgoing_payload)
             if final:
                 sess.pending_final_payload = None
                 sess.pending_final_payloads = None
@@ -3043,16 +3582,18 @@ async def send_or_store_session_payloads(
                 sess.pending_stream_payloads = None
             return True
         except Exception as exc:
+            failed_index = index if 'index' in locals() else 0
             add_log(bot, f"[{key}] {payload_kind} send deferred req_id={req_id or '-'}: {exc}")
 
+    remaining_payloads = outgoing_payloads[failed_index:] if 'failed_index' in locals() and failed_index is not None else outgoing_payloads
     if final:
-        sess.pending_final_payload = dict(outgoing_payloads[-1])
-        sess.pending_final_payloads = clone_payload_sequence(outgoing_payloads)
+        sess.pending_final_payload = dict(remaining_payloads[-1])
+        sess.pending_final_payloads = clone_payload_sequence(remaining_payloads)
         sess.pending_stream_payload = None
         sess.pending_stream_payloads = None
     else:
-        sess.pending_stream_payload = dict(outgoing_payloads[-1])
-        sess.pending_stream_payloads = clone_payload_sequence(outgoing_payloads)
+        sess.pending_stream_payload = dict(remaining_payloads[-1])
+        sess.pending_stream_payloads = clone_payload_sequence(remaining_payloads)
     add_log(bot, f"[{key}] cached {payload_kind} reply req_id={req_id or '-'}")
     return False
 
@@ -3082,15 +3623,9 @@ async def send_or_store_session_payload(
             )
     req_id = payload_req_id(outgoing_payload)
     payload_kind = "final" if final else "stream"
-    requires_ack = outgoing_payload.get("cmd") == "aibot_send_msg" and bool(req_id)
     if bot.ws and not bot.ws.closed:
         try:
-            if requires_ack:
-                response = await send_session_ws_payload_with_ack(bot, sess, outgoing_payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
-                if response.get("errcode") not in (None, 0):
-                    raise BridgeError(502, f"proactive send failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
-            else:
-                await send_session_ws_payload(bot, sess, outgoing_payload)
+            await send_session_payload(bot, sess, outgoing_payload)
             if final:
                 sess.pending_final_payload = None
                 sess.pending_final_payloads = None
@@ -3133,44 +3668,133 @@ async def flush_session_pending_payloads(bot: BotState, key: str, sess: SessionS
 
 
 async def flush_all_pending_session_payloads(bot: BotState) -> None:
+    if bot.pending_payload_flush_in_progress:
+        return
+    bot.pending_payload_flush_in_progress = True
+    try:
+        for key, sess in list(bot.sessions.items()):
+            await flush_session_pending_payloads(bot, key, sess)
+    finally:
+        bot.pending_payload_flush_in_progress = False
+
+
+def has_pending_session_payloads(bot: BotState) -> bool:
+    for sess in bot.sessions.values():
+        if sess.pending_final_payload or sess.pending_stream_payload:
+            return True
+    return False
+
+
+def find_chat_key_for_session(bot: BotState, target: SessionState) -> Optional[str]:
+    for key, sess in bot.sessions.items():
+        if sess is target:
+            return key
+    return None
+
+
+def consume_late_cached_session_payload_ack(bot: BotState, req_id: Optional[str]) -> bool:
+    req_text = str(req_id or "").strip()
+    if not req_text:
+        return False
     for key, sess in list(bot.sessions.items()):
-        await flush_session_pending_payloads(bot, key, sess)
+        cached_payloads: Optional[list[dict[str, Any]]] = None
+        payload_kind = ""
+        if sess.pending_final_payload:
+            cached_payloads = clone_payload_sequence(sess.pending_final_payloads or [sess.pending_final_payload])
+            payload_kind = "final"
+        elif sess.pending_stream_payload:
+            cached_payloads = clone_payload_sequence(sess.pending_stream_payloads or [sess.pending_stream_payload])
+            payload_kind = "stream"
+        if not cached_payloads or len(cached_payloads) != 1:
+            continue
+        cached_payload = cached_payloads[0]
+        if payload_req_id(cached_payload) != req_text:
+            continue
+        mark_session_reply_sent(bot, sess, cached_payload)
+        if payload_kind == "final":
+            sess.pending_final_payload = None
+            sess.pending_final_payloads = None
+            sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
+            add_log(bot, f"[{key}] accepted late ack for cached final reply req_id={req_text}")
+            if sess.queue and can_continue_session_queue(sess):
+                process_queue(bot, sess, key)
+        else:
+            sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
+            add_log(bot, f"[{key}] accepted late ack for cached stream reply req_id={req_text}")
+        return True
+    return False
+
+
+async def flush_pending_session_payloads_from_inbound(bot: BotState, source: str) -> None:
+    if not bot.ws or bot.ws.closed or not has_pending_session_payloads(bot):
+        return
+    try:
+        await flush_all_pending_session_payloads(bot)
+    except Exception as exc:
+        add_log(bot, f"inbound-triggered pending payload flush skipped ({source}): {exc}")
 
 
 async def respond_queued_error(bot: BotState, req_id: Optional[str], message: str) -> None:
     if not req_id:
         return
     sess = bot.reply_sessions.get(req_id)
+    key = find_chat_key_for_session(bot, sess) if sess else None
     payload = {
         "cmd": "aibot_respond_msg",
         "headers": {"req_id": req_id},
         "body": {"msgtype": "stream", "stream": {"id": sess.session_id if sess else uid(), "finish": True, "content": f"Error: {message}"}},
     }
     try:
+        if sess and key:
+            delivered = await send_or_store_session_payload(bot, key, sess, payload, True)
+            if delivered:
+                cleanup_reply_session(bot, req_id, sess)
+            return
         if sess:
-            await send_session_ws_payload(bot, sess, payload)
+            await send_session_payload(bot, sess, payload)
         else:
-            await send_ws_payload(bot, payload)
+            response = await send_ws_payload_with_ack(bot, payload, REPLY_SEND_ACK_TIMEOUT_SEC)
+            error = session_payload_ack_error(payload, response)
+            if error is not None:
+                raise error
     except Exception as exc:
         add_log(bot, f"queued error reply skipped req_id={req_id}: {exc}")
     else:
         cleanup_reply_session(bot, req_id, sess)
 
 
-async def respond_info(bot: BotState, req_id: Optional[str], message: str, final: bool = True) -> None:
+async def respond_info(
+    bot: BotState,
+    req_id: Optional[str],
+    message: str,
+    final: bool = True,
+    *,
+    cache_on_failure: bool = True,
+) -> None:
     if not req_id:
         return
     sess = bot.reply_sessions.get(req_id)
+    key = find_chat_key_for_session(bot, sess) if sess else None
     payload = {
         "cmd": "aibot_respond_msg",
         "headers": {"req_id": req_id},
         "body": {"msgtype": "stream", "stream": {"id": sess.session_id if sess else uid(), "finish": final, "content": message}},
     }
     try:
+        if sess and key and cache_on_failure:
+            delivered = await send_or_store_session_payload(bot, key, sess, payload, final)
+            if final and delivered:
+                cleanup_reply_session(bot, req_id, sess)
+            return
         if sess:
-            await send_session_ws_payload(bot, sess, payload)
+            await send_session_payload(bot, sess, payload)
         else:
-            await send_ws_payload(bot, payload)
+            response = await send_ws_payload_with_ack(bot, payload, REPLY_SEND_ACK_TIMEOUT_SEC)
+            error = session_payload_ack_error(payload, response)
+            if error is not None:
+                raise error
     except Exception as exc:
         add_log(bot, f"info reply skipped req_id={req_id}: {exc}")
         return
@@ -3285,11 +3909,7 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
             build_template_card_update_payload(req_id, update_card),
             5,
         )
-        if response.get("errcode") not in (None, 0):
-            raise BridgeError(
-                502,
-                f"template card update failed: {response.get('errcode')} {response.get('errmsg', '')}".strip(),
-            )
+        require_ack_success(response, "template card update")
         add_event_log(
             bot,
             "template_card.updated",
@@ -3323,20 +3943,25 @@ async def respond_session_info(
 
 def sanitize_file_name(name: str, fallback: str = "attachment.bin") -> str:
     base = re.sub(r"[^\w.-]+", "_", str(name or fallback).strip())
+    if base in {".", ".."}:
+        return fallback
     return base or fallback
 
 
 def build_nonconflicting_file_path(target_dir: Path, file_name: str) -> Path:
-    candidate = target_dir / file_name
-    if not candidate.exists():
+    normalized_name = Path(str(file_name or "")).name or "attachment.bin"
+    if normalized_name in {".", ".."}:
+        normalized_name = "attachment.bin"
+    candidate = target_dir / normalized_name
+    if not candidate.exists() and not candidate.is_symlink():
         return candidate
-    path = Path(file_name)
+    path = Path(normalized_name)
     stem = path.stem or "attachment"
     suffix = path.suffix
     index = 1
     while True:
         candidate = target_dir / f"{stem}-{index}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and not candidate.is_symlink():
             return candidate
         index += 1
 
@@ -3367,15 +3992,16 @@ def decode_aes_key(aes_key: str) -> Optional[bytes]:
     if not aes_key:
         return None
     raw = str(aes_key).strip()
+    if len(raw) == 32:
+        return raw.encode("utf-8")
     try:
         normalized = raw if len(raw) % 4 == 0 else raw + ("=" * (4 - (len(raw) % 4)))
         decoded = base64.b64decode(normalized)
-        if len(decoded) == 32:
+        if len(decoded) in {16, 24, 32}:
             return decoded
     except Exception:
         pass
-    utf8 = raw.encode("utf-8")
-    return utf8 if len(utf8) == 32 else None
+    return None
 
 
 def decrypt_media_buffer(buffer: bytes, aes_key: str) -> bytes:
@@ -3520,6 +4146,8 @@ def extract_mixed_text(mixed: dict[str, Any]) -> str:
     items = mixed.get("msg_item") or mixed.get("msgItem") or []
     parts = []
     for item in items:
+        if not isinstance(item, dict):
+            continue
         if item.get("msgtype") == "text":
             content = ((item.get("text") or {}).get("content") or "").strip()
             if content:
@@ -3529,7 +4157,20 @@ def extract_mixed_text(mixed: dict[str, Any]) -> str:
 
 def extract_mixed_images(mixed: dict[str, Any]) -> list[dict[str, Any]]:
     items = mixed.get("msg_item") or mixed.get("msgItem") or []
-    return [item.get("image") for item in items if item.get("msgtype") == "image" and (item.get("image") or {}).get("url")]
+    return [
+        item.get("image")
+        for item in items
+        if (
+            isinstance(item, dict)
+            and item.get("msgtype") == "image"
+            and isinstance(item.get("image"), dict)
+            and (
+                item["image"].get("url")
+                or item["image"].get("download_url")
+                or item["image"].get("downloadUrl")
+            )
+        )
+    ]
 
 
 def get_or_create_session(bot: BotState, key: str) -> SessionState:
@@ -3540,6 +4181,7 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
             work_dir=str(get_session_runtime_cwd(bot, key, session_id=record["sessionId"])),
             lock_file=Path(record["lockFile"]),
             thread_id=str(record.get("threadId") or "").strip() or None,
+            chat=list(record.get("recentChat") or []),
         )
         bot.sessions[key] = sess
         add_log(bot, f"[{key}] new session")
@@ -3587,10 +4229,8 @@ def build_prompt(
 
 
 def build_compat_history_prompt(bot: BotState, sess: SessionState, prompt: str) -> str:
-    if bot_agent_backend(bot.config) == "codex":
-        return prompt
     history_lines: list[str] = []
-    for item in sess.chat[-12:]:
+    for item in sess.chat[-MAX_COMPAT_HISTORY_ITEMS:]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip()
@@ -3944,9 +4584,7 @@ async def run_codex(
         if final_payloads:
             final_delivery_pending = not await send_or_store_session_payloads(bot, key, sess, final_payloads, True)
         add_log(bot, f"[{key}] reply completed ({len(final)} chars, exit={return_code})")
-        sess.chat.append({"role": "bot", "text": final, "time": int(time.time())})
-        if len(sess.chat) > 200:
-            del sess.chat[: len(sess.chat) - 200]
+        append_session_chat_message(sess, {"role": "bot", "text": final, "time": int(time.time())})
         update_session_record(
             sess.session_id,
             lambda record: {
@@ -3955,6 +4593,7 @@ async def run_codex(
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
                 "threadId": sess.thread_id,
+                "recentChat": session_recent_chat_snapshot(sess),
             },
         )
         if return_code == 0:
@@ -4023,9 +4662,7 @@ async def run_codex(
                 final_delivery_pending = not await send_or_store_session_payloads(bot, key, sess, error_payloads, True)
         except Exception as send_exc:
             add_log(bot, f"[{key}] failed to report codex error: {send_exc}")
-        sess.chat.append({"role": "bot", "text": error_text, "time": int(time.time())})
-        if len(sess.chat) > 200:
-            del sess.chat[: len(sess.chat) - 200]
+        append_session_chat_message(sess, {"role": "bot", "text": error_text, "time": int(time.time())})
         try:
             update_session_record(
                 sess.session_id,
@@ -4034,6 +4671,8 @@ async def run_codex(
                     "status": "error",
                     "activeScheduleId": None,
                     "lastRunAt": now_ms(),
+                    "threadId": sess.thread_id,
+                    "recentChat": session_recent_chat_snapshot(sess),
                 },
             )
         except Exception as update_exc:
@@ -4173,6 +4812,7 @@ def interrupt_session(
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
                 "threadId": sess.thread_id,
+                "recentChat": session_recent_chat_snapshot(sess),
             },
         )
     else:
@@ -4188,6 +4828,7 @@ def interrupt_session(
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
                 "threadId": sess.thread_id,
+                "recentChat": session_recent_chat_snapshot(sess),
             },
         )
 
@@ -4212,17 +4853,61 @@ async def interrupt_session_command(bot: BotState, key: str, req_id: Optional[st
         resume_session_queue(bot, sess, key, "interrupt command")
 
 
+async def cwd_session_command(bot: BotState, key: str, req_id: Optional[str], raw_argument: Optional[str]) -> None:
+    sess = get_or_create_session(bot, key)
+    if bot_workspace_mode(bot.config) != "personal":
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "仅 personal 模式支持 /cwd；team 模式不允许切换。")
+        return
+    if sess.running:
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "当前有任务在运行，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。")
+        return
+    current_cwd = get_session_runtime_cwd(bot, key, session_id=sess.session_id)
+    argument = str(raw_argument or "").strip()
+    if not argument:
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, f"Current cwd: {current_cwd}")
+        return
+    requested_path = Path(argument).expanduser()
+    resolved_argument = (current_cwd / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
+    next_cwd = resolve_personal_cwd_for_bot(bot, resolved_argument)
+    changed = next_cwd != current_cwd
+    if changed:
+        sess.thread_id = None
+        clear_resume_selection(sess)
+    update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "cwdDir": str(next_cwd),
+            "updatedAt": now_ms(),
+            "threadId": sess.thread_id,
+        },
+    )
+    sess.work_dir = str(next_cwd)
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, f"cwd changed to {next_cwd}")
+
+
 def count_scheduled_messages_for_key(bot_id: str, key: str) -> int:
     total = 0
     for root in (SCHEDULE_PENDING_ROOT, SCHEDULE_PROCESSING_ROOT):
         for pending_file in root.glob("*.json"):
             job = read_json_file(pending_file, None)
-            if (
-                isinstance(job, dict)
-                and str(job.get("botId") or "") == bot_id
-                and str(job.get("chatKey") or "") == key
-            ):
+            if not isinstance(job, dict):
+                continue
+            if str(job.get("chatKey") or "") != key:
+                continue
+            job_bot_id = str(job.get("botId") or "").strip()
+            if job_bot_id == bot_id:
                 total += 1
+                continue
+            if not job_bot_id:
+                schedule_id = str(job.get("scheduleId") or "").strip()
+                definition = read_schedule_definition(schedule_id) if schedule_id else None
+                if definition and str(definition.get("botId") or "").strip() == bot_id:
+                    total += 1
     return total
 
 
@@ -4235,7 +4920,21 @@ def session_records_for_bot(bot_id: str) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     for session_file in sessions_root.glob("*.json"):
-        record = normalize_session_record(read_json_file(session_file, None))
+        raw = read_json_file(session_file, None)
+        record = normalize_session_record(raw)
+        if record is None:
+            if raw_session_record_matches_bot(bot_id, raw, session_file=session_file):
+                session_id = str((raw or {}).get("sessionId") or session_file.stem).strip()
+                record = normalize_session_record(
+                    {
+                        **dict(raw or {}),
+                        "sessionId": session_id,
+                        "botId": bot_id,
+                        "chatKey": str((raw or {}).get("chatKey") or chat_key_for_session_id_from_key_root(bot_id, session_id)).strip(),
+                    }
+                )
+                if record is not None:
+                    write_session_record(record)
         if not record:
             continue
         if str(record.get("botId") or "") != bot_id:
@@ -4352,8 +5051,18 @@ def bind_resume_candidate_to_session(
     target_record = read_session_record_by_id(str(candidate["sessionId"]))
     if not target_record:
         raise BridgeError(404, f"session not found: {candidate['sessionId']}")
+    copied_recent_chat = [dict(item) for item in normalize_session_chat_items(target_record.get("recentChat"))]
     sess.thread_id = thread_id
-    update_session_record(sess.session_id, lambda record: {**record, "lastRunAt": now_ms()})
+    sess.chat = copied_recent_chat
+    update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "lastRunAt": now_ms(),
+            "threadId": thread_id,
+            "recentChat": copied_recent_chat,
+        },
+    )
     clear_resume_selection(sess)
     add_log(
         bot,
@@ -4452,7 +5161,8 @@ async def status_session_command(bot: BotState, key: str, req_id: Optional[str])
             f"queue={len(sess.queue)}; "
             f"scheduled={scheduled_count}; "
             f"sessionId={sess.session_id}; "
-            f"threadId={sess.thread_id or '-'}"
+            f"threadId={sess.thread_id or '-'}; "
+            f"cwd={sess.work_dir}"
         )
     elif record:
         status_text = (
@@ -4460,10 +5170,11 @@ async def status_session_command(bot: BotState, key: str, req_id: Optional[str])
             f"queue=0; "
             f"scheduled={scheduled_count}; "
             f"sessionId={record['sessionId']}; "
-            f"threadId=-"
+            f"threadId=-; "
+            f"cwd={record.get('cwdDir') or get_session_runtime_cwd(bot, key, session_id=record['sessionId'])}"
         )
     else:
-        status_text = f"status=empty; queue=0; scheduled={scheduled_count}; sessionId=-; threadId=-"
+        status_text = f"status=empty; queue=0; scheduled={scheduled_count}; sessionId=-; threadId=-; cwd=-"
     if sess:
         register_reply_session(bot, req_id, sess)
     await respond_info(bot, req_id, status_text)
@@ -4575,13 +5286,13 @@ def validate_file_for_upload(bot: BotState, key: str, file_path: str, *, session
         raise BridgeError(404, f"file not found: {resolved}")
     if not resolved.is_file():
         raise BridgeError(400, f"not a regular file: {resolved}")
-    size = resolved.stat().st_size
-    if size > MAX_UPLOAD_SIZE:
-        raise BridgeError(413, f"file too large: {size} bytes (max {MAX_UPLOAD_SIZE})")
     allowed_roots = get_allowed_file_roots(bot, key, session_id=session_id)
     if not any(is_path_inside(resolved, root) for root in allowed_roots):
         allowed = ", ".join(str(root) for root in allowed_roots)
         raise BridgeError(403, f"filePath is outside allowed roots: {allowed}")
+    size = resolved.stat().st_size
+    if size > MAX_UPLOAD_SIZE:
+        raise BridgeError(413, f"file too large: {size} bytes (max {MAX_UPLOAD_SIZE})")
     return resolved
 
 
@@ -4644,9 +5355,9 @@ def resolve_schedule_target_bot_metadata(target_config_id: Optional[str], bot_na
 def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path]:
     file_path = data.get("filePath") or data.get("file_path")
     chat_key_value = data.get("chatKey") or data.get("chat_key")
-    bot_name = data.get("botName") or data.get("bot_name")
-    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
-    session_id = data.get("sessionId") or data.get("session_id")
+    bot_name = normalize_optional_string(data.get("botName") or data.get("bot_name"))
+    target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
+    session_id = normalize_optional_string(data.get("sessionId") or data.get("session_id"))
     if not file_path:
         raise BridgeError(400, "filePath required")
     last_error: Optional[BridgeError] = None
@@ -4759,11 +5470,17 @@ async def send_reply_url_message(bot: BotState, req_id: str, payload_data: dict[
         if response.status != 200:
             raise BridgeError(502, f"response_url send failed: HTTP {response.status}")
         result = await response.json(content_type=None)
-    errcode = int(result.get("errcode", 0))
+    raw_errcode = result.get("errcode", 0)
+    try:
+        errcode = int(raw_errcode if raw_errcode not in (None, "") else 0)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(502, "response_url send failed: invalid errcode") from exc
     if errcode != 0:
         raise BridgeError(502, f"response_url send failed: {errcode} {result.get('errmsg', '')}".strip())
-    bot.reply_urls[req_id]["consumed"] = True
-    write_reply_url_state(bot)
+    current_state = bot.reply_urls.get(req_id)
+    if isinstance(current_state, dict):
+        current_state["consumed"] = True
+        write_reply_url_state(bot)
     if str(payload_data.get("msgtype") or "").strip() == "template_card":
         delivered_card = dict(body.get("template_card") or {})
         task_id = str(delivered_card.get("task_id") or "").strip()
@@ -4774,6 +5491,8 @@ async def send_reply_url_message(bot: BotState, req_id: str, payload_data: dict[
 
 
 def build_template_card_update_payload(req_id: str, template_card: dict[str, Any]) -> dict[str, Any]:
+    req_id = require_non_empty_string(req_id, "reqId")
+    template_card = validate_template_card_update_payload(template_card)
     return {
         "cmd": "aibot_respond_update_msg",
         "headers": {"req_id": req_id},
@@ -4922,6 +5641,8 @@ def register_template_card_button_texts(bot: BotState, template_card: dict[str, 
             button_texts[key] = text
     if button_texts:
         bot.template_card_button_texts[task_id] = button_texts
+    else:
+        bot.template_card_button_texts.pop(task_id, None)
 
 
 def save_template_card_delivery_meta(
@@ -4952,10 +5673,10 @@ def save_template_card_delivery_meta(
 
 def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, dict[str, Any], Optional[str]]:
     chat_key_value = data.get("chatKey") or data.get("chat_key")
-    bot_name = data.get("botName") or data.get("bot_name")
-    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
-    session_id = data.get("sessionId") or data.get("session_id")
-    reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip() or None
+    bot_name = normalize_optional_string(data.get("botName") or data.get("bot_name"))
+    target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
+    session_id = normalize_optional_string(data.get("sessionId") or data.get("session_id"))
+    reply_req_id = normalize_optional_string(data.get("replyReqId") or data.get("reply_req_id"))
     msgtype = str(data.get("msgtype") or "").strip()
     if not msgtype:
         raise BridgeError(400, "msgtype required")
@@ -4966,7 +5687,7 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
             template_card = validate_template_card_payload(data.get("templateCard"), require_interaction_task_id=False)
         except ValueError as exc:
             raise BridgeError(400, str(exc)) from exc
-        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        feedback_id = normalize_optional_string(data.get("feedbackId") or data.get("feedback_id"))
         if feedback_id is not None:
             try:
                 feedback_id = validate_feedback_id(feedback_id)
@@ -4977,7 +5698,7 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
         content = str(data.get("content") or "").strip()
         if not content:
             raise BridgeError(400, "content required")
-        feedback_id = str(data.get("feedbackId") or data.get("feedback_id") or "").strip() or None
+        feedback_id = normalize_optional_string(data.get("feedbackId") or data.get("feedback_id"))
         if feedback_id is not None:
             try:
                 feedback_id = validate_feedback_id(feedback_id)
@@ -4986,11 +5707,35 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
         payload_data = {
             "msgtype": "markdown",
             "content": content,
-            "mentionUserId": str(data.get("mentionUserId") or data.get("mention_user_id") or "").strip() or None,
+            "mentionUserId": normalize_optional_string(data.get("mentionUserId") or data.get("mention_user_id")),
             "feedbackId": feedback_id,
         }
     else:
         raise BridgeError(400, f"unsupported msgtype: {msgtype}")
+
+    if reply_req_id:
+        matching_bots = []
+        if target_config_id:
+            bot = resolve_loaded_target_bot(target_config_id, bot_name)
+            if get_reply_url_state(bot, reply_req_id):
+                matching_bots.append(bot)
+        else:
+            for candidate in BOTS.values():
+                if bot_instance_is_stale(candidate):
+                    continue
+                if get_reply_url_state(candidate, reply_req_id):
+                    if bot_name and candidate.config["name"] != bot_name:
+                        continue
+                    matching_bots.append(candidate)
+            if len(matching_bots) > 1:
+                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
+        if not matching_bots:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        bot = matching_bots[0]
+        state = get_reply_url_state(bot, reply_req_id)
+        if not state:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        return bot, str(state.get("chatKey") or ""), payload_data, reply_req_id
 
     if chat_key_value:
         try:
@@ -5028,30 +5773,6 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
     if last_error is not None:
         raise last_error
 
-    if reply_req_id:
-        matching_bots = []
-        if target_config_id:
-            bot = resolve_loaded_target_bot(target_config_id, bot_name)
-            if get_reply_url_state(bot, reply_req_id):
-                matching_bots.append(bot)
-        else:
-            for candidate in BOTS.values():
-                if bot_instance_is_stale(candidate):
-                    continue
-                if get_reply_url_state(candidate, reply_req_id):
-                    if bot_name and candidate.config["name"] != bot_name:
-                        continue
-                    matching_bots.append(candidate)
-            if len(matching_bots) > 1:
-                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
-        if not matching_bots:
-            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
-        bot = matching_bots[0]
-        state = get_reply_url_state(bot, reply_req_id)
-        if not state:
-            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
-        return bot, str(state.get("chatKey") or ""), payload_data, reply_req_id
-
     raise BridgeError(400, "chatKey or sessionId or replyReqId required")
 
 
@@ -5069,8 +5790,7 @@ async def submit_send_message_request(data: dict[str, Any], source: str = "api")
         payload = build_proactive_chat_payload(resolved_chat_key, payload_data["content"], payload_data.get("mentionUserId"))
         payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
     response = await send_ws_payload_with_ack(bot, payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
-    if response.get("errcode") not in (None, 0):
-        raise BridgeError(502, f"message send failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+    require_ack_success(response, "message send")
     if sent_template_card is not None:
         task_id = str(sent_template_card.get("task_id") or "").strip()
         if task_id:
@@ -5099,18 +5819,26 @@ async def submit_send_message_request(data: dict[str, Any], source: str = "api")
 
 
 def submit_local_send_message_request(data: dict[str, Any], source: str = "local-command") -> dict[str, Any]:
-    bot, resolved_chat_key, payload_data = resolve_message_send_request(data)
-    queue_paths = get_local_send_message_queue_paths()
-    ensure_local_send_message_dirs()
+    bot, resolved_chat_key, payload_data, reply_req_id = resolve_message_send_request(data)
+    queue_paths = get_local_send_message_queue_paths(bot.config["id"])
+    ensure_local_send_message_dirs([bot.config["id"]])
     request_id = str(data.get("requestId") or data.get("request_id") or "").strip() or uid()
-    requested_at = normalize_optional_int(data.get("requestedAt") or data.get("requested_at")) or now_ms()
-    timeout_ms = normalize_optional_int(data.get("timeoutMs") or data.get("timeout_ms")) or LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS
-    expires_at = normalize_optional_int(data.get("expiresAt") or data.get("expires_at")) or (requested_at + timeout_ms)
+    requested_at_value = data.get("requestedAt") if "requestedAt" in data else data.get("requested_at")
+    timeout_ms_value = data.get("timeoutMs") if "timeoutMs" in data else data.get("timeout_ms")
+    expires_at_value = data.get("expiresAt") if "expiresAt" in data else data.get("expires_at")
+    requested_at = normalize_optional_int(requested_at_value) or now_ms()
+    timeout_ms = normalize_optional_int(timeout_ms_value)
+    if timeout_ms is None:
+        timeout_ms = LOCAL_SEND_MESSAGE_RESULT_TIMEOUT_MS
+    expires_at = normalize_optional_int(expires_at_value)
+    if expires_at is None:
+        expires_at = requested_at + timeout_ms
     request = {
         "requestId": request_id,
         "chatKey": resolved_chat_key,
         "botName": bot.config["name"],
         "targetConfigId": bot.config["id"],
+        "replyReqId": reply_req_id,
         "msgtype": payload_data["msgtype"],
         "content": payload_data.get("content"),
         "mentionUserId": payload_data.get("mentionUserId"),
@@ -5121,7 +5849,7 @@ def submit_local_send_message_request(data: dict[str, Any], source: str = "local
         "expiresAt": expires_at,
         "source": source,
     }
-    pending_file = queue_paths["pending"] / f"{request_id}.json"
+    pending_file = local_queue_request_file_path(queue_paths["pending"], request_id)
     write_json_atomic(pending_file, request)
     add_log(bot, f"[{resolved_chat_key}] local message request accepted via {source}: {payload_data['msgtype']}")
     return {"ok": True, "requestId": request_id, "chatKey": resolved_chat_key, "msgtype": payload_data["msgtype"]}
@@ -5131,7 +5859,7 @@ def submit_file_send_request(data: dict[str, Any], source: str = "api") -> dict[
     bot, resolved_chat_key, resolved_file = resolve_file_send_request(data)
     local_request_id = str(data.get("localRequestId") or data.get("local_request_id") or "").strip() or None
     local_processing_file = str(data.get("localProcessingFile") or data.get("local_processing_file") or "").strip() or None
-    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
+    target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
     if local_request_id:
         bot.active_local_file_request_ids.add(local_request_id)
     bot.upload_queue.put_nowait(
@@ -5163,7 +5891,7 @@ def write_local_file_send_result(request_id: str, payload: dict[str, Any], queue
     ensure_dir(paths["results"])
     retain_until = normalize_optional_int(payload.get("retainUntil") or payload.get("retain_until"))
     write_json_atomic(
-        paths["results"] / f"{request_id}.json",
+        local_queue_request_file_path(paths["results"], request_id),
         {
             **payload,
             "processedAt": now_ms(),
@@ -5214,7 +5942,8 @@ def parse_optional_timestamp_ms(value: Any, label: str) -> Optional[int]:
 
 
 def parse_schedule_run_at(run_at: Any, delay_seconds: Any) -> int:
-    if delay_seconds not in (None, ""):
+    using_delay_seconds = delay_seconds not in (None, "")
+    if using_delay_seconds:
         try:
             seconds = float(delay_seconds)
         except (TypeError, ValueError) as exc:
@@ -5224,7 +5953,7 @@ def parse_schedule_run_at(run_at: Any, delay_seconds: Any) -> int:
         run_at_ms = now_ms() + int(seconds * 1000)
     else:
         run_at_ms = parse_timestamp_ms(run_at, "runAt")
-    if run_at_ms <= now_ms():
+    if run_at_ms < now_ms() or (not using_delay_seconds and run_at_ms <= now_ms()):
         raise BridgeError(400, "runAt must be in the future")
     return run_at_ms
 
@@ -5270,7 +5999,7 @@ def normalize_schedule_definition(record: Optional[dict[str, Any]]) -> Optional[
         "endAt": as_int(record.get("endAt")),
         "maxRuns": as_int(record.get("maxRuns")),
         "runCount": int(record.get("runCount") or 0),
-        "enabled": record.get("enabled", True) is not False,
+        "enabled": normalize_enabled_flag(record.get("enabled", True), status_code=500),
         "nextRunAt": as_int(record.get("nextRunAt")),
         "lastPlannedAt": as_int(record.get("lastPlannedAt")),
         "lastTriggeredAt": as_int(record.get("lastTriggeredAt")),
@@ -5506,12 +6235,42 @@ def validate_schedule_misfire_policy(policy: str) -> str:
 
 
 def resolve_schedule_target(data: dict[str, Any]) -> dict[str, Any]:
-    session_id = str(data.get("sessionId") or data.get("session_id") or "").strip()
+    session_id = normalize_optional_string(data.get("sessionId") or data.get("session_id")) or ""
     chat_key_value = str(data.get("chatKey") or data.get("chat_key") or "").strip()
-    reply_req_id = str(data.get("replyReqId") or data.get("reply_req_id") or "").strip()
-    bot_name = str(data.get("botName") or data.get("bot_name") or "").strip() or None
-    target_config_id = str(data.get("targetConfigId") or data.get("target_config_id") or "").strip() or None
+    reply_req_id = normalize_optional_string(data.get("replyReqId") or data.get("reply_req_id")) or ""
+    bot_name = normalize_optional_string(data.get("botName") or data.get("bot_name"))
+    target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
     last_error: Optional[BridgeError] = None
+
+    if reply_req_id:
+        matching_bots = []
+        if target_config_id:
+            bot = resolve_loaded_target_bot(target_config_id, bot_name)
+            if get_reply_url_state(bot, reply_req_id):
+                matching_bots.append(bot)
+        else:
+            for candidate in BOTS.values():
+                if bot_instance_is_stale(candidate):
+                    continue
+                if get_reply_url_state(candidate, reply_req_id):
+                    if bot_name and candidate.config["name"] != bot_name:
+                        continue
+                    matching_bots.append(candidate)
+            if len(matching_bots) > 1:
+                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
+        if not matching_bots:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        bot = matching_bots[0]
+        state = get_reply_url_state(bot, reply_req_id)
+        if not state:
+            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
+        return {
+            "botId": bot.config["id"],
+            "botName": bot.config["name"],
+            "sessionId": None,
+            "chatKey": str(state.get("chatKey") or ""),
+            "replyReqId": reply_req_id,
+        }
 
     if chat_key_value:
         try:
@@ -5557,36 +6316,6 @@ def resolve_schedule_target(data: dict[str, Any]) -> dict[str, Any]:
 
     if last_error is not None:
         raise last_error
-
-    if reply_req_id:
-        matching_bots = []
-        if target_config_id:
-            bot = resolve_loaded_target_bot(target_config_id, bot_name)
-            if get_reply_url_state(bot, reply_req_id):
-                matching_bots.append(bot)
-        else:
-            for candidate in BOTS.values():
-                if bot_instance_is_stale(candidate):
-                    continue
-                if get_reply_url_state(candidate, reply_req_id):
-                    if bot_name and candidate.config["name"] != bot_name:
-                        continue
-                    matching_bots.append(candidate)
-            if len(matching_bots) > 1:
-                raise BridgeError(409, f"replyReqId matches multiple bots; provide targetConfigId: {reply_req_id}")
-        if not matching_bots:
-            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
-        bot = matching_bots[0]
-        state = get_reply_url_state(bot, reply_req_id)
-        if not state:
-            raise BridgeError(404, f"reply response_url not found or expired: {reply_req_id}")
-        return {
-            "botId": bot.config["id"],
-            "botName": bot.config["name"],
-            "sessionId": None,
-            "chatKey": str(state.get("chatKey") or ""),
-            "replyReqId": reply_req_id,
-        }
 
     raise BridgeError(400, "sessionId or chatKey or replyReqId required")
 
@@ -5641,13 +6370,13 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
     if not has_cron:
         raise BridgeError(400, "cron required")
 
-    timezone_name = str(data.get("timezone") or "UTC").strip() or "UTC"
+    timezone_name = normalize_optional_string(data.get("timezone")) or "UTC"
     start_at = parse_optional_timestamp_ms(data.get("startAt") or data.get("start_at"), "startAt")
     end_at = parse_optional_timestamp_ms(data.get("endAt") or data.get("end_at"), "endAt")
     if end_at is not None and end_at <= created_at:
         raise BridgeError(400, "endAt must be in the future")
 
-    max_runs_raw = data.get("maxRuns") or data.get("max_runs")
+    max_runs_raw = data.get("maxRuns") if "maxRuns" in data else data.get("max_runs")
     max_runs = None
     if max_runs_raw not in (None, ""):
         try:
@@ -5657,9 +6386,11 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
         if max_runs <= 0:
             raise BridgeError(400, "maxRuns must be > 0")
 
-    misfire_policy = validate_schedule_misfire_policy(str(data.get("misfirePolicy") or data.get("misfire_policy") or "fire_once_now"))
+    misfire_policy = validate_schedule_misfire_policy(
+        normalize_optional_string(data.get("misfirePolicy") or data.get("misfire_policy")) or "fire_once_now"
+    )
     concurrency_policy = validate_schedule_concurrency_policy(
-        str(data.get("concurrencyPolicy") or data.get("concurrency_policy") or "skip_if_running")
+        normalize_optional_string(data.get("concurrencyPolicy") or data.get("concurrency_policy")) or "skip_if_running"
     )
 
     parse_cron_expression(cron_expr)
@@ -5673,7 +6404,7 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
 
     return normalize_schedule_definition(
         {
-            "scheduleId": data.get("scheduleId") or uid(),
+            "scheduleId": normalize_optional_string(data.get("scheduleId") or data.get("schedule_id")) or uid(),
             "botId": target["botId"],
             "botConfigId": target["botId"],
             "botName": target.get("botName"),
@@ -5707,7 +6438,9 @@ def create_schedule_definition_record(data: dict[str, Any], created_at_ms: Optio
 
 def create_one_shot_schedule_definition_record(data: dict[str, Any], created_at_ms: Optional[int] = None) -> tuple[dict[str, Any], int]:
     created_at = created_at_ms if created_at_ms is not None else now_ms()
-    requested_run_at = parse_schedule_run_at(data.get("runAt") or data.get("run_at"), data.get("delaySeconds") or data.get("delay_seconds"))
+    run_at_value = data.get("runAt") if "runAt" in data else data.get("run_at")
+    delay_seconds_value = data.get("delaySeconds") if "delaySeconds" in data else data.get("delay_seconds")
+    requested_run_at = parse_schedule_run_at(run_at_value, delay_seconds_value)
     normalized_run_at = ceil_timestamp_to_minute_ms(requested_run_at)
     schedule_data = {
         **data,
@@ -5864,7 +6597,7 @@ def cancel_pending_file_send_requests(bot: BotState, chat_key: str, session_id: 
                     continue
                 if not local_file_request_matches_target(request, chat_key, target_session_id):
                     continue
-                request_id = str(request.get("requestId") or request_file.stem).strip() or request_file.stem
+                request_id = str(request.get("requestId") or local_queue_request_id_from_job_file(request_file)).strip() or local_queue_request_id_from_job_file(request_file)
                 is_active_request = bool(request_id and request_id == active_request_id)
                 is_active_processing_file = bool(active_processing_file and str(request_file) == active_processing_file)
                 if is_active_request or is_active_processing_file:
@@ -5918,7 +6651,8 @@ def iter_due_scheduled_job_files(now: int) -> list[Path]:
             if root == SCHEDULE_PROCESSING_ROOT:
                 due.append(pending_file)
                 continue
-            if int(job.get("runAt") or 0) <= now:
+            run_at = normalize_optional_int(job.get("runAt"))
+            if run_at is None or run_at <= now:
                 due.append(pending_file)
     return due
 
@@ -5952,7 +6686,7 @@ def acquire_schedule_definition_lock(schedule_id: str) -> bool:
             existing["count"] = int(existing.get("count") or 0) + 1
             return True
         return False
-    ensure_dir_for(lock_file)
+    lock_file = _prepare_flock_lock_file(lock_file)
     handle = open(lock_file, "a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -6218,20 +6952,29 @@ async def process_scheduled_messages_once() -> None:
         if not isinstance(job, dict):
             finalize_scheduled_message_job(pending_file, False)
             continue
-        if pending_file.parent == SCHEDULE_PENDING_ROOT and int(job.get("runAt") or 0) > now:
+        run_at = normalize_optional_int(job.get("runAt"))
+        if run_at is None:
+            finalize_scheduled_message_job(pending_file, False)
             continue
-        bot = BOTS.get(str(job.get("botId") or ""))
+        if pending_file.parent == SCHEDULE_PENDING_ROOT and run_at > now:
+            continue
+        job_bot_id = str(job.get("botId") or "").strip()
+        if not job_bot_id:
+            definition = read_schedule_definition(str(job.get("scheduleId") or "").strip())
+            if definition:
+                job_bot_id = str(definition.get("botId") or "").strip()
+        bot = BOTS.get(job_bot_id)
         if not bot or not bot.config.get("enabled", True):
-            run_at = int(job.get("runAt") or 0)
             if run_at and now - run_at > SCHEDULE_ORPHAN_TTL_MS:
                 finalize_scheduled_message_job(pending_file, False)
             continue
         if bot.status != "running" or not bot.ws or bot.ws.closed:
             continue
         chat_key_value = str(job.get("chatKey") or "").strip()
+        reply_req_id = str(job.get("replyReqId") or "").strip()
         message = str(job.get("message") or "").strip()
         msgtype = str(job.get("msgtype") or "markdown").strip() or "markdown"
-        if not chat_key_value or (msgtype == "markdown" and not message):
+        if (not chat_key_value and not reply_req_id) or (msgtype == "markdown" and not message):
             finalize_scheduled_message_job(pending_file, False)
             continue
         processing_file = pending_file
@@ -6244,7 +6987,7 @@ async def process_scheduled_messages_once() -> None:
             job["enqueuedAt"] = None
             job["enqueuedByInstance"] = None
             write_json_atomic(processing_file, job)
-        enqueued_at = int(job.get("enqueuedAt") or 0)
+        enqueued_at = normalize_optional_int(job.get("enqueuedAt")) or 0
         if is_schedule_job_running(job, now):
             continue
         if enqueued_at and now - enqueued_at < SCHEDULE_PROCESSING_RETRY_MS:
@@ -6268,21 +7011,38 @@ async def process_scheduled_messages_once() -> None:
             continue
         if msgtype == "template_card":
             try:
-                reply_req_id = str(job.get("replyReqId") or "").strip() or None
+                reply_req_id = reply_req_id or None
                 result = await submit_send_message_request(
                     {
                         "replyReqId": reply_req_id,
                         "chatKey": None if reply_req_id else chat_key_value,
-                        "targetConfigId": str(job.get("botId") or "").strip() or None,
-                        "botName": str(job.get("botName") or "").strip() or None,
+                        "targetConfigId": job_bot_id or None,
+                        "botName": str(bot.config.get("name") or "").strip() or None,
                         "msgtype": "template_card",
                         "templateCard": job.get("templateCard"),
                     },
                     "scheduled-message",
                 )
                 accepted = bool(result.get("ok"))
-            except BridgeError:
+            except BridgeError as exc:
+                if 400 <= exc.status_code < 500:
+                    add_log(bot, f"[{chat_key_value}] scheduled template card failed permanently requestId={job.get('requestId')}: {exc.message}")
+                    finalize_scheduled_message_job(processing_file, False)
+                    continue
                 accepted = False
+            if accepted:
+                finalize_scheduled_message_job(processing_file, True)
+                maybe_cleanup_schedule_definition(str(job.get("scheduleId") or "").strip() or None)
+                add_log(bot, f"[{chat_key_value}] scheduled message dispatched requestId={job.get('requestId')}")
+                add_event_log(
+                    bot,
+                    "schedule.dispatched",
+                    chatKey=chat_key_value,
+                    sessionId=job.get("sessionId"),
+                    scheduleId=job.get("scheduleId"),
+                    requestId=job.get("requestId"),
+                )
+                continue
         else:
             accepted = await enqueue_message(
                 bot,
@@ -6330,7 +7090,7 @@ async def process_local_file_send_queue_once() -> None:
                 request = read_json_file(processing_file, None)
                 if not isinstance(request, dict):
                     write_local_file_send_result(
-                        processing_file.stem,
+                        local_queue_request_id_from_job_file(processing_file),
                         {"ok": False, "statusCode": 400, "error": "invalid local file-send request"},
                         queue_paths,
                     )
@@ -6339,7 +7099,7 @@ async def process_local_file_send_queue_once() -> None:
                 request, request_changed = ensure_local_file_send_request_deadline(request, processing_file)
                 if request_changed:
                     write_json_atomic(processing_file, request)
-                request_id = str(request.get("requestId") or processing_file.stem).strip() or processing_file.stem
+                request_id = str(request.get("requestId") or local_queue_request_id_from_job_file(processing_file)).strip() or local_queue_request_id_from_job_file(processing_file)
                 existing_result = read_local_file_send_result(request_id, queue_paths)
                 if existing_result is not None and isinstance(existing_result.get("ok"), bool):
                     finalize_local_file_send_job(processing_file, bool(existing_result.get("ok")))
@@ -6397,6 +7157,7 @@ async def process_local_file_send_queue_once() -> None:
 
 
 async def process_local_send_message_queue_once() -> None:
+    cleanup_stale_local_send_message_result_files()
     ensure_local_send_message_dirs(sorted(BOTS.keys()))
     for queue_paths in list_local_send_message_queue_path_groups():
         for pending_file in [*sorted(queue_paths["pending"].glob("*.json")), *sorted(queue_paths["processing"].glob("*.json"))]:
@@ -6410,14 +7171,15 @@ async def process_local_send_message_queue_once() -> None:
             request = read_json_file(processing_file, None)
             if not isinstance(request, dict):
                 write_local_send_message_result(
-                    processing_file.stem,
+                    local_queue_request_id_from_job_file(processing_file),
                     {"ok": False, "statusCode": 400, "error": "invalid local message request"},
                     queue_paths,
                 )
                 finalize_local_send_message_job(processing_file, False)
                 continue
-            request_id = str(request.get("requestId") or processing_file.stem).strip() or processing_file.stem
-            expires_at = normalize_optional_int(request.get("expiresAt") or request.get("expires_at"))
+            request_id = str(request.get("requestId") or local_queue_request_id_from_job_file(processing_file)).strip() or local_queue_request_id_from_job_file(processing_file)
+            expires_at_value = request.get("expiresAt") if "expiresAt" in request else request.get("expires_at")
+            expires_at = normalize_optional_int(expires_at_value)
             if expires_at is not None and now_ms() > expires_at:
                 write_local_send_message_result(
                     request_id,
@@ -6445,13 +7207,19 @@ async def process_local_send_message_queue_once() -> None:
 
 
 def create_request_future(bot: BotState, req_id: str) -> asyncio.Future:
+    req_text = str(req_id or "").strip()
+    if not req_text:
+        raise BridgeError(400, "req_id required")
+    existing = bot.pending_requests.get(req_text)
+    if existing is not None and not existing.done():
+        raise BridgeError(409, f"duplicate pending request: {req_text}")
     future = asyncio.get_running_loop().create_future()
-    bot.pending_requests[req_id] = future
+    bot.pending_requests[req_text] = future
     return future
 
 
 def resolve_request_future(bot: BotState, req_id: str, payload: dict[str, Any]) -> bool:
-    future = bot.pending_requests.pop(req_id, None)
+    future = bot.pending_requests.pop(str(req_id or "").strip(), None)
     if not future:
         return False
     if not future.done():
@@ -6498,9 +7266,7 @@ async def upload_and_send_file(
         },
     }
     init_response = await send_ws_payload_with_ack(bot, init_payload, 30)
-    if init_response.get("errcode") != 0 or not ((init_response.get("body") or {}).get("upload_id")):
-        raise BridgeError(502, f"upload init failed: {init_response.get('errcode')} {init_response.get('errmsg', '')}".strip())
-    upload_id = init_response["body"]["upload_id"]
+    upload_id = require_ack_success(init_response, "upload init", required_body_key="upload_id")["upload_id"]
 
     chunk_futures: list[asyncio.Future] = []
     chunk_req_ids: list[str] = []
@@ -6528,8 +7294,10 @@ async def upload_and_send_file(
             bot.pending_requests.pop(req_id, None)
         raise BridgeError(504, "upload chunk ack timeout") from exc
     for req_id, response in zip(chunk_req_ids, chunk_responses):
-        if response.get("errcode") not in (None, 0):
-            raise BridgeError(502, f"upload chunk failed: {req_id} {response.get('errcode')} {response.get('errmsg', '')}".strip())
+        try:
+            require_ack_success(response, "upload chunk")
+        except BridgeError as exc:
+            raise BridgeError(502, f"upload chunk failed: {req_id} {exc.message.removeprefix('upload chunk failed: ')}") from exc
 
     finish_payload = {
         "cmd": "aibot_upload_media_finish",
@@ -6537,10 +7305,7 @@ async def upload_and_send_file(
         "body": {"upload_id": upload_id},
     }
     finish_response = await send_ws_payload_with_ack(bot, finish_payload, 60)
-
-    media_id = ((finish_response.get("body") or {}).get("media_id"))
-    if finish_response.get("errcode") != 0 or not media_id:
-        raise BridgeError(502, f"upload finish failed: {finish_response.get('errcode')} {finish_response.get('errmsg', '')}".strip())
+    media_id = require_ack_success(finish_response, "upload finish", required_body_key="media_id")["media_id"]
 
     send_payload = {
         "cmd": "aibot_send_msg",
@@ -6550,8 +7315,7 @@ async def upload_and_send_file(
     if before_delivery:
         before_delivery()
     response = await send_ws_payload_with_ack(bot, send_payload, 30)
-    if response.get("errcode") not in (None, 0):
-        raise BridgeError(502, f"file send failed: {response.get('errcode')} {response.get('errmsg', '')}".strip())
+    require_ack_success(response, "file send")
     if after_delivery:
         after_delivery()
     add_log(bot, f"file sent: {file_name}")
@@ -6722,7 +7486,8 @@ def find_bot_by_chat_key(chat_key_value: str, bot_name: Optional[str]) -> BotSta
 
 
 def normalize_work_dir(work_dir: Optional[str]) -> str:
-    resolved = Path(work_dir or DEFAULT_WORK_DIR).expanduser().resolve()
+    normalized = normalize_optional_string(work_dir) or DEFAULT_WORK_DIR
+    resolved = Path(normalized).expanduser().resolve()
     if not resolved.exists():
         raise BridgeError(400, f"workDir not found: {resolved}")
     if not resolved.is_dir():
@@ -6732,13 +7497,16 @@ def normalize_work_dir(work_dir: Optional[str]) -> str:
 
 def normalize_group_session_mode(value: Any) -> str:
     mode = (str(value or "per-user").strip().lower() or "per-user").replace("_", "-")
+    if mode in {"none", "null"}:
+        mode = "per-user"
     if mode not in VALID_GROUP_SESSION_MODES:
         raise BridgeError(400, f"groupSessionMode must be one of: {', '.join(sorted(VALID_GROUP_SESSION_MODES))}")
     return mode
 
 
 def normalize_optional_path(value: Any, *, base_dir: Optional[Path] = None) -> str:
-    raw = str(value or "").strip()
+    normalized_text = normalize_optional_string(value)
+    raw = normalized_text or ""
     if not raw:
         return ""
     path = Path(raw).expanduser()
@@ -6751,7 +7519,35 @@ def normalize_optional_path(value: Any, *, base_dir: Optional[Path] = None) -> s
 
 def normalize_optional_string(value: Any) -> Optional[str]:
     text = str(value or "").strip()
-    return text or None
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
+def normalize_enabled_flag(value: Any, *, status_code: int) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return True
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise BridgeError(status_code, f"enabled must be a boolean, got: {value}")
+
+
+def normalize_internal_bool_flag(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def prepare_claude_bridge_runtime(
@@ -6783,6 +7579,8 @@ def env_bool(name: str, default: bool) -> bool:
     if raw is None or not raw.strip():
         return default
     value = raw.strip().lower()
+    if value in {"none", "null"}:
+        return default
     if value in {"1", "true", "yes", "on"}:
         return True
     if value in {"0", "false", "no", "off"}:
@@ -6816,7 +7614,7 @@ def read_text_file(path_value: Any, *, label: str, status_code: int = 400) -> st
 
 
 def resolve_bot_secret(data: dict[str, Any], *, status_code: int, allow_inline_secret: bool = False) -> tuple[str, str]:
-    secret = str(data.get("secret") or "").strip()
+    secret = normalize_optional_string(data.get("secret")) or ""
     secret_file = normalize_optional_path(data.get("secretFile") or data.get("secret_file"))
     if secret and secret_file:
         file_secret = read_text_file(secret_file, label="secretFile", status_code=status_code)
@@ -6847,7 +7645,7 @@ def resolve_optional_secret_file(data: dict[str, Any], *keys: str, status_code: 
 
 
 def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = False) -> dict[str, Any]:
-    bot_id = str(data.get("botId") or "").strip()
+    bot_id = normalize_optional_string(data.get("botId")) or ""
     if not bot_id:
         raise BridgeError(400, "botId required")
     secret, secret_file = resolve_bot_secret(data, status_code=400, allow_inline_secret=allow_inline_secret)
@@ -6857,30 +7655,35 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
         default_backend=agent_backend,
         fallback_for_missing="team" if any(key in data for key in ("createdAt", "created_at", "updatedAt", "updated_at")) else None,
     )
-    config_id = str(data.get("id") or "").strip() or uid()
+    config_id = normalize_optional_string(data.get("id")) or uid()
+    agent_runtime_root = normalize_optional_path(data.get("agentRuntimeRoot") or data.get("agent_runtime_root")) or None
+    if agent_runtime_root:
+        resolved_agent_runtime_root = Path(agent_runtime_root)
+        if resolved_agent_runtime_root.exists() and not resolved_agent_runtime_root.is_dir():
+            raise BridgeError(400, f"agentRuntimeRoot is not a directory: {resolved_agent_runtime_root}")
+    workspace_namespace = normalize_optional_string(data.get("workspaceNamespace") or data.get("workspace_namespace")) or config_id
     normalized = {
         "id": config_id,
-        "name": (str(data.get("name") or "unnamed").strip() or "unnamed"),
+        "name": (normalize_optional_string(data.get("name")) or "unnamed"),
         "botId": bot_id,
         "secret": secret,
         "workDir": normalize_work_dir(data.get("workDir")),
-        "workspaceNamespace": str(
-            data.get("workspaceNamespace") or data.get("workspace_namespace") or config_id or ""
-        ).strip()
-        or config_id,
-        "welcome": str(data.get("welcome") or ""),
+        "workspaceNamespace": workspace_namespace,
+        "welcome": normalize_optional_string(data.get("welcome")) or "",
         "groupSessionMode": normalize_group_session_mode(data.get("groupSessionMode") or data.get("group_session_mode")),
         "workspaceMode": workspace_mode,
         "agentBackend": agent_backend,
         "agentCommand": normalize_agent_command(data.get("agentCommand") or data.get("agent_command")),
         "agentRunAsUser": normalize_optional_run_as(data.get("agentRunAsUser") or data.get("agent_run_as_user")),
         "agentRunAsGroup": normalize_optional_run_as(data.get("agentRunAsGroup") or data.get("agent_run_as_group")),
-        "agentRuntimeRoot": normalize_optional_path(data.get("agentRuntimeRoot") or data.get("agent_runtime_root")) or None,
-        "enabled": data.get("enabled", True) is not False,
-        "restartToken": str(data.get("restartToken") or data.get("restart_token") or "").strip() or None,
+        "agentRuntimeRoot": agent_runtime_root,
+        "enabled": normalize_enabled_flag(data.get("enabled", True), status_code=400),
+        "restartToken": normalize_optional_string(data.get("restartToken") or data.get("restart_token")),
     }
     if secret_file:
         normalized["secretFile"] = secret_file
+    if normalize_internal_bool_flag(data.get("bootstrapManaged"), default=False):
+        normalized["bootstrapManaged"] = True
     return normalized
 
 
@@ -6891,6 +7694,13 @@ def normalize_persisted_bot_config(record: dict[str, Any]) -> dict[str, Any]:
             500,
             "legacy plaintext bot secrets in .bots.json are no longer supported; rewrite the bot to use secretFile or env bootstrap",
         )
+    if "botId" in normalized:
+        normalized_bot_id = normalize_optional_string(normalized.get("botId")) or ""
+        if not normalized_bot_id:
+            raise BridgeError(500, "botId required")
+        normalized["botId"] = normalized_bot_id
+    if "name" in normalized:
+        normalized["name"] = normalize_optional_string(normalized.get("name")) or "unnamed"
     legacy_secret_file = normalized.pop("secret_file", None)
     if legacy_secret_file and not normalized.get("secretFile"):
         normalized["secretFile"] = legacy_secret_file
@@ -6904,19 +7714,41 @@ def normalize_persisted_bot_config(record: dict[str, Any]) -> dict[str, Any]:
         normalized["updatedAt"] = updated_at
     else:
         normalized.pop("updatedAt", None)
-    workspace_namespace = str(
-        normalized.get("workspaceNamespace") or normalized.get("workspace_namespace") or normalized.get("id") or ""
-    ).strip()
+    workspace_namespace = normalize_optional_string(
+        normalized.get("workspaceNamespace") or normalized.get("workspace_namespace") or normalized.get("id")
+    )
     if workspace_namespace:
         normalized["workspaceNamespace"] = workspace_namespace
     else:
         normalized.pop("workspaceNamespace", None)
+    if "welcome" in normalized:
+        normalized["welcome"] = normalize_optional_string(normalized.get("welcome")) or ""
     workspace_mode = str(normalized.get("workspaceMode") or normalized.get("workspace_mode") or "").strip()
     normalized["workspaceMode"] = normalize_workspace_mode(
         workspace_mode,
         default_backend=normalized.get("agentBackend") or "codex",
         fallback_for_missing="team",
     )
+    try:
+        group_session_mode = normalized.get("groupSessionMode") or normalized.get("group_session_mode")
+        if group_session_mode not in (None, ""):
+            normalized["groupSessionMode"] = normalize_group_session_mode(group_session_mode)
+        agent_backend = normalized.get("agentBackend") or normalized.get("agent_backend")
+        if agent_backend not in (None, ""):
+            normalized["agentBackend"] = normalize_agent_backend(agent_backend)
+    except ValueError as exc:
+        raise BridgeError(500, str(exc)) from exc
+    normalized["agentCommand"] = normalize_agent_command(normalized.get("agentCommand") or normalized.get("agent_command"))
+    normalized["agentRunAsUser"] = normalize_optional_run_as(normalized.get("agentRunAsUser") or normalized.get("agent_run_as_user"))
+    normalized["agentRunAsGroup"] = normalize_optional_run_as(normalized.get("agentRunAsGroup") or normalized.get("agent_run_as_group"))
+    agent_runtime_root = normalize_optional_path(normalized.get("agentRuntimeRoot") or normalized.get("agent_runtime_root")) or None
+    normalized["agentRuntimeRoot"] = agent_runtime_root
+    if "enabled" in normalized:
+        normalized["enabled"] = normalize_enabled_flag(normalized.get("enabled"), status_code=500)
+    if normalize_internal_bool_flag(normalized.get("bootstrapManaged"), default=False):
+        normalized["bootstrapManaged"] = True
+    else:
+        normalized.pop("bootstrapManaged", None)
     return normalized
 
 
@@ -6950,19 +7782,22 @@ def load_env_bootstrap_bot_configs() -> list[dict[str, Any]]:
                 candidate["__idExplicit__"] = False
             else:
                 candidate["__idExplicit__"] = True
+            candidate["bootstrapManaged"] = True
             configs.append(candidate)
 
-    bot_id = str(os.environ.get("WECOM_BOT_ID") or "").strip()
-    secret_file = str(os.environ.get("WECOM_BOT_SECRET_FILE") or "").strip()
+    bot_id = normalize_optional_string(os.environ.get("WECOM_BOT_ID")) or ""
+    secret_file = normalize_optional_string(os.environ.get("WECOM_BOT_SECRET_FILE")) or ""
+    if bot_id and bot_tombstone_deleted_at(bot_id):
+        return configs
     if os.environ.get("WECOM_BOT_SECRET"):
         raise BridgeError(500, "WECOM_BOT_SECRET is no longer supported; use WECOM_BOT_SECRET_FILE")
     if bot_id or secret_file:
         if not bot_id or not secret_file:
             raise BridgeError(500, "WECOM_BOT_ID must be set together with WECOM_BOT_SECRET_FILE")
-        explicit_id = str(os.environ.get("WECOM_BOT_CONFIG_ID") or "").strip()
+        explicit_id = normalize_optional_string(os.environ.get("WECOM_BOT_CONFIG_ID")) or ""
         candidate = {
             "id": explicit_id or default_bot_config_id(bot_id),
-            "name": (str(os.environ.get("WECOM_BOT_NAME") or "default").strip() or "default"),
+            "name": (normalize_optional_string(os.environ.get("WECOM_BOT_NAME")) or "default"),
             "botId": bot_id,
             "workDir": str(os.environ.get("WECOM_BOT_WORK_DIR") or DEFAULT_WORK_DIR).strip() or DEFAULT_WORK_DIR,
             "workspaceNamespace": str(
@@ -6988,6 +7823,7 @@ def load_env_bootstrap_bot_configs() -> list[dict[str, Any]]:
             "enabled": env_bool("WECOM_BOT_ENABLED", True),
             "__idExplicit__": bool(explicit_id),
             "__secretSourceExplicit__": True,
+            "bootstrapManaged": True,
         }
         if secret_file:
             candidate["secretFile"] = secret_file
@@ -7016,6 +7852,7 @@ def merge_bot_configs(
         candidate = dict(raw_config)
         candidate_id_explicit = candidate.pop("__idExplicit__", True)
         candidate_secret_source_explicit = candidate.pop("__secretSourceExplicit__", False)
+        candidate_bootstrap_managed = normalize_internal_bool_flag(candidate.get("bootstrapManaged"), default=False)
         candidate_id = str(candidate.get("id") or "").strip()
         candidate_bot_id = str(candidate.get("botId") or "").strip()
         match_index = None
@@ -7040,6 +7877,8 @@ def merge_bot_configs(
             base.update(candidate)
             candidate = base
         normalized = normalize_bot_config(candidate)
+        if candidate_bootstrap_managed:
+            normalized["bootstrapManaged"] = True
         if match_index is None:
             merged.append(normalized)
             match_index = len(merged) - 1
@@ -7051,6 +7890,50 @@ def merge_bot_configs(
     return merged
 
 
+def is_bootstrap_managed_persisted_bot_config(config: dict[str, Any]) -> bool:
+    if normalize_internal_bool_flag(config.get("bootstrapManaged"), default=False):
+        return True
+    bot_id = normalize_optional_string(config.get("botId")) or ""
+    config_id = normalize_optional_string(config.get("id")) or ""
+    return bool(bot_id and config_id and config_id == default_bot_config_id(bot_id))
+
+
+def prune_stale_bootstrap_managed_persisted_bot_configs(
+    stored_configs: list[dict[str, Any]],
+    bootstrap_configs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    if not bootstrap_configs:
+        return list(stored_configs), set()
+
+    active_bootstrap_ids = {
+        str(item.get("id") or "").strip()
+        for item in bootstrap_configs
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    active_bootstrap_bot_ids = {
+        str(item.get("botId") or "").strip()
+        for item in bootstrap_configs
+        if isinstance(item, dict) and str(item.get("botId") or "").strip()
+    }
+
+    filtered: list[dict[str, Any]] = []
+    dropped_ids: set[str] = set()
+    for item in stored_configs:
+        config_id = str(item.get("id") or "").strip()
+        bot_id = str(item.get("botId") or "").strip()
+        if not config_id or not bot_id:
+            filtered.append(item)
+            continue
+        if config_id in active_bootstrap_ids or bot_id in active_bootstrap_bot_ids:
+            filtered.append(item)
+            continue
+        if is_bootstrap_managed_persisted_bot_config(item):
+            dropped_ids.add(config_id)
+            continue
+        filtered.append(item)
+    return filtered, dropped_ids
+
+
 def serialize_bot_config_for_disk(config: dict[str, Any]) -> dict[str, Any]:
     persisted = dict(config)
     persisted.pop("secret", None)
@@ -7059,6 +7942,9 @@ def serialize_bot_config_for_disk(config: dict[str, Any]) -> dict[str, Any]:
         persisted.pop("secretFile", None)
     if not str(persisted.get("appSecretFile") or "").strip():
         persisted.pop("appSecretFile", None)
+    for key in ("agentCommand", "agentRunAsUser", "agentRunAsGroup", "agentRuntimeRoot"):
+        if not str(persisted.get(key) or "").strip():
+            persisted.pop(key, None)
     return persisted
 
 
@@ -7075,11 +7961,68 @@ def serialize_bot_configs_for_disk(configs: list[dict[str, Any]]) -> list[dict[s
     return [serialize_bot_config_for_disk(item) for item in configs if isinstance(item, dict)]
 
 
+def persisted_bot_config_generation(record: dict[str, Any]) -> Optional[int]:
+    updated_at = normalize_optional_int(record.get("updatedAt") or record.get("updated_at"))
+    created_at = normalize_optional_int(record.get("createdAt") or record.get("created_at"))
+    return updated_at if updated_at is not None else created_at
+
+
+def filter_deleted_persisted_bot_config_entries(entries: list[Any]) -> list[Any]:
+    filtered: list[Any] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        wecom_bot_id = str(item.get("botId") or "").strip()
+        if wecom_bot_id:
+            deleted_at = bot_tombstone_deleted_at(wecom_bot_id)
+            if deleted_at:
+                config_generation = persisted_bot_config_generation(item)
+                if config_generation is None or config_generation <= deleted_at:
+                    continue
+        filtered.append(item)
+    return filtered
+
+
+def has_newer_persisted_bot_config_than_tombstone(bot_id: str, wecom_bot_id: str, deleted_at: int) -> bool:
+    with persisted_bot_configs_lock():
+        for item in read_persisted_bot_configs_unlocked():
+            config_id = str(item.get("id") or "").strip()
+            current_wecom_bot_id = str(item.get("botId") or "").strip()
+            if config_id != bot_id and current_wecom_bot_id != wecom_bot_id:
+                continue
+            generation = persisted_bot_config_generation(item)
+            if generation is not None and generation > deleted_at:
+                return True
+    return False
+
+
+def newer_persisted_config_uses_different_id(bot_id: str, wecom_bot_id: str, deleted_at: int) -> bool:
+    with persisted_bot_configs_lock():
+        for item in read_persisted_bot_configs_unlocked():
+            current_wecom_bot_id = str(item.get("botId") or "").strip()
+            if current_wecom_bot_id != wecom_bot_id:
+                continue
+            generation = persisted_bot_config_generation(item)
+            if generation is None or generation <= deleted_at:
+                continue
+            config_id = str(item.get("id") or "").strip()
+            if config_id and config_id != bot_id:
+                return True
+    return False
+
+
 def read_persisted_bot_config_entries_unlocked() -> list[Any]:
     stored_raw = read_json_file(DATA_FILE, [])
     if not isinstance(stored_raw, list):
         print_log(f"[INIT] invalid bot config file, ignore: {DATA_FILE}")
         return []
+    filtered_raw = filter_deleted_persisted_bot_config_entries(stored_raw)
+    if filtered_raw != stored_raw or not DATA_FILE.exists():
+        normalized_valid = normalize_persisted_bot_config_entries(filtered_raw)
+        next_entries = replace_persisted_bot_config_entries(filtered_raw, normalized_valid)
+        write_json_atomic(DATA_FILE, next_entries)
+        return next_entries
     return stored_raw
 
 
@@ -7197,12 +8140,29 @@ def upsert_persisted_bot_config(config: dict[str, Any]) -> None:
 def remove_persisted_bot_config(bot_id: str) -> None:
     with persisted_bot_configs_lock():
         stored = read_persisted_bot_configs_unlocked()
-        filtered = [item for item in stored if str(item.get("id") or "").strip() != bot_id]
-        if len(filtered) != len(stored) or not DATA_FILE.exists():
-            current_entries = read_persisted_bot_config_entries_unlocked()
-            next_entries = replace_persisted_bot_config_entries(current_entries, filtered, drop_ids={bot_id})
-            if next_entries != current_entries or not DATA_FILE.exists():
-                write_json_atomic(DATA_FILE, next_entries)
+        target_wecom_bot_id = ""
+        for item in stored:
+            if str(item.get("id") or "").strip() == bot_id:
+                target_wecom_bot_id = str(item.get("botId") or "").strip()
+                break
+        if not target_wecom_bot_id:
+            runtime_bot = BOTS.get(bot_id)
+            if runtime_bot:
+                target_wecom_bot_id = str(runtime_bot.config.get("botId") or "").strip()
+        current_entries = read_persisted_bot_config_entries_unlocked()
+        next_entries = [
+            item
+            for item in current_entries
+            if not (
+                isinstance(item, dict)
+                and (
+                    str(item.get("id") or "").strip() == bot_id
+                    or (target_wecom_bot_id and str(item.get("botId") or "").strip() == target_wecom_bot_id)
+                )
+            )
+        ]
+        if next_entries != current_entries or not DATA_FILE.exists():
+            write_json_atomic(DATA_FILE, next_entries)
 
 
 def read_persisted_bot_config(bot_id: str) -> Optional[dict[str, Any]]:
@@ -7314,12 +8274,43 @@ def clear_persisted_session_threads(bot_id: str) -> int:
 
 def invalidate_bot_session_mappings(bot_id: str) -> int:
     removed = 0
-    for record in session_records_for_bot(bot_id):
-        remove_tree_if_exists(get_chatfile_dir(str(record["sessionId"])))
-        remove_session_codex_home(str(record["sessionId"]))
-        remove_path_if_exists(Path(str(record["lockFile"])))
-        remove_path_if_exists(get_registry_session_file(str(record["sessionId"])))
-        removed += 1
+    candidate_session_ids = set(session_ids_referenced_by_key_root(bot_id))
+    sessions_root = SESSION_REGISTRY_ROOT / "sessions"
+    if sessions_root.exists():
+        for session_file in sessions_root.glob("*.json"):
+            raw = read_json_file(session_file, None)
+            if not raw_session_record_matches_bot(bot_id, raw, session_file=session_file):
+                continue
+            candidate_session_ids.update(
+                session_id
+                for session_id in {
+                    str(raw.get("sessionId") or "").strip(),
+                    str(session_file.stem or "").strip(),
+                }
+                if safe_session_id(session_id)
+            )
+            for session_id in {
+                session_id
+                for session_id in {
+                    str(raw.get("sessionId") or "").strip(),
+                    str(session_file.stem or "").strip(),
+                }
+                if safe_session_id(session_id)
+            }:
+                remove_tree_if_exists(get_chatfile_dir(session_id))
+                remove_session_codex_home(session_id)
+                remove_path_if_exists(get_managed_session_lock_file(bot_id, session_id))
+                remove_path_if_exists(legacy_managed_session_lock_file(bot_id, session_id))
+            remove_path_if_exists(session_file)
+            removed += 1
+    for session_id in candidate_session_ids:
+        remove_tree_if_exists(get_chatfile_dir(session_id))
+        remove_session_codex_home(session_id)
+        remove_path_if_exists(get_managed_session_lock_file(bot_id, session_id))
+        remove_path_if_exists(legacy_managed_session_lock_file(bot_id, session_id))
+        if get_registry_session_file(session_id).exists():
+            remove_path_if_exists(get_registry_session_file(session_id))
+            removed += 1
     key_root = SESSION_REGISTRY_ROOT / "keys" / bot_id
     if key_root.exists():
         for key_file in key_root.glob("*.json"):
@@ -7353,8 +8344,14 @@ def rebuild_scheduled_job_session_bindings(bot: BotState) -> int:
             job = read_json_file(job_file, None)
             if not isinstance(job, dict):
                 continue
-            if str(job.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+            job_bot_id = str(job.get("botId") or "").strip()
+            if job_bot_id and job_bot_id != str(bot.config.get("id") or "").strip():
                 continue
+            if not job_bot_id:
+                schedule_id = str(job.get("scheduleId") or "").strip()
+                definition = read_schedule_definition(schedule_id) if schedule_id else None
+                if not definition or str(definition.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+                    continue
             chat_key = str(job.get("chatKey") or "").strip()
             if not chat_key:
                 continue
@@ -7440,11 +8437,12 @@ def reset_bot_session_runtime_state(bot_id: str, replacement_config: Optional[di
     return cleared
 
 
-def bot_runtime_workspace_identity(config: dict[str, Any]) -> tuple[str, str, str]:
+def bot_runtime_workspace_identity(config: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(config.get("workDir") or "").strip(),
         workspace_namespace_for_bot(config),
         bot_workspace_mode(config),
+        normalize_group_session_mode(config.get("groupSessionMode") or config.get("group_session_mode") or "per-user"),
     )
 
 
@@ -7455,45 +8453,72 @@ def remove_path_if_exists(path: Path) -> None:
         pass
 
 
-def remove_tree_if_exists(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+def remove_tree_if_exists(path: Path) -> bool:
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+    if not path.exists():
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
 
 
 def clear_directory_contents(path: Path) -> None:
     if not path.exists():
         return
     for child in path.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child, ignore_errors=True)
+        if child.is_dir() or child.is_symlink():
+            remove_tree_if_exists(child)
         else:
             remove_path_if_exists(child)
+
+
+def replace_path_if_needed(path: Path) -> None:
+    if path.is_symlink():
+        remove_path_if_exists(path)
+        return
+    if path.is_dir():
+        remove_tree_if_exists(path)
 
 
 def sync_tree_contents(source: Path, target: Path) -> None:
     ensure_dir(target)
     for child in sorted(source.iterdir(), key=lambda item: item.name):
         destination = target / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination, dirs_exist_ok=True)
+        if child.is_symlink():
+            if destination.exists() or destination.is_symlink():
+                continue
+            ensure_dir_for(destination)
+            os.symlink(os.readlink(child), destination, target_is_directory=child.is_dir())
+        elif child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True, symlinks=True)
         else:
             ensure_dir_for(destination)
-            shutil.copy2(child, destination)
+            shutil.copy2(child, destination, follow_symlinks=False)
 
 
 def copy_missing_tree_contents(source: Path, target: Path) -> None:
     ensure_dir(target)
     for child in sorted(source.iterdir(), key=lambda item: item.name):
         destination = target / child.name
-        if destination.exists():
-            if child.is_dir() and destination.is_dir():
+        if child.is_symlink():
+            if destination.exists() or destination.is_symlink():
+                continue
+            ensure_dir_for(destination)
+            os.symlink(os.readlink(child), destination, target_is_directory=child.is_dir())
+            continue
+        if destination.exists() or destination.is_symlink():
+            if child.is_dir() and destination.is_dir() and not destination.is_symlink():
                 copy_missing_tree_contents(child, destination)
             continue
         if child.is_dir():
-            shutil.copytree(child, destination)
+            shutil.copytree(child, destination, symlinks=True)
         else:
             ensure_dir_for(destination)
-            shutil.copy2(child, destination)
+            shutil.copy2(child, destination, follow_symlinks=False)
 
 
 def clone_payload_sequence(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -7506,7 +8531,7 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
     ensure_dir(bridge_home)
 
     allowed_root_files = {"auth.json", "config.toml", "version.json", "installation_id"}
-    if base_home.exists():
+    if base_home.exists() and base_home.is_dir():
         for child in sorted(base_home.iterdir(), key=lambda item: item.name):
             # Skip volatile runtime trees. They are recreated per session and may
             # contain short-lived sandbox binaries that disappear while copying.
@@ -7522,6 +8547,7 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
                     continue
             except FileNotFoundError:
                 pass
+            replace_path_if_needed(destination)
             ensure_dir_for(destination)
             shutil.copy2(child, destination)
 
@@ -7533,7 +8559,7 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
             remove_path_if_exists(skills_link)
         else:
             remove_tree_if_exists(skills_link)
-    if (base_home / "skills").exists():
+    if (base_home / "skills").exists() and (base_home / "skills").is_dir():
         os.symlink((base_home / "skills"), skills_link, target_is_directory=True)
     else:
         ensure_dir(skills_link)
@@ -7541,46 +8567,136 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
 
 
 def cleanup_bot_session_storage(bot_id: str) -> None:
+    candidate_session_ids = set(session_ids_referenced_by_key_root(bot_id))
     sessions_root = SESSION_REGISTRY_ROOT / "sessions"
     if sessions_root.exists():
         for session_file in sessions_root.glob("*.json"):
-            record = normalize_session_record(read_json_file(session_file, None))
-            if not record or str(record.get("botId") or "") != bot_id:
+            raw = read_json_file(session_file, None)
+            if not raw_session_record_matches_bot(bot_id, raw, session_file=session_file):
                 continue
-            remove_path_if_exists(Path(record["lockFile"]))
-            remove_session_codex_home(record["sessionId"])
-            remove_tree_if_exists(get_chatfile_dir(str(record["sessionId"])))
+            candidate_session_ids.update(
+                session_id
+                for session_id in {
+                    str(raw.get("sessionId") or "").strip(),
+                    str(session_file.stem or "").strip(),
+                }
+                if safe_session_id(session_id)
+            )
+            for session_id in {
+                session_id
+                for session_id in {
+                    str(raw.get("sessionId") or "").strip(),
+                    str(session_file.stem or "").strip(),
+                }
+                if safe_session_id(session_id)
+            }:
+                remove_path_if_exists(get_managed_session_lock_file(bot_id, session_id))
+                remove_path_if_exists(legacy_managed_session_lock_file(bot_id, session_id))
+                remove_session_codex_home(session_id)
+                remove_tree_if_exists(get_chatfile_dir(session_id))
             remove_path_if_exists(session_file)
+    for session_id in candidate_session_ids:
+        remove_path_if_exists(get_managed_session_lock_file(bot_id, session_id))
+        remove_path_if_exists(legacy_managed_session_lock_file(bot_id, session_id))
+        remove_session_codex_home(session_id)
+        remove_tree_if_exists(get_chatfile_dir(session_id))
+        remove_path_if_exists(get_registry_session_file(session_id))
     remove_tree_if_exists(SESSION_REGISTRY_ROOT / "keys" / bot_id)
     remove_tree_if_exists(SESSION_LOCK_ROOT / bot_id)
 
 
-def cleanup_bot_schedule_jobs(bot_id: str) -> None:
+def cleanup_bot_schedule_jobs(bot_id: str, *, schedule_ids: Optional[set[str]] = None) -> None:
+    target_schedule_ids = {str(item).strip() for item in (schedule_ids or set()) if str(item).strip()}
     for root in (SCHEDULE_PENDING_ROOT, SCHEDULE_PROCESSING_ROOT, SCHEDULE_DONE_ROOT, SCHEDULE_FAILED_ROOT):
         if not root.exists():
             continue
         for job_file in root.glob("*.json"):
             job = read_json_file(job_file, None)
-            if isinstance(job, dict) and str(job.get("botId") or "") == bot_id:
+            if not isinstance(job, dict):
+                continue
+            job_bot_id = str(job.get("botId") or "").strip()
+            schedule_id = str(job.get("scheduleId") or "").strip()
+            if job_bot_id == bot_id or (not job_bot_id and schedule_id in target_schedule_ids):
                 remove_path_if_exists(job_file)
 
 
 def cleanup_bot_schedule_definitions(bot_id: str) -> None:
     schedule_ids = [item["scheduleId"] for item in list_schedule_definitions() if str(item.get("botId") or "") == bot_id]
+    removed_schedule_ids: set[str] = {str(item).strip() for item in schedule_ids if str(item).strip()}
+    referenced_schedule_ids: set[str] = set(removed_schedule_ids)
+    for root in (SCHEDULE_PENDING_ROOT, SCHEDULE_PROCESSING_ROOT, SCHEDULE_DONE_ROOT, SCHEDULE_FAILED_ROOT):
+        if not root.exists():
+            continue
+        for job_file in root.glob("*.json"):
+            raw_job = read_json_file(job_file, None)
+            if not isinstance(raw_job, dict) or str(raw_job.get("botId") or "").strip() != bot_id:
+                continue
+            schedule_id = str(raw_job.get("scheduleId") or "").strip()
+            if schedule_id:
+                referenced_schedule_ids.add(schedule_id)
     for schedule_id in schedule_ids:
         delete_schedule_definition(schedule_id)
         remove_path_if_exists(get_schedule_definition_lock_file(schedule_id))
-    cleanup_bot_schedule_jobs(bot_id)
+    for definition_file in SCHEDULE_DEFINITION_ROOT.glob("*.json"):
+        raw = read_json_file(definition_file, None)
+        if isinstance(raw, dict):
+            schedule_id = str(raw.get("scheduleId") or "").strip()
+            if not schedule_id:
+                schedule_id = unquote(definition_file.stem).strip()
+            raw_bot_id = str(raw.get("botId") or "").strip()
+            owner_matches = raw_bot_id == bot_id
+            linked_from_jobs = bool(schedule_id and schedule_id in referenced_schedule_ids)
+            if not owner_matches and not (not raw_bot_id and linked_from_jobs):
+                continue
+        else:
+            schedule_id = unquote(definition_file.stem).strip()
+            if not schedule_id or schedule_id not in referenced_schedule_ids:
+                continue
+        if not schedule_id:
+            continue
+        if schedule_id and schedule_id in schedule_ids:
+            continue
+        if schedule_id:
+            removed_schedule_ids.add(schedule_id)
+        remove_path_if_exists(definition_file)
+        if schedule_id:
+            remove_path_if_exists(get_schedule_definition_lock_file(schedule_id))
+    cleanup_bot_schedule_jobs(bot_id, schedule_ids=removed_schedule_ids)
 
 
 async def remove_deleted_bots_from_memory_once() -> None:
     for bot_id, bot in list(BOTS.items()):
         if not bot_instance_is_stale(bot):
             continue
+        wecom_bot_id = str(bot.config.get("botId") or "").strip()
+        deleted_at = bot_tombstone_deleted_at(wecom_bot_id) if wecom_bot_id else 0
+        preserve_recreated_state = bool(
+            wecom_bot_id
+            and deleted_at > 0
+            and has_newer_persisted_bot_config_than_tombstone(bot_id, wecom_bot_id, deleted_at)
+        )
+        preserve_with_new_config_id = bool(
+            preserve_recreated_state
+            and wecom_bot_id
+            and deleted_at > 0
+            and newer_persisted_config_uses_different_id(bot_id, wecom_bot_id, deleted_at)
+        )
+        workspace_namespace = workspace_namespace_for_bot(bot.config)
         bot.config["enabled"] = False
         await stop_bot(bot_id, persist_disable=False, reason="deleted_bot_reaper")
+        if not preserve_recreated_state:
+            remove_persisted_bot_config(bot_id)
+            cleanup_bot_schedule_definitions(bot_id)
+            cleanup_bot_session_storage(bot_id)
+            cleanup_workspace_namespace_if_unused(workspace_namespace, excluding_bot_id=bot_id)
+        elif preserve_with_new_config_id:
+            cleanup_bot_schedule_definitions(bot_id)
+            cleanup_bot_session_storage(bot_id)
+            cleanup_workspace_namespace_if_unused(workspace_namespace, excluding_bot_id=bot_id)
         BOTS.pop(bot_id, None)
         PREPARED_PREVIOUS_BOT_CONFIGS.pop(bot_id, None)
+        if not preserve_recreated_state or preserve_with_new_config_id:
+            delete_template_card_state(bot_id)
 
 
 def bot_secret_source(config: dict[str, Any]) -> str:
@@ -7645,6 +8761,7 @@ def prepare_bot_configs() -> list[dict[str, Any]]:
     with persisted_bot_configs_lock():
         stored = filter_deleted_persisted_bot_configs(read_persisted_bot_configs_unlocked())
         bootstrap = filter_deleted_bot_configs(raw_bootstrap)
+        stored, dropped_bootstrap_managed_ids = prune_stale_bootstrap_managed_persisted_bot_configs(stored, bootstrap)
         runtime_payload = stored if not bootstrap else merge_bot_configs(stored, bootstrap)
         seen_bot_ids: dict[str, str] = {}
         for item in runtime_payload:
@@ -7670,10 +8787,16 @@ def prepare_bot_configs() -> list[dict[str, Any]]:
             for item in runtime_payload
             if isinstance(item, dict)
         ]
-        persisted_payload = serialize_bot_configs_for_disk(stamped_runtime_payload)
-        current_persisted = serialize_bot_configs_for_disk(stored)
-        if persisted_payload != current_persisted or not DATA_FILE.exists():
-            write_persisted_bot_configs_unlocked(stamped_runtime_payload)
+        current_entries = read_persisted_bot_config_entries_unlocked()
+        next_entries = replace_persisted_bot_config_entries(
+            current_entries,
+            stamped_runtime_payload,
+            drop_ids=dropped_bootstrap_managed_ids,
+        )
+        if next_entries != current_entries or not DATA_FILE.exists():
+            write_json_atomic(DATA_FILE, next_entries)
+        if dropped_bootstrap_managed_ids:
+            print_log(f"[INIT] pruned {len(dropped_bootstrap_managed_ids)} stale bootstrap bot config(s)")
     if bootstrap:
         print_log(f"[INIT] bootstrapped {len(bootstrap)} bot config(s) from env")
     return runtime_payload
@@ -7784,31 +8907,63 @@ async def remove_bot(bot_id: str) -> None:
 
 
 async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
+    if not isinstance(message, dict):
+        return
     bot.last_inbound_at_ms = now_ms()
     if WECOM_RAW_INBOUND_LOG_ENABLED:
         add_log(bot, f"raw inbound: {summarize_inbound_payload(message)}")
-    req_id = ((message.get("headers") or {}).get("req_id"))
+    headers = _as_dict(message.get("headers"))
+    body = _as_dict(message.get("body"))
+    req_id = headers.get("req_id")
+    inbound_chat_key: Optional[str] = None
+    try:
+        inbound_chat_key = chat_key_for_bot(bot, message)
+    except BridgeError:
+        inbound_chat_key = None
     if req_id:
         response_url = extract_response_url(message)
-        if response_url:
-            save_reply_url(bot, str(req_id), chat_key_for_bot(bot, message), response_url)
+        if response_url and inbound_chat_key:
+            save_reply_url(bot, str(req_id), inbound_chat_key, response_url)
     if req_id and resolve_request_future(bot, req_id, message):
         if str(message.get("cmd") or "").strip().lower() == "ping":
             bot.last_heartbeat_ack_at_ms = bot.last_inbound_at_ms
+        await flush_pending_session_payloads_from_inbound(bot, "resolved_request")
         return
 
     if message.get("errcode") is not None and not message.get("cmd"):
-        body = message.get("body") or {}
-        if message.get("errcode") != 0:
+        if not has_explicit_zero_errcode(message):
             add_log(bot, f"WeCom response error: {message.get('errcode')} {message.get('errmsg', '')}")
+        else:
+            if req_id and consume_late_cached_session_payload_ack(bot, req_id):
+                return
+            await flush_pending_session_payloads_from_inbound(bot, "ack_only")
+        return
+
+    command = message.get("cmd")
+    msg_type = body.get("msgtype")
+    if command == "aibot_event_callback" and msg_type == "event":
+        event = _as_dict(body.get("event"))
+        if str(event.get("eventtype") or "").strip() == "disconnected_event":
+            bot.status = "disconnected"
+            bot.last_disconnect_at_ms = now_ms()
+            add_log(bot, "recv disconnected event from WeCom, closing websocket")
+            add_event_log(bot, "wecom.disconnected_event")
+            try:
+                if bot.ws and not bot.ws.closed:
+                    await bot.ws.close()
+            except Exception as exc:
+                add_log(bot, f"close websocket after disconnected event failed: {exc}")
+            return
+
+    if inbound_chat_key is None:
         return
 
     event_key = (
-        (message.get("body") or {}).get("msgid")
+        body.get("msgid")
         or (
-            f"{((message.get('headers') or {}).get('req_id') or '')}:"
-            f"{((message.get('body') or {}).get('msgtype') or '')}:"
-            f"{chat_key_for_bot(bot, message)}:"
+            f"{(headers.get('req_id') or '')}:"
+            f"{(body.get('msgtype') or '')}:"
+            f"{inbound_chat_key}:"
             f"{message_sender_userid(message)}:"
             f"{dedupe_content_fingerprint(message)}"
         )
@@ -7819,14 +8974,11 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         return
     RECENT_EVENTS[event_key] = time.time() + RECENT_EVENT_TTL
 
-    command = message.get("cmd")
-    body = message.get("body") or {}
-    msg_type = body.get("msgtype")
-
     if command == "aibot_msg_callback" and msg_type == "text":
-        content = strip_text_mentions(((body.get("text") or {}).get("content") or ""), bot.config.get("name"))
-        command_text = normalize_bridge_command_text(((body.get("text") or {}).get("content") or ""), bot.config.get("name"))
-        key = chat_key_for_bot(bot, message)
+        text_body = _as_dict(body.get("text"))
+        content = strip_text_mentions((text_body.get("content") or ""), bot.config.get("name"))
+        command_text = normalize_bridge_command_text((text_body.get("content") or ""), bot.config.get("name"))
+        key = inbound_chat_key
         add_log(bot, f'recv: "{content}" {key}')
         try:
             if command_text == "/bridge-resume":
@@ -7834,6 +8986,12 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
                 return
             if command_text.startswith("/bridge-resume "):
                 await resume_session_command(bot, key, req_id, command_text.split(None, 1)[1].strip())
+                return
+            if command_text == "/cwd":
+                await cwd_session_command(bot, key, req_id, None)
+                return
+            if command_text.startswith("/cwd "):
+                await cwd_session_command(bot, key, req_id, command_text.split(None, 1)[1])
                 return
             if command_text == "/bridge-interrupt":
                 await interrupt_session_command(bot, key, req_id)
@@ -7872,7 +9030,8 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         await enqueue_mixed_message(bot, message)
         return
 
-    if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "enter_chat"):
+    event = _as_dict(body.get("event"))
+    if command == "aibot_event_callback" and (event.get("eventtype") == "enter_chat"):
         welcome = bot.config.get("welcome") or "Send me a message and I will route it to Codex."
         await send_ws_payload(
             bot,
@@ -7884,11 +9043,11 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         )
         return
 
-    if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "template_card_event"):
+    if command == "aibot_event_callback" and (event.get("eventtype") == "template_card_event"):
         await handle_template_card_event(bot, message)
         return
 
-    if command == "aibot_event_callback" and ((body.get("event") or {}).get("eventtype") == "disconnected_event"):
+    if command == "aibot_event_callback" and (event.get("eventtype") == "disconnected_event"):
         bot.status = "disconnected"
         bot.last_disconnect_at_ms = now_ms()
         add_log(bot, "WeCom disconnected event received")
@@ -7973,7 +9132,7 @@ async def bot_runner(bot: BotState) -> None:
                 try:
                     response = await asyncio.wait_for(sub_future, 30)
                     add_log(bot, f"subscribe response: {json.dumps(response, ensure_ascii=False)}")
-                    if response.get("errcode") == 0:
+                    if has_explicit_zero_errcode(response):
                         bot.status = "running"
                         bot.last_subscribed_at_ms = now_ms()
                         bot.stop_reason = None
@@ -8107,12 +9266,14 @@ async def enqueue_message(
             "scheduleRequestId": schedule_request_id,
         }
     )
-    sess.chat.append({"role": "user", "text": text, "from": key, "time": int(time.time())})
-    if len(sess.chat) > 200:
-        del sess.chat[: len(sess.chat) - 200]
+    append_session_chat_message(
+        sess,
+        {"role": "user", "text": text, "from": key, "time": int(time.time())},
+        persist=True,
+    )
     if queue_position > 1:
         if req_id:
-            await respond_info(bot, req_id, build_queued_proactive_notice(queue_position))
+            await respond_info(bot, req_id, build_queued_proactive_notice(queue_position), cache_on_failure=False)
             mark_reply_proactive(sess, req_id)
         else:
             await send_transient_session_status(bot, key, sess, req_id, build_queue_status_text(queue_position))
@@ -8204,7 +9365,13 @@ async def session_recycler_loop() -> None:
         try:
             await asyncio.sleep(60)
             now = time.time()
-            cleanup_stale_session_codex_homes(int(now * 1000))
+            active_session_ids = {
+                sess.session_id
+                for bot in list(BOTS.values())
+                for sess in bot.sessions.values()
+                if str(sess.session_id or "").strip()
+            }
+            cleanup_stale_session_codex_homes(int(now * 1000), active_session_ids=active_session_ids)
             for bot in list(BOTS.values()):
                 for key, sess in list(bot.sessions.items()):
                     if not sess.running and now - sess.last_active > SESSION_TTL:
@@ -8246,7 +9413,7 @@ async def local_send_message_loop() -> None:
     while not SHUTDOWN_EVENT.is_set():
         try:
             await process_local_send_message_queue_once()
-            await asyncio.sleep(LOCAL_FILE_SEND_POLL_MS / 1000)
+            await asyncio.sleep(LOCAL_SEND_MESSAGE_POLL_MS / 1000)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8299,8 +9466,29 @@ async def paused_session_recovery_loop() -> None:
 
 
 async def reconcile_bots_once() -> None:
+    raw_bootstrap = load_env_bootstrap_bot_configs()
     with persisted_bot_configs_lock():
         persisted_configs = filter_deleted_persisted_bot_configs(read_persisted_bot_configs_unlocked())
+        bootstrap_configs = filter_deleted_bot_configs(raw_bootstrap)
+        persisted_configs, dropped_bootstrap_managed_ids = prune_stale_bootstrap_managed_persisted_bot_configs(
+            persisted_configs,
+            bootstrap_configs,
+        )
+        if dropped_bootstrap_managed_ids:
+            current_entries = read_persisted_bot_config_entries_unlocked()
+            next_entries = [
+                item
+                for item in current_entries
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("id") or "").strip() in dropped_bootstrap_managed_ids
+                )
+            ]
+            if next_entries != current_entries or not DATA_FILE.exists():
+                write_json_atomic(DATA_FILE, next_entries)
+            print_log(f"[SYNC] pruned {len(dropped_bootstrap_managed_ids)} stale bootstrap bot config(s)")
+        if bootstrap_configs:
+            persisted_configs = merge_bot_configs(persisted_configs, bootstrap_configs)
     desired_by_id: dict[str, dict[str, Any]] = {}
     for stored in persisted_configs:
         try:
@@ -8797,6 +9985,19 @@ async def api_healthz(_: web.Request) -> web.Response:
     )
 
 
+async def api_livez(_: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "ok": not SHUTDOWN_EVENT.is_set(),
+            "name": "WeCom Codex Bridge Python",
+            "instanceId": INSTANCE_ID,
+            "shutdown": SHUTDOWN_EVENT.is_set(),
+            "botCount": len([bot for bot in BOTS.values() if not bot_instance_is_stale(bot)]),
+        },
+        status=200 if not SHUTDOWN_EVENT.is_set() else 503,
+    )
+
+
 async def app_cleanup(_: web.Application) -> None:
     SHUTDOWN_EVENT.set()
     for bot_id in list(BOTS.keys()):
@@ -8808,6 +10009,7 @@ async def app_cleanup(_: web.Application) -> None:
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", api_root)
+    app.router.add_get("/livez", api_livez)
     app.router.add_get("/healthz", api_healthz)
     app.router.add_get("/api/bots", api_get_bots)
     app.router.add_post("/api/bots", api_add_bot)

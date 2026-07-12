@@ -7,7 +7,7 @@ from .models import ResolvedSkillSpace, SkillDefinition, SkillLayer
 
 def discover_skills(root_dir: Path | str, *, layer_name: str) -> dict[str, SkillDefinition]:
     root = Path(root_dir).expanduser().resolve()
-    if not root.exists():
+    if not root.exists() or not root.is_dir():
         return {}
 
     discovered: dict[str, SkillDefinition] = {}

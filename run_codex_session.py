@@ -10,6 +10,11 @@ from workspace_bridge.runner import build_runner_invocation, run_invocation
 from workspace_bridge.runtime import build_bot_config, prepare_session_run
 
 
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=__import__("sys").stderr)
+    raise SystemExit(code)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a workspace-backed Codex session.")
     parser.add_argument("--bot-id", required=True)
@@ -19,19 +24,29 @@ def main() -> int:
     parser.add_argument("--chatfile-root", required=True)
     parser.add_argument("--chat-key", required=True)
     parser.add_argument("--message", required=True)
-    parser.add_argument("--output-file", required=True)
+    parser.add_argument("--output-file")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    bot = build_bot_config(
-        bot_id=args.bot_id,
-        bot_name=args.bot_name,
-        source_dir=args.source_dir,
-        runtime_root=args.runtime_root,
-        chatfile_root=args.chatfile_root,
-    )
-    launch = prepare_session_run(bot, args.chat_key)
-    prompt = build_prompt(bot, launch, args.message)
+    try:
+        source_dir = Path(args.source_dir).expanduser().resolve()
+        if not source_dir.exists():
+            fail(f"source-dir does not exist: {source_dir}", 4)
+        if not source_dir.is_dir():
+            fail(f"source-dir is not a directory: {source_dir}", 4)
+        bot = build_bot_config(
+            bot_id=args.bot_id,
+            bot_name=args.bot_name,
+            source_dir=source_dir,
+            runtime_root=args.runtime_root,
+            chatfile_root=args.chatfile_root,
+        )
+        launch = prepare_session_run(bot, args.chat_key)
+        prompt = build_prompt(bot, launch, args.message)
+    except ValueError as exc:
+        fail(str(exc), 4)
+    except Exception as exc:
+        fail(str(exc) or "unexpected error", 1)
 
     if args.dry_run:
         payload = {
@@ -46,8 +61,13 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    invocation = build_runner_invocation(launch, prompt=prompt, output_file=Path(args.output_file).expanduser().resolve())
-    result = run_invocation(invocation)
+    if not str(args.output_file or "").strip():
+        fail("--output-file is required unless --dry-run is used", 4)
+    try:
+        invocation = build_runner_invocation(launch, prompt=prompt, output_file=Path(args.output_file).expanduser().resolve())
+        result = run_invocation(invocation)
+    except Exception as exc:
+        fail(str(exc) or "unexpected error", 1)
     print(
         json.dumps(
             {

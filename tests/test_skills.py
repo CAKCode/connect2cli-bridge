@@ -47,3 +47,12 @@ def test_resolve_skill_space_handles_missing_roots(tmp_path: Path) -> None:
 
     assert len(resolved.layers) == 2
     assert resolved.effective_skills == {}
+
+
+def test_discover_skills_returns_empty_for_file_root(tmp_path: Path) -> None:
+    root_file = tmp_path / "skills.txt"
+    root_file.write_text("not a dir", encoding="utf-8")
+
+    skills = discover_skills(root_file, layer_name="workspace")
+
+    assert skills == {}

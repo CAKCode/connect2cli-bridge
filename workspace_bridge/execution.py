@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -18,15 +19,24 @@ from .async_utils import run_blocking
 from .prompting import build_prompt
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
-from .runtime import prepare_session_run, update_session_record
-from .schedule import advance_schedule_definition_after_success, schedule_done_root, schedule_failed_root, schedule_pending_root
+from .runtime import append_session_record_chat_message, prepare_session_run, update_session_record
+from .schedule import (
+    advance_schedule_definition_after_success,
+    schedule_done_marker_file,
+    schedule_done_root,
+    schedule_failed_marker_file,
+    schedule_failed_root,
+    schedule_pending_root,
+)
 from .messaging import get_messaging_provider
 from .models import OutboundMessage
 from .wecom_protocol import build_text_response_payloads
-from .wecom_upload import ws_send_json
+from .wecom_upload import require_ack_ok, send_ws_payload_with_ack, ws_send_json
 
 STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
+PROACTIVE_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("PROACTIVE_SEND_ACK_TIMEOUT_SEC", "10")))
+REPLY_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("REPLY_SEND_ACK_TIMEOUT_SEC", "10")))
 _RESUME_STATE_MISSING_RE = re.compile(
     r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found|No conversation found with session ID:",
     re.I,
@@ -75,6 +85,13 @@ def _touch_session_failure(runtime_root: Path | str, session_id: str) -> None:
     )
 
 
+def _write_marker_file(path: Path, payload: str = "{}") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _resume_fallback_error_text(stderr_text: str, prompt_error: Exception | None = None) -> str:
     parts = [str(stderr_text or "").strip()]
     if prompt_error is not None:
@@ -87,18 +104,14 @@ def _agent_backend(config_or_bot) -> str:
 
 
 def _build_compat_history_prompt(bot_or_runtime, launch, message, prompt: str) -> str:
-    backend = _agent_backend(bot_or_runtime)
-    if backend == "codex":
-        return prompt
-
     history_lines: list[str] = []
     session_history = []
     if hasattr(bot_or_runtime, "sessions"):
         session = getattr(bot_or_runtime, "sessions", {}).get(message.chat_key)
         if session is not None:
             session_history = list(getattr(session, "chat", []) or [])
-    if not session_history and hasattr(bot_or_runtime, "active_message_tasks"):
-        session_history = []
+    if not session_history:
+        session_history = list(getattr(launch.session, "recent_chat", ()) or [])
     if not session_history:
         return prompt
 
@@ -204,19 +217,27 @@ def _finalize_deferred_job_delivery(runtime, cache_key: str) -> None:
         return
     pending_root = schedule_pending_root(runtime.config.runtime_root)
     done_root = schedule_done_root(runtime.config.runtime_root)
-    for path in sorted(pending_root.glob(f"*-{request_id}.json")):
+    for path in sorted(pending_root.glob("*.json")):
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+            continue
         schedule_id = None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            payload_request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+            if payload_request_id != request_id:
+                continue
             schedule_id = str(payload.get("schedule_id") or payload.get("scheduleId") or "") or None
         except (OSError, ValueError, UnicodeDecodeError):
-            schedule_id = None
+            continue
         if schedule_id:
             advance_schedule_definition_after_success(runtime.config.runtime_root, schedule_id)
-            schedule_failed_root(runtime.config.runtime_root).joinpath(f"{schedule_id}.json").unlink(missing_ok=True)
+            schedule_failed_marker_file(runtime.config.runtime_root, schedule_id).unlink(missing_ok=True)
         path.replace(done_root / path.name)
         if schedule_id:
-            (done_root / f"{schedule_id}.json").write_text("{}", encoding="utf-8")
+            _write_marker_file(schedule_done_marker_file(runtime.config.runtime_root, schedule_id))
         return
 
 
@@ -237,10 +258,44 @@ def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
 def _resolve_launch_thread_id(bot_or_runtime, launch, message) -> str | None:
     if hasattr(bot_or_runtime, "session_threads"):
         thread_id = str(getattr(bot_or_runtime, "session_threads", {}).get(message.chat_key) or "").strip()
-        return thread_id or None
+        if thread_id:
+            return thread_id
     launch_thread_id = getattr(launch.session, "thread_id", None)
     text = str(launch_thread_id or "").strip()
     return text or None
+
+
+def _append_launch_session_chat_message(runtime_root: Path | str, launch, item: dict[str, object]):
+    updated = append_session_record_chat_message(runtime_root, launch.session.session_id, item)
+    if updated is None:
+        return launch
+    return replace(launch, session=updated)
+
+
+def _runtime_payload_ack_timeout(payload: dict) -> int | None:
+    req_id = str((payload.get("headers") or {}).get("req_id") or "").strip()
+    if not req_id:
+        return None
+    cmd = str(payload.get("cmd") or "").strip()
+    if cmd == "aibot_send_msg":
+        return PROACTIVE_SEND_ACK_TIMEOUT_SEC
+    if cmd == "aibot_respond_msg":
+        return REPLY_SEND_ACK_TIMEOUT_SEC
+    return None
+
+
+def _runtime_payload_stage(payload: dict) -> str:
+    return "proactive send" if str(payload.get("cmd") or "").strip() == "aibot_send_msg" else "reply send"
+
+
+async def _send_runtime_payload(runtime, payload: dict) -> dict | None:
+    ack_timeout = _runtime_payload_ack_timeout(payload)
+    if ack_timeout is None:
+        await ws_send_json(runtime, payload)
+        return None
+    response = await send_ws_payload_with_ack(runtime, payload, ack_timeout)
+    require_ack_ok(response, _runtime_payload_stage(payload))
+    return response
 
 
 async def send_or_cache_runtime_payload(runtime, message, session_id: str, content: str, *, final: bool) -> bool:
@@ -258,12 +313,14 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
         _store_cached_runtime_payloads(runtime, state, cache_key, [dict(item) for item in payloads], final=final)
         return False
     sequence = [dict(item) for item in payloads]
+    failed_index = 0
     try:
         for index, item in enumerate(sequence):
-            await ws_send_json(runtime, item)
+            failed_index = index
+            await _send_runtime_payload(runtime, item)
     except Exception as exc:
         runtime.last_error = str(exc)
-        _store_cached_runtime_payloads(runtime, state, cache_key, sequence[index:], final=final)
+        _store_cached_runtime_payloads(runtime, state, cache_key, sequence[failed_index:], final=final)
         return False
     _clear_cached_runtime_payload(runtime, cache_key, final=final)
     if final and runtime.pending_streams is not None and cache_key:
@@ -279,44 +336,59 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
 async def flush_cached_runtime_payloads(runtime) -> None:
     if runtime.ws is None:
         return
-    for req_id, payloads in list((runtime.pending_streams or {}).items()):
-        sequence = [dict(item) for item in (payloads if isinstance(payloads, list) else [payloads])]
-        state = runtime.reply_states.get(req_id)
-        for index, payload in enumerate(sequence):
-            try:
-                await ws_send_json(runtime, payload)
-            except Exception as exc:
-                runtime.last_error = str(exc)
-                remaining = sequence[index:]
-                _store_cached_runtime_payloads(runtime, state, req_id, remaining, final=False)
-                raise
-        if state is not None:
-            mark_reply_sent(state, final=False)
-        _clear_transient_runtime_error(runtime)
-        if runtime.pending_streams is not None:
-            runtime.pending_streams.pop(req_id, None)
-    for req_id, payloads in list((runtime.pending_finals or {}).items()):
-        sequence = [dict(item) for item in (payloads if isinstance(payloads, list) else [payloads])]
-        state = runtime.reply_states.get(req_id)
-        for index, payload in enumerate(sequence):
-            try:
-                await ws_send_json(runtime, payload)
-            except Exception as exc:
-                runtime.last_error = str(exc)
-                remaining = sequence[index:]
-                _store_cached_runtime_payloads(runtime, state, req_id, remaining, final=True)
-                raise
-        if state is not None:
-            mark_reply_sent(state, final=True)
-            _finalize_deferred_job_delivery(runtime, req_id)
-            cleanup_reply_state(runtime, req_id)
-        _clear_transient_runtime_error(runtime)
-        if runtime.pending_finals is not None:
-            runtime.pending_finals.pop(req_id, None)
+    if runtime.pending_payload_flush_in_progress:
+        return
+    runtime.pending_payload_flush_in_progress = True
+    try:
+        for req_id, payloads in list((runtime.pending_streams or {}).items()):
+            sequence = [dict(item) for item in (payloads if isinstance(payloads, list) else [payloads])]
+            state = runtime.reply_states.get(req_id)
+            failed_index = 0
+            for index, payload in enumerate(sequence):
+                try:
+                    failed_index = index
+                    await _send_runtime_payload(runtime, payload)
+                except Exception as exc:
+                    runtime.last_error = str(exc)
+                    remaining = sequence[failed_index:]
+                    _store_cached_runtime_payloads(runtime, state, req_id, remaining, final=False)
+                    raise
+            if state is not None:
+                mark_reply_sent(state, final=False)
+            _clear_transient_runtime_error(runtime)
+            if runtime.pending_streams is not None:
+                runtime.pending_streams.pop(req_id, None)
+        for req_id, payloads in list((runtime.pending_finals or {}).items()):
+            sequence = [dict(item) for item in (payloads if isinstance(payloads, list) else [payloads])]
+            state = runtime.reply_states.get(req_id)
+            failed_index = 0
+            for index, payload in enumerate(sequence):
+                try:
+                    failed_index = index
+                    await _send_runtime_payload(runtime, payload)
+                except Exception as exc:
+                    runtime.last_error = str(exc)
+                    remaining = sequence[failed_index:]
+                    _store_cached_runtime_payloads(runtime, state, req_id, remaining, final=True)
+                    raise
+            if state is not None:
+                mark_reply_sent(state, final=True)
+                _finalize_deferred_job_delivery(runtime, req_id)
+                cleanup_reply_state(runtime, req_id)
+            _clear_transient_runtime_error(runtime)
+            if runtime.pending_finals is not None:
+                runtime.pending_finals.pop(req_id, None)
+    finally:
+        runtime.pending_payload_flush_in_progress = False
 
 
 async def run_text_message_once(config, bot, message, **kwargs):
     launch = await run_blocking(prepare_session_run, bot, message.chat_key)
+    launch = _append_launch_session_chat_message(
+        bot.runtime_root,
+        launch,
+        {"role": "user", "text": message.content, "time": int(time.time())},
+    )
     backend = _agent_backend(bot)
     prompt = build_prompt(bot, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
@@ -364,6 +436,7 @@ async def run_text_message_once(config, bot, message, **kwargs):
                         lambda current: replace(
                             current,
                             updated_at=int(time.time() * 1000),
+                            thread_id=None,
                         ),
                     )
                     output_file.unlink(missing_ok=True)
@@ -390,7 +463,13 @@ async def run_text_message_once(config, bot, message, **kwargs):
                         current,
                         updated_at=int(time.time() * 1000),
                         last_run_at=int(time.time() * 1000),
+                        thread_id=next_thread_id,
                     ),
+                )
+                _append_launch_session_chat_message(
+                    bot.runtime_root,
+                    launch,
+                    {"role": "bot", "text": reply, "time": int(time.time())},
                 )
                 break
     finally:
@@ -402,6 +481,11 @@ async def run_text_message_once(config, bot, message, **kwargs):
 
 async def stream_text_message_once(config, runtime, message, **kwargs):
     launch = await run_blocking(prepare_session_run, runtime.config, message.chat_key)
+    launch = _append_launch_session_chat_message(
+        runtime.config.runtime_root,
+        launch,
+        {"role": "user", "text": message.content, "time": int(time.time())},
+    )
     backend = _agent_backend(runtime)
     prompt = build_prompt(runtime.config, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
@@ -508,6 +592,7 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                         lambda current: replace(
                             current,
                             updated_at=int(time.time() * 1000),
+                            thread_id=None,
                         ),
                     )
                     output_file.unlink(missing_ok=True)
@@ -538,7 +623,13 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                         current,
                         updated_at=int(time.time() * 1000),
                         last_run_at=int(time.time() * 1000),
+                        thread_id=next_thread_id,
                     ),
+                )
+                _append_launch_session_chat_message(
+                    runtime.config.runtime_root,
+                    launch,
+                    {"role": "bot", "text": reply, "time": int(time.time())},
                 )
                 delivered = await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, reply, final=True)
                 if require_final_delivery and not delivered:
