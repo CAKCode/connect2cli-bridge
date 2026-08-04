@@ -16,7 +16,7 @@ Chinese docs:
 - Manages multiple bot configurations and persistence
 - Starts `codex exec` per session and attempts `codex exec resume` only when a runtime thread is still available
 - Supports built-in session control commands:
-  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`, `/bridge-resume`, `/cwd`
+  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`, `/bridge-resume`, `/local-resume`, `/local-detach`, `/cwd`
 - Downloads inbound WeCom images and files into local workspaces
 - Sends local files back to WeCom through a local command or JSON API
 - Supports one-shot scheduled messages and cron-based recurring schedules
@@ -50,13 +50,15 @@ echo "${CODEX_HOME:-$HOME/.codex}"
 ### 2. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 For tests:
 
 ```bash
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 ```
 
 ### 3. Prepare `.env`
@@ -69,8 +71,11 @@ Minimal example:
 
 ```bash
 BRIDGE_BIND=127.0.0.1:9299
+BRIDGE_PYTHON=/path/to/connect2cli-bridge/.venv/bin/python
 WORK_DIR=/home/jenkins
 BRIDGE_BASIC_AUTH=bridge:change-me
+BRIDGE_RUNTIME_ROOT=/var/tmp/wecom-bridge-runtime
+BRIDGE_CONTROL_ROOT=/var/tmp/wecom-bridge-control
 CODEX_EXEC_MODE=host
 
 WECOM_BOT_NAME=default
@@ -85,13 +90,20 @@ WECOM_BOT_ENABLED=true
 Notes:
 
 - Use either `BRIDGE_BASIC_AUTH` or `BRIDGE_TOKEN`
-- if neither is configured, `/api/*` is limited to localhost
+- if neither is configured, `/healthz` and `/api/*` are limited to localhost
+- `/livez` remains public for process liveness probes; detailed `/healthz` output follows the API authentication policy
+- `BRIDGE_PYTHON` selects the interpreter that launches `bridge.py`; pin it to the project virtual environment
 - plaintext bot `secret` is no longer supported; use `secretFile`
 - `WECOM_BOT_WORK_DIR` is the bot's shared project root, not the exact Codex `cwd`
 - `WECOM_BOT_WORKSPACE_MODE` supports `team` and `personal`
   - `team`: default for new `codex` bots; user chats use `workfile`, room-shared chats use `roomfile`
   - `personal`: default for new `claude` bots; all chats run directly in `workDir`
 - If an env value contains spaces, such as `WECOM_BOT_AGENT_COMMAND=claude --model sonnet`, quote it in `.env`
+- `BRIDGE_SHARED_RUNTIME_ROOT` stores shared coordination state, `BRIDGE_RUNTIME_ROOT` stores instance-local state, and `BRIDGE_CONTROL_ROOT` stores PID files, watchdog state, and logs
+- runtime roots may be shared by multiple system users; put those users in one group and use a setgid group-writable root such as `2770` or `2775`
+- state directories and files inherit the parent collaboration policy, so instances sharing one root do not need to use the same UID
+- each instance sharing one source tree needs a distinct `BRIDGE_CONTROL_ROOT`
+- set `BRIDGE_ENV_FILE=/path/to/instance.env` in the launcher environment to use an isolated config file instead of the repository `.env`; startup fails when an explicitly selected file is missing
 
 ### 4. Start the service
 
@@ -99,17 +111,27 @@ Notes:
 sh ./start.sh
 ```
 
+`bridge.py` is the only production entry point started by this launcher. `workspace_bridge.service` remains a compatibility library/API path with its own regression gate.
+
 Then inspect logs:
 
 ```bash
-tail -f ./bridge.log
+tail -f /var/tmp/wecom-bridge-control/bridge.log
 ```
 
 Health check:
 
 ```bash
-curl -s http://127.0.0.1:9299/
+curl -s http://127.0.0.1:9299/livez
 ```
+
+Run an isolated launcher, watchdog recovery, HTTP load, and resource gate against the current code:
+
+```bash
+python3 ./check_production_readiness.py --duration-sec 60 --concurrency 20
+```
+
+The probe uses a temporary port and isolated runtime roots without production bot credentials. It does not replace live WeCom subscription, reconnect, or multi-chat acceptance checks.
 
 ## Runtime Model
 
@@ -148,7 +170,7 @@ When the bridge starts an agent:
 
 For external integrations, prefer storing and using `chatKey`. `sessionId` should be treated as a fallback identifier.
 
-### Codex execution mode
+### Agent execution mode
 
 `CODEX_EXEC_MODE` supports:
 
@@ -158,6 +180,10 @@ For external integrations, prefer storing and using `chatKey`. `sessionId` shoul
   runs `codex exec --dangerously-bypass-approvals-and-sandbox`
 
 Default: `host`.
+
+Claude uses the same Bridge process identity and supplementary groups without `setpriv` or an isolated run-as
+directory. In `host` mode, Bridge adds `--permission-mode bypassPermissions` to Claude so non-interactive runs
+are not blocked by Claude CLI tool permission prompts. Legacy run-as fields are accepted but ignored.
 
 `host` mode is intended for trusted internal environments.
 
@@ -299,6 +325,9 @@ These commands are intercepted by the bridge and are not forwarded to Codex:
 - `/bridge-interrupt`
 - `/bridge-reset`
 - `/bridge-resume`
+- `/local-resume`
+- `/local-resume <sessionId>`
+- `/local-detach`
 - `/cwd`
 
 Meaning:
@@ -311,8 +340,20 @@ Meaning:
   stop the current run and clear session context
 - `/bridge-resume`
   list resumable sessions visible to the current chat; reply with the index or send `/bridge-resume <sessionId>`
+- `/local-resume`
+  list local Codex sessions under `$CODEX_HOME/sessions` whose latest rollout `cwd` matches the current directory; reply with an index to select one
+- `/local-resume <sessionId>`
+  bind the specified local session for the current directory and import its recent chat history
+- `/local-detach`
+  release the local-session binding and restore the previous Bridge thread and chat history, when available
 - `/cwd`
   available only in `workspaceMode=personal`; `/cwd` shows the current directory, `/cwd <path>` switches to a subdirectory inside `workDir`, and switching is blocked while a run is active
+
+Local-session commands require a bot with `workspaceMode=personal` and `agentBackend=codex`. Set the bot's
+`localResumeOwnerUserId` to the authorized WeCom user ID. For single-bot bootstrap, use
+`WECOM_BOT_LOCAL_RESUME_OWNER_USER_ID`; `LOCAL_RESUME_OWNER_USER_ID` is accepted as a fallback. Shared group
+sessions cannot use this capability, and one local Codex session can be bound to only one valid WeCom session
+at a time. The current session must have no running, queued, or pending-delivery work before switching context.
 
 The same controls are also exposed by API:
 
@@ -342,3 +383,13 @@ Full test suite:
 ```bash
 sh ./test.sh
 ```
+
+Static and runtime release gates:
+
+```bash
+sh ./check_quality.sh
+sh ./check_production_runtime.sh
+sh ./check_compatibility_runtime.sh
+```
+
+`check_multi_user_readiness.sh` runs both runtime gates in sequence. CI invokes the same commands.

@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+from .atomic_io import atomic_write_json, atomic_write_text, exclusive_create_json
 from .config import build_bot_from_app_config
 from .models import WeComBotRuntime, WeComTextMessage
 from .schedule import (
@@ -94,22 +95,19 @@ def _acquire_schedule_processing_marker(config, schedule_id: str) -> Path | None
     marker_path = _schedule_marker_path(config, schedule_id)
     if marker_path.is_symlink():
         marker_path.unlink(missing_ok=True)
-    try:
-        with marker_path.open("x", encoding="utf-8") as handle:
-            json.dump({"scheduleId": schedule_id, "claimedAt": int(time.time() * 1000)}, handle, ensure_ascii=False)
-    except FileExistsError:
+    if not exclusive_create_json(
+        marker_path,
+        {"scheduleId": schedule_id, "claimedAt": int(time.time() * 1000)},
+    ):
         return None
     return marker_path
 
 
 def _write_marker_payload(path: Path, payload: dict | str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
     if isinstance(payload, dict):
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, payload)
     else:
-        tmp.write_text(str(payload), encoding="utf-8")
-    tmp.replace(path)
+        atomic_write_text(path, str(payload))
 
 
 def _write_schedule_failure_marker(config, definition: ScheduleDefinition, exc: Exception) -> None:

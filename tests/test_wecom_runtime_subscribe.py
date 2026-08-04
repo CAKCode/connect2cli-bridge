@@ -1409,6 +1409,65 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     assert "prepare_session_run" in calls
 
 
+async def test_resume_binding_uses_latest_source_thread_not_stale_candidate(tmp_path) -> None:
+    from dataclasses import replace
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record, prepare_session_run, update_session_record
+    from workspace_bridge.wecom_runtime import _bind_resume_candidate
+
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    current = prepare_session_run(runtime.config, "single:alice")
+    source = prepare_session_run(runtime.config, "group-user:room-1:alice")
+    update_session_record(
+        runtime.config.runtime_root,
+        source.session.session_id,
+        lambda record: replace(record, thread_id="thread-latest"),
+    )
+
+    source_session_id = await _bind_resume_candidate(
+        runtime,
+        "single:alice",
+        {
+            "sessionId": source.session.session_id,
+            "threadId": "thread-stale",
+            "chatKey": "group-user:room-1:alice",
+            "updatedAt": source.session.updated_at,
+            "lastRunAt": 0,
+        },
+    )
+
+    updated = load_session_record(runtime.config.runtime_root, current.session.session_id)
+    assert source_session_id == source.session.session_id
+    assert updated is not None
+    assert updated.thread_id == "thread-latest"
+    assert runtime.session_threads["single:alice"] == "thread-latest"
+
+
+async def test_resume_binding_reports_missing_source_record_cleanly(tmp_path, monkeypatch) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import prepare_session_run
+    from workspace_bridge import wecom_runtime as runtime_module
+
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    prepare_session_run(runtime.config, "single:alice")
+    monkeypatch.setattr(runtime_module, "list_session_records", lambda *_args: [])
+
+    with pytest.raises(RuntimeError, match="selected session is no longer resumable"):
+        await runtime_module._bind_resume_candidate(
+            runtime,
+            "single:alice",
+            {
+                "sessionId": "missing-session",
+                "threadId": "stale-thread",
+                "chatKey": "group-user:room-1:alice",
+                "updatedAt": 0,
+                "lastRunAt": 0,
+            },
+        )
+
+
 async def test_resume_selection_copies_recent_chat_from_selected_session(tmp_path) -> None:
     from dataclasses import replace
     from workspace_bridge.config import build_bot_from_app_config
@@ -2000,7 +2059,10 @@ async def test_message_failure_reply_uses_stable_session_id(tmp_path, monkeypatc
             },
             runtime_module._dispatch_message,
         )
-        await asyncio.sleep(0)
+        for _ in range(100):
+            if ws.sent:
+                break
+            await asyncio.sleep(0.01)
     finally:
         runtime_module.stream_text_message_once = original_stream
 
@@ -2036,11 +2098,46 @@ async def test_failed_message_task_preserves_message_failed_status_after_reply(t
         },
         runtime_module._dispatch_message,
     )
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if any("执行失败: boom" in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"]):
+            break
+        await asyncio.sleep(0.01)
 
     assert runtime.last_status == "message_failed"
     assert runtime.last_error == "boom"
     assert any("执行失败: boom" in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"])
+
+
+async def test_failed_message_record_update_waits_for_session_guard(tmp_path, monkeypatch) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.execution import session_run_guards
+    from workspace_bridge import wecom_runtime as runtime_module
+
+    async def fake_stream_text_message_once(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runtime_module, "stream_text_message_once", fake_stream_text_message_once)
+    config = make_config(tmp_path)
+    runtime = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    runtime.ws = ws
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-guarded-failure"},
+        "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "hello"}},
+    }
+
+    async with session_run_guards(runtime.config, "single:alice"):
+        await handle_wecom_payload(config, runtime, ws, payload, runtime_module._dispatch_message)
+        await asyncio.sleep(0.05)
+        assert not any("执行失败: boom" in item["body"]["stream"]["content"] for item in ws.sent)
+
+    for _ in range(100):
+        if any("执行失败: boom" in item["body"]["stream"]["content"] for item in ws.sent):
+            break
+        await asyncio.sleep(0.01)
+
+    assert any("执行失败: boom" in item["body"]["stream"]["content"] for item in ws.sent)
 
 
 async def test_service_startup_creates_wecom_task_when_enabled(tmp_path, monkeypatch) -> None:
@@ -2292,8 +2389,10 @@ async def test_interrupt_suppression_does_not_hide_next_real_failure(tmp_path, m
     )
     await asyncio.sleep(0)
     release_old.set()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if any("执行失败: real boom" in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"]):
+            break
+        await asyncio.sleep(0.01)
 
     assert runtime.last_status == "message_failed"
     assert runtime.last_error == "real boom"

@@ -67,6 +67,12 @@ def build_agent_argv(
         argv = [*base, "-p", "--verbose"]
         if resume and resume_thread_id:
             argv.extend(["--resume", resume_thread_id])
+        has_permission_mode = any(
+            item == "--permission-mode" or item.startswith("--permission-mode=")
+            for item in base
+        )
+        if mode == "host" and not has_permission_mode:
+            argv.extend(["--permission-mode", "bypassPermissions"])
         argv.extend(["--output-format", "stream-json"])
         return tuple(argv)
 

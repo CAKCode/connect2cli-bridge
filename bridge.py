@@ -40,15 +40,21 @@ from workspace_bridge.agent_backends import (
     extract_agent_thread_id,
     normalize_agent_backend,
 )
-from workspace_bridge.agent_runtime import (
-    apply_claude_runtime_env,
-    build_setpriv_prefix,
-    config_agent_run_as_group,
-    config_agent_run_as_user,
-    config_agent_runtime_root,
-    normalize_optional_text,
-    prepare_claude_runtime_root,
-    resolve_posix_identity,
+from workspace_bridge.agent_runtime import normalize_optional_text
+from workspace_bridge.api_security import (
+    api_auth_enabled as shared_api_auth_enabled,
+    api_auth_mode_label as shared_api_auth_mode_label,
+    authorize_api_access,
+    extract_basic_credentials,
+    extract_bearer_token,
+    is_loopback_address,
+    secure_text_equal as shared_secure_text_equal,
+)
+from workspace_bridge.atomic_io import (
+    atomic_write_json,
+    ensure_state_directory,
+    open_state_lock_file,
+    state_file_mode,
 )
 from workspace_bridge.async_utils import run_blocking
 from workspace_bridge import codex_runtime
@@ -146,6 +152,7 @@ SUBPROCESS_STREAM_READ_SIZE = max(4096, int(os.environ.get("SUBPROCESS_STREAM_RE
 SUBPROCESS_STREAM_MAX_LINE = max(16 * 1024, int(os.environ.get("SUBPROCESS_STREAM_MAX_LINE", 256 * 1024)))
 PROACTIVE_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("PROACTIVE_SEND_ACK_TIMEOUT_SEC", 10)))
 REPLY_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("REPLY_SEND_ACK_TIMEOUT_SEC", 10)))
+UNCERTAIN_DELIVERY_RETRY_SEC = max(1, int(os.environ.get("UNCERTAIN_DELIVERY_RETRY_SEC", 90)))
 WEBSOCKET_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("WEBSOCKET_SEND_TIMEOUT_SEC", 5)))
 STATUS_STREAM_INTERVAL_SEC = max(1, int(os.environ.get("STATUS_STREAM_INTERVAL_SEC", 2)))
 STATUS_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_TIMEOUT_SEC", 1)))
@@ -301,6 +308,8 @@ class SessionState:
     pending_media_downloads: int = 0
     active_run_media: list[dict[str, Any]] = field(default_factory=list)
     active_run_media_notes: list[str] = field(default_factory=list)
+    active_run_thread_checkpoint: Optional[str] = None
+    active_run_thread_checkpoint_set: bool = False
     lease_owned: bool = False
     thread_id: Optional[str] = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -313,6 +322,8 @@ class SessionState:
     pending_final_payload: Optional[dict[str, Any]] = None
     pending_stream_payloads: Optional[list[dict[str, Any]]] = None
     pending_final_payloads: Optional[list[dict[str, Any]]] = None
+    late_ack_payloads: list[dict[str, Any]] = field(default_factory=list)
+    pending_payload_retry_after: float = 0.0
     run_generation: int = 0
     codex_runtime_status: Optional[str] = None
     active_scheduled_job_file: Optional[str] = None
@@ -321,6 +332,7 @@ class SessionState:
     active_schedule_id: Optional[str] = None
     resume_candidates: list[dict[str, Any]] = field(default_factory=list)
     resume_selection_expires_at: int = 0
+    use_global_codex_sessions: bool = False
 
 
 @dataclass
@@ -398,10 +410,6 @@ def normalize_agent_command(value: Any) -> Optional[str]:
     return text or None
 
 
-def normalize_optional_run_as(value: Any) -> Optional[str]:
-    return normalize_optional_text(value)
-
-
 def bot_agent_backend(config: dict[str, Any]) -> str:
     raw = config.get("agentBackend") or config.get("agent_backend") or "codex"
     return normalize_agent_backend(str(raw))
@@ -409,18 +417,6 @@ def bot_agent_backend(config: dict[str, Any]) -> str:
 
 def bot_agent_command(config: dict[str, Any]) -> Optional[str]:
     return normalize_agent_command(config.get("agentCommand") or config.get("agent_command"))
-
-
-def bot_agent_run_as_user(config: dict[str, Any]) -> Optional[str]:
-    return config_agent_run_as_user(config)
-
-
-def bot_agent_run_as_group(config: dict[str, Any]) -> Optional[str]:
-    return config_agent_run_as_group(config)
-
-
-def bot_agent_runtime_root(config: dict[str, Any]) -> Optional[Path]:
-    return config_agent_runtime_root(config, base_dir=BASE_DIR)
 
 
 def build_codex_base_args(
@@ -528,6 +524,19 @@ def ensure_dir(path: Path) -> None:
 
 def ensure_dir_for(path: Path) -> None:
     ensure_dir(path.parent)
+
+
+def ensure_secure_state_root(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise RuntimeError(f"{label} must not be a symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {path}")
+    if path.stat().st_mode & 0o002:
+        raise RuntimeError(f"{label} must not be world-writable: {path}")
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise RuntimeError(f"{label} is not writable: {path}")
+    return path
 
 
 def local_file_send_namespace(value: Any) -> Optional[str]:
@@ -1126,6 +1135,8 @@ def cleanup_stale_local_file_send_result_files(current_ms: Optional[int] = None)
 
 
 def read_json_file(path: Path, fallback: Any = None) -> Any:
+    if path.is_symlink():
+        return fallback
     try:
         return json.loads(path.read_text("utf-8"))
     except Exception:
@@ -1133,14 +1144,11 @@ def read_json_file(path: Path, fallback: Any = None) -> Any:
 
 
 def write_json_atomic(path: Path, data: Any) -> None:
-    ensure_dir_for(path)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, data)
 
 
 def get_shutdown_reason_file() -> Path:
-    return BASE_DIR / ".bridge.shutdown-reason.json"
+    return INSTANCE_RUNTIME_ROOT / ".bridge.shutdown-reason.json"
 
 
 def write_shutdown_reason(reason: str, detail: Optional[str] = None) -> None:
@@ -1367,7 +1375,7 @@ def ensure_schedule_dirs() -> None:
         SCHEDULE_DEFINITION_ROOT,
         SCHEDULE_DEFINITION_LOCK_ROOT,
     ):
-        ensure_dir(item)
+        ensure_state_directory(item)
 
 
 def legacy_shared_runtime_root() -> Path:
@@ -1507,6 +1515,11 @@ def get_registry_key_file(bot_id: str, key: str) -> Path:
 
 def get_registry_key_lock_file(bot_id: str, key: str) -> Path:
     return SESSION_REGISTRY_ROOT / "keys" / bot_id / f"{quote(key, safe='')}.lock"
+
+
+def get_local_resume_thread_binding_lock_file(thread_id: str) -> Path:
+    digest = hashlib.sha256(str(thread_id or "").encode("utf-8")).hexdigest()
+    return SESSION_REGISTRY_ROOT / "local-thread-locks" / f"{digest}.lock"
 
 
 def get_registry_session_file(session_id: str) -> Path:
@@ -2036,6 +2049,10 @@ def get_session_codex_home_root(session_id: str) -> Path:
     return get_bridge_codex_home_root() / "sessions" / workspace_slug(session_id)
 
 
+def get_session_codex_home_local_sessions_backup_root(session_id: str) -> Path:
+    return get_session_codex_home_root(session_id) / "sessions.bridge-local"
+
+
 def get_user_alias_dir(alias_scope: str) -> Path:
     return USER_ALIAS_ROOT / workspace_slug(alias_scope)
 
@@ -2121,17 +2138,14 @@ def get_persisted_bot_configs_lock_file() -> Path:
     return DATA_FILE.with_name(f"{DATA_FILE.name}.lock")
 
 
-def _prepare_flock_lock_file(lock_file: Path) -> Path:
+def _open_flock_lock_file(lock_file: Path) -> Any:
     ensure_dir_for(lock_file)
-    if lock_file.is_symlink():
-        lock_file.unlink(missing_ok=True)
-    return lock_file
+    return open_state_lock_file(lock_file)
 
 
 @contextmanager
 def persisted_bot_configs_lock() -> Any:
-    lock_file = _prepare_flock_lock_file(get_persisted_bot_configs_lock_file())
-    with open(lock_file, "a+", encoding="utf-8") as handle:
+    with _open_flock_lock_file(get_persisted_bot_configs_lock_file()) as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -2236,6 +2250,24 @@ def append_session_chat_message(sess: SessionState, item: dict[str, Any], *, per
         persist_session_recent_chat(sess)
 
 
+def normalize_local_resume_backup(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    thread_id = str(value.get("threadId") or "").strip() or None
+    recent_chat = normalize_session_chat_items(value.get("recentChat"))
+    saved_at = normalize_optional_int(value.get("savedAt"))
+    if thread_id is None and not recent_chat:
+        return None
+    backup = {
+        "threadId": thread_id,
+        "recentChat": recent_chat,
+        "useGlobalCodexSessions": False,
+    }
+    if saved_at is not None:
+        backup["savedAt"] = saved_at
+    return backup
+
+
 def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not isinstance(record, dict):
         return None
@@ -2271,6 +2303,8 @@ def normalize_session_record(record: Optional[dict[str, Any]]) -> Optional[dict[
         "leaseExpiresAt": normalize_optional_int(record.get("leaseExpiresAt")),
         "activeScheduleId": str(record.get("activeScheduleId") or "").strip() or None,
         "threadId": str(record.get("threadId") or "").strip() or None,
+        "useGlobalCodexSessions": normalize_internal_bool_flag(record.get("useGlobalCodexSessions"), default=False),
+        "localResumeBackup": normalize_local_resume_backup(record.get("localResumeBackup")),
         "recentChat": normalize_session_chat_items(record.get("recentChat")),
     }
 
@@ -2516,8 +2550,17 @@ def session_ids_referenced_by_key_root(bot_id: str) -> set[str]:
 
 @contextmanager
 def session_key_lock(bot_id: str, key: str) -> Any:
-    lock_file = _prepare_flock_lock_file(get_registry_key_lock_file(bot_id, key))
-    with open(lock_file, "a+", encoding="utf-8") as handle:
+    with _open_flock_lock_file(get_registry_key_lock_file(bot_id, key)) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def local_resume_thread_binding_lock(thread_id: str) -> Any:
+    with _open_flock_lock_file(get_local_resume_thread_binding_lock_file(thread_id)) as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -2533,6 +2576,25 @@ def update_session_record(session_id: str, updater: Any) -> Optional[dict[str, A
     if not next_record:
         next_record = current
     return write_session_record(next_record)
+
+
+def update_owned_session_record(
+    bot: BotState,
+    key: str,
+    sess: SessionState,
+    updater: Any,
+) -> Optional[dict[str, Any]]:
+    with session_key_lock(str(bot.config["id"]), key):
+        current_lease = read_lease(sess.lock_file)
+        current_owner = (
+            str(current_lease.get("instanceId") or "").strip()
+            if isinstance(current_lease, dict)
+            else ""
+        )
+        if not sess.lease_owned or current_owner != INSTANCE_ID:
+            sess.lease_owned = False
+            return None
+        return update_session_record(sess.session_id, updater)
 
 
 def create_session_record(bot: BotState, key: str) -> dict[str, Any]:
@@ -2558,6 +2620,7 @@ def create_session_record(bot: BotState, key: str) -> dict[str, Any]:
                 "createdAt": now_ms(),
                 "updatedAt": now_ms(),
                 "status": "idle",
+                "useGlobalCodexSessions": False,
                 "recentChat": [],
             }
         )
@@ -2581,7 +2644,7 @@ def write_lease(lock_file: Path, lease: dict[str, Any]) -> None:
     write_json_atomic(lock_file, lease)
 
 
-def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
+def _acquire_session_lease_unlocked(bot: BotState, sess: SessionState, key: str) -> bool:
     lock_file = sess.lock_file
     now = now_ms()
     next_lease = {
@@ -2595,10 +2658,14 @@ def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
 
     for _ in range(2):
         try:
-            ensure_dir_for(lock_file)
+            ensure_state_directory(lock_file.parent)
             if lock_file.is_symlink():
                 lock_file.unlink(missing_ok=True)
-            fd = os.open(str(lock_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(
+                str(lock_file),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                state_file_mode(lock_file.parent),
+            )
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(next_lease, ensure_ascii=False, indent=2))
             sess.lease_owned = True
@@ -2634,7 +2701,12 @@ def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
     return False
 
 
-def renew_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
+def acquire_session_lease(bot: BotState, sess: SessionState, key: str) -> bool:
+    with session_key_lock(str(bot.config["id"]), key):
+        return _acquire_session_lease_unlocked(bot, sess, key)
+
+
+def _renew_session_lease_unlocked(bot: BotState, key: str, sess: SessionState) -> bool:
     if not sess.lease_owned:
         return False
     current = read_lease(sess.lock_file)
@@ -2658,16 +2730,37 @@ def renew_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
     return True
 
 
-def release_session_lease(bot: BotState, key: str, sess: SessionState) -> None:
+def renew_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
+    with session_key_lock(str(bot.config["id"]), key):
+        return _renew_session_lease_unlocked(bot, key, sess)
+
+
+def session_lease_is_owned_by_current_instance(sess: SessionState) -> bool:
+    if not sess.lease_owned:
+        return False
+    current = read_lease(sess.lock_file)
+    if not isinstance(current, dict) or str(current.get("instanceId") or "").strip() != INSTANCE_ID:
+        sess.lease_owned = False
+        return False
+    return True
+
+
+def _release_session_lease_unlocked(bot: BotState, key: str, sess: SessionState) -> bool:
     current = read_lease(sess.lock_file)
     current = current if isinstance(current, dict) else None
-    if current and current.get("instanceId") == INSTANCE_ID:
+    record = read_session_record_by_id(sess.session_id)
+    lock_owner = str(current.get("instanceId") or "").strip() if current else ""
+    record_owner = str(record.get("ownerInstance") or "").strip() if record else ""
+    sess.lease_owned = False
+    if (lock_owner and lock_owner != INSTANCE_ID) or (record_owner and record_owner != INSTANCE_ID):
+        add_log(bot, f"[{key}] lease release skipped after ownership changed")
+        return False
+    if current and lock_owner == INSTANCE_ID:
         try:
             sess.lock_file.unlink()
         except FileNotFoundError:
             pass
         add_log(bot, f"[{key}] lease released")
-    sess.lease_owned = False
     update_session_record(
         sess.session_id,
         lambda record: {
@@ -2675,10 +2768,29 @@ def release_session_lease(bot: BotState, key: str, sess: SessionState) -> None:
             "ownerInstance": None,
             "ownerPid": None,
             "leaseExpiresAt": None,
-            "activeScheduleId": None if record.get("status") != "running" else record.get("activeScheduleId"),
-            "status": "idle" if record.get("status") == "leased" else record.get("status"),
+            "activeScheduleId": None,
+            "status": "idle",
         },
     )
+    return True
+
+
+def release_session_lease(bot: BotState, key: str, sess: SessionState) -> bool:
+    with session_key_lock(str(bot.config["id"]), key):
+        return _release_session_lease_unlocked(bot, key, sess)
+
+
+def release_session_lease_and_update(
+    bot: BotState,
+    key: str,
+    sess: SessionState,
+    updater: Any,
+) -> bool:
+    with session_key_lock(str(bot.config["id"]), key):
+        if not _release_session_lease_unlocked(bot, key, sess):
+            return False
+        update_session_record(sess.session_id, updater)
+        return True
 
 
 def limit_stream_content(content: str) -> str:
@@ -2794,9 +2906,7 @@ def build_status_stream_content(status_text: str, summary: Optional[str] = None)
 def acquire_bot_runtime_lock(bot: BotState) -> bool:
     if bot.runtime_lock_handle is not None:
         return True
-    lock_file = get_bot_runtime_lock_file(bot.config["botId"])
-    lock_file = _prepare_flock_lock_file(lock_file)
-    handle = open(lock_file, "a+", encoding="utf-8")
+    handle = _open_flock_lock_file(get_bot_runtime_lock_file(bot.config["botId"]))
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -2807,9 +2917,7 @@ def acquire_bot_runtime_lock(bot: BotState) -> bool:
 
 
 def bot_runtime_lock_held_elsewhere(wecom_bot_id: str) -> bool:
-    lock_file = get_bot_runtime_lock_file(wecom_bot_id)
-    lock_file = _prepare_flock_lock_file(lock_file)
-    handle = open(lock_file, "a+", encoding="utf-8")
+    handle = _open_flock_lock_file(get_bot_runtime_lock_file(wecom_bot_id))
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2858,10 +2966,12 @@ def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
 
 def normalize_bridge_command_text(content: str, bot_name: Optional[str] = None) -> str:
     text = strip_text_mentions(content, bot_name)
-    if text.startswith("/bridge-") or text.startswith("/cwd"):
+    if text.startswith("/bridge-") or text.startswith("/cwd") or text.startswith("/local-"):
         return text
     fallback = LEADING_MENTION_RE.sub("", content or "", count=1).strip()
-    return fallback if fallback.startswith("/bridge-") or fallback.startswith("/cwd") else (content or "").strip()
+    if fallback.startswith("/bridge-") or fallback.startswith("/cwd") or fallback.startswith("/local-"):
+        return fallback
+    return (content or "").strip()
 
 
 def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
@@ -3028,6 +3138,12 @@ def payload_req_id(payload: dict[str, Any]) -> str:
     return str(((payload.get("headers") or {}).get("req_id")) or "")
 
 
+def same_payload_delivery(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_headers = {key: value for key, value in (left.get("headers") or {}).items() if key != "req_id"}
+    right_headers = {key: value for key, value in (right.get("headers") or {}).items() if key != "req_id"}
+    return {**left, "headers": left_headers} == {**right, "headers": right_headers}
+
+
 def is_reply_payload(payload: dict[str, Any]) -> bool:
     return payload.get("cmd") == "aibot_respond_msg" and bool(payload_req_id(payload))
 
@@ -3061,6 +3177,9 @@ def cleanup_reply_session(bot: BotState, req_id: Optional[str], sess: Optional[S
         context.reply_proactive_req_ids.discard(req_id)
         context.proactive_status_sent_at.pop(req_id, None)
         context.reply_mentions_sent.discard(req_id)
+        context.late_ack_payloads = [
+            payload for payload in context.late_ack_payloads if payload_req_id(payload) != req_id
+        ]
     bot.reply_sessions.pop(req_id, None)
 
 
@@ -3188,7 +3307,18 @@ async def send_session_ws_payload_with_ack(
     if not acquired:
         raise BridgeError(504, "websocket send lock timeout")
     try:
-        response = await send_ws_payload_with_ack(bot, payload, timeout_sec, send_timeout_sec=send_timeout_sec)
+        try:
+            response = await send_ws_payload_with_ack(bot, payload, timeout_sec, send_timeout_sec=send_timeout_sec)
+        except BridgeError as exc:
+            if exc.status_code == 504 and exc.message in {"websocket ack timeout", "websocket send timeout"}:
+                sess.late_ack_payloads.append(clone_payload_sequence([payload])[0])
+                if len(sess.late_ack_payloads) > 20:
+                    del sess.late_ack_payloads[:-20]
+                sess.pending_payload_retry_after = max(
+                    sess.pending_payload_retry_after,
+                    time.monotonic() + UNCERTAIN_DELIVERY_RETRY_SEC,
+                )
+            raise
         mark_session_reply_sent(bot, sess, payload)
         return response
     finally:
@@ -3317,12 +3447,12 @@ def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
             split_at = remaining.rfind(" ", 0, limit + 1)
         if split_at <= 0:
             split_at = limit
-        chunk = remaining[:split_at].rstrip()
+        chunk = remaining[:split_at]
         if not chunk:
             chunk = remaining[:limit]
             split_at = len(chunk)
         chunks.append(chunk)
-        remaining = remaining[split_at:].lstrip()
+        remaining = remaining[split_at:]
     if remaining:
         chunks.append(remaining)
     return chunks
@@ -3556,13 +3686,25 @@ async def send_or_store_session_payloads(
             sess.pending_stream_payload = None
             sess.pending_stream_payloads = None
             return False
-        if reply_req_id and final and (reply_idle_too_long(sess, reply_req_id) or reply_should_use_proactive(sess, reply_req_id)):
+        uncertain_stream_delivery = bool(sess.pending_stream_payload)
+        if reply_req_id and final and (
+            uncertain_stream_delivery
+            or reply_idle_too_long(sess, reply_req_id)
+            or reply_should_use_proactive(sess, reply_req_id)
+        ):
             mark_reply_proactive(sess, reply_req_id)
             proactive_payload = build_proactive_chat_payload(
                 key,
                 "".join(reply_payload_content(payload) for payload in outgoing_payloads),
-                proactive_reply_mention_user_id(key, sess, reply_req_id),
+                (
+                    chat_key_to_user_id(key)
+                    if uncertain_stream_delivery and key.startswith("group-user:")
+                    else proactive_reply_mention_user_id(key, sess, reply_req_id)
+                ),
             )
+            sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
+            cleanup_reply_session(bot, reply_req_id, sess)
             return await send_or_store_session_payload(bot, key, sess, proactive_payload, final)
     req_id = payload_req_id(outgoing_payloads[-1])
     payload_kind = "final" if final else "stream"
@@ -3576,10 +3718,12 @@ async def send_or_store_session_payloads(
                 sess.pending_final_payloads = None
                 sess.pending_stream_payload = None
                 sess.pending_stream_payloads = None
+                sess.pending_payload_retry_after = 0.0
                 cleanup_reply_session(bot, original_reply_req_id, sess)
             else:
                 sess.pending_stream_payload = None
                 sess.pending_stream_payloads = None
+                sess.pending_payload_retry_after = 0.0
             return True
         except Exception as exc:
             failed_index = index if 'index' in locals() else 0
@@ -3614,13 +3758,25 @@ async def send_or_store_session_payload(
             sess.pending_stream_payload = None
             sess.pending_stream_payloads = None
             return False
-        if reply_req_id and final and (reply_idle_too_long(sess, reply_req_id) or reply_should_use_proactive(sess, reply_req_id)):
+        uncertain_stream_delivery = bool(sess.pending_stream_payload)
+        if reply_req_id and final and (
+            uncertain_stream_delivery
+            or reply_idle_too_long(sess, reply_req_id)
+            or reply_should_use_proactive(sess, reply_req_id)
+        ):
             mark_reply_proactive(sess, reply_req_id)
             outgoing_payload = build_proactive_chat_payload(
                 key,
                 reply_payload_content(outgoing_payload),
-                proactive_reply_mention_user_id(key, sess, reply_req_id),
+                (
+                    chat_key_to_user_id(key)
+                    if uncertain_stream_delivery and key.startswith("group-user:")
+                    else proactive_reply_mention_user_id(key, sess, reply_req_id)
+                ),
             )
+            sess.pending_stream_payload = None
+            sess.pending_stream_payloads = None
+            cleanup_reply_session(bot, reply_req_id, sess)
     req_id = payload_req_id(outgoing_payload)
     payload_kind = "final" if final else "stream"
     if bot.ws and not bot.ws.closed:
@@ -3631,10 +3787,12 @@ async def send_or_store_session_payload(
                 sess.pending_final_payloads = None
                 sess.pending_stream_payload = None
                 sess.pending_stream_payloads = None
+                sess.pending_payload_retry_after = 0.0
                 cleanup_reply_session(bot, original_reply_req_id, sess)
             else:
                 sess.pending_stream_payload = None
                 sess.pending_stream_payloads = None
+                sess.pending_payload_retry_after = 0.0
             return True
         except Exception as exc:
             add_log(bot, f"[{key}] {payload_kind} send deferred req_id={req_id or '-'}: {exc}")
@@ -3653,6 +3811,13 @@ async def send_or_store_session_payload(
 
 async def flush_session_pending_payloads(bot: BotState, key: str, sess: SessionState) -> None:
     if not bot.ws or bot.ws.closed:
+        return
+    pending_payload = sess.pending_final_payload or sess.pending_stream_payload
+    if (
+        pending_payload
+        and time.monotonic() < sess.pending_payload_retry_after
+        and any(same_payload_delivery(pending_payload, payload) for payload in sess.late_ack_payloads)
+    ):
         return
     if sess.pending_final_payload:
         payloads = clone_payload_sequence(sess.pending_final_payloads or [sess.pending_final_payload])
@@ -3697,6 +3862,17 @@ def consume_late_cached_session_payload_ack(bot: BotState, req_id: Optional[str]
     if not req_text:
         return False
     for key, sess in list(bot.sessions.items()):
+        tracked_index = next(
+            (
+                index
+                for index, payload in enumerate(sess.late_ack_payloads)
+                if payload_req_id(payload) == req_text
+            ),
+            None,
+        )
+        if tracked_index is None:
+            continue
+        tracked_payload = sess.late_ack_payloads.pop(tracked_index)
         cached_payloads: Optional[list[dict[str, Any]]] = None
         payload_kind = ""
         if sess.pending_final_payload:
@@ -3705,24 +3881,35 @@ def consume_late_cached_session_payload_ack(bot: BotState, req_id: Optional[str]
         elif sess.pending_stream_payload:
             cached_payloads = clone_payload_sequence(sess.pending_stream_payloads or [sess.pending_stream_payload])
             payload_kind = "stream"
-        if not cached_payloads or len(cached_payloads) != 1:
-            continue
+        if not cached_payloads or not same_payload_delivery(cached_payloads[0], tracked_payload):
+            add_log(bot, f"[{key}] accepted late ack for superseded payload req_id={req_text}")
+            return True
         cached_payload = cached_payloads[0]
-        if payload_req_id(cached_payload) != req_text:
-            continue
         mark_session_reply_sent(bot, sess, cached_payload)
+        sess.pending_payload_retry_after = 0.0
+        remaining_payloads = cached_payloads[1:]
         if payload_kind == "final":
-            sess.pending_final_payload = None
-            sess.pending_final_payloads = None
-            sess.pending_stream_payload = None
-            sess.pending_stream_payloads = None
-            add_log(bot, f"[{key}] accepted late ack for cached final reply req_id={req_text}")
-            if sess.queue and can_continue_session_queue(sess):
-                process_queue(bot, sess, key)
+            if remaining_payloads:
+                sess.pending_final_payload = dict(remaining_payloads[-1])
+                sess.pending_final_payloads = clone_payload_sequence(remaining_payloads)
+                add_log(bot, f"[{key}] accepted late ack for cached final reply fragment req_id={req_text}")
+            else:
+                sess.pending_final_payload = None
+                sess.pending_final_payloads = None
+                sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
+                add_log(bot, f"[{key}] accepted late ack for cached final reply req_id={req_text}")
+                if sess.queue and can_continue_session_queue(sess):
+                    process_queue(bot, sess, key)
         else:
-            sess.pending_stream_payload = None
-            sess.pending_stream_payloads = None
-            add_log(bot, f"[{key}] accepted late ack for cached stream reply req_id={req_text}")
+            if remaining_payloads:
+                sess.pending_stream_payload = dict(remaining_payloads[-1])
+                sess.pending_stream_payloads = clone_payload_sequence(remaining_payloads)
+                add_log(bot, f"[{key}] accepted late ack for cached stream reply fragment req_id={req_text}")
+            else:
+                sess.pending_stream_payload = None
+                sess.pending_stream_payloads = None
+                add_log(bot, f"[{key}] accepted late ack for cached stream reply req_id={req_text}")
         return True
     return False
 
@@ -3777,24 +3964,38 @@ async def respond_info(
         return
     sess = bot.reply_sessions.get(req_id)
     key = find_chat_key_for_session(bot, sess) if sess else None
-    payload = {
-        "cmd": "aibot_respond_msg",
-        "headers": {"req_id": req_id},
-        "body": {"msgtype": "stream", "stream": {"id": sess.session_id if sess else uid(), "finish": final, "content": message}},
-    }
+    stream_id = sess.session_id if sess else uid()
+    chunks = split_text_chunks(message, max_chars=STREAM_TEXT_MAX_CHARS)
+    payloads = [
+        {
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": req_id},
+            "body": {
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": final and index == len(chunks) - 1,
+                    "content": chunk,
+                },
+            },
+        }
+        for index, chunk in enumerate(chunks)
+    ]
     try:
         if sess and key and cache_on_failure:
-            delivered = await send_or_store_session_payload(bot, key, sess, payload, final)
+            delivered = await send_or_store_session_payloads(bot, key, sess, payloads, final)
             if final and delivered:
                 cleanup_reply_session(bot, req_id, sess)
             return
         if sess:
-            await send_session_payload(bot, sess, payload)
+            for payload in payloads:
+                await send_session_payload(bot, sess, payload)
         else:
-            response = await send_ws_payload_with_ack(bot, payload, REPLY_SEND_ACK_TIMEOUT_SEC)
-            error = session_payload_ack_error(payload, response)
-            if error is not None:
-                raise error
+            for payload in payloads:
+                response = await send_ws_payload_with_ack(bot, payload, REPLY_SEND_ACK_TIMEOUT_SEC)
+                error = session_payload_ack_error(payload, response)
+                if error is not None:
+                    raise error
     except Exception as exc:
         add_log(bot, f"info reply skipped req_id={req_id}: {exc}")
         return
@@ -4019,22 +4220,29 @@ def decrypt_media_buffer(buffer: bytes, aes_key: str) -> bytes:
     return decrypted
 
 
-async def download_buffer(url: str) -> dict[str, Any]:
+async def download_buffer(url: str, max_bytes: int) -> dict[str, Any]:
     if HTTP_SESSION is None:
         raise BridgeError(500, "http session not ready")
     timeout = aiohttp.ClientTimeout(total=MEDIA_TOTAL_TIMEOUT / 1000, connect=MEDIA_CONNECT_TIMEOUT / 1000)
     async with HTTP_SESSION.get(url, timeout=timeout, allow_redirects=True) as response:
         if response.status != 200:
             raise BridgeError(502, f"media download failed: HTTP {response.status}")
-        data = await response.read()
+        content_length = normalize_optional_int(response.headers.get("Content-Length"))
+        if content_length is not None and content_length > max_bytes:
+            raise BridgeError(413, f"media too large: {content_length} bytes (max {max_bytes})")
+        data = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if len(data) + len(chunk) > max_bytes:
+                raise BridgeError(413, f"media too large while downloading (max {max_bytes} bytes)")
+            data.extend(chunk)
         return {
-            "data": data,
+            "data": bytes(data),
             "contentType": response.headers.get("Content-Type", ""),
             "contentDisposition": response.headers.get("Content-Disposition", ""),
         }
 
 
-async def download_buffer_via_curl(url: str) -> dict[str, Any]:
+async def download_buffer_via_curl(url: str, max_bytes: int) -> dict[str, Any]:
     tmp_dir = Path(tempfile.mkdtemp(prefix="wecom-codex-media-py-"))
     header_file = tmp_dir / "headers.txt"
     body_file = tmp_dir / "body.bin"
@@ -4045,6 +4253,8 @@ async def download_buffer_via_curl(url: str) -> dict[str, Any]:
         str(max(1, MEDIA_CONNECT_TIMEOUT // 1000)),
         "--max-time",
         str(max(1, MEDIA_TOTAL_TIMEOUT // 1000)),
+        "--max-filesize",
+        str(max_bytes),
         "-D",
         str(header_file),
         "-o",
@@ -4055,6 +4265,9 @@ async def download_buffer_via_curl(url: str) -> dict[str, Any]:
     )
     stdout, stderr = await process.communicate()
     try:
+        body_size = body_file.stat().st_size if body_file.exists() else 0
+        if process.returncode == 63 or body_size > max_bytes:
+            raise BridgeError(413, f"media too large while downloading (max {max_bytes} bytes)")
         if process.returncode != 0:
             raise BridgeError(502, f"curl media download failed: {(stderr or stdout).decode('utf-8', 'ignore').strip()}")
         header_text = header_file.read_text("utf-8") if header_file.exists() else ""
@@ -4103,23 +4316,24 @@ async def download_incoming_media(
     if not url:
         raise BridgeError(400, f"{kind} payload missing url")
     inbound_limit = MAX_INBOUND_IMAGE_SIZE if kind == "image" else MAX_INBOUND_FILE_SIZE
+    aes_key = payload.get("aeskey") or payload.get("aes_key")
+    download_limit = inbound_limit + 32 if aes_key else inbound_limit
 
     try:
-        response = await download_buffer(url)
+        response = await download_buffer(url, download_limit)
     except Exception as exc:
         if not should_fallback_to_curl(exc):
             raise
         add_log(bot, f"[{key}] direct download failed, fallback to curl: {exc}")
-        response = await download_buffer_via_curl(url)
+        response = await download_buffer_via_curl(url, download_limit)
 
     data = response["data"]
-    if len(data) > inbound_limit:
-        raise BridgeError(413, f"{kind} too large: {len(data)} bytes")
-    aes_key = payload.get("aeskey") or payload.get("aes_key")
     if aes_key:
         data = decrypt_media_buffer(data, aes_key)
         if len(data) > inbound_limit:
             raise BridgeError(413, f"{kind} too large after decrypt: {len(data)} bytes")
+    elif len(data) > inbound_limit:
+        raise BridgeError(413, f"{kind} too large: {len(data)} bytes")
 
     target_dir = ensure_session_workspace_dirs_light_for_session(bot, key, sess.session_id)["chatfile"]
     assert target_dir is not None
@@ -4173,6 +4387,31 @@ def extract_mixed_images(mixed: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def restore_bridge_state_from_local_resume_backup(bot: BotState, sess: SessionState, key: str) -> None:
+    record = read_session_record_by_id(sess.session_id) or {}
+    backup = normalize_local_resume_backup(record.get("localResumeBackup"))
+    if backup is not None:
+        sess.thread_id = str(backup.get("threadId") or "").strip() or None
+        sess.chat = [dict(item) for item in normalize_session_chat_items(backup.get("recentChat"))]
+    else:
+        sess.thread_id = None
+        sess.chat = []
+    sess.use_global_codex_sessions = False
+    clear_resume_selection(sess)
+    update_owned_session_record(
+        bot,
+        key,
+        sess,
+        lambda current: {
+            **current,
+            "threadId": sess.thread_id,
+            "useGlobalCodexSessions": False,
+            "localResumeBackup": None,
+            "recentChat": session_recent_chat_snapshot(sess),
+        },
+    )
+
+
 def get_or_create_session(bot: BotState, key: str) -> SessionState:
     if key not in bot.sessions:
         record = get_or_create_session_record(bot, key)
@@ -4182,11 +4421,26 @@ def get_or_create_session(bot: BotState, key: str) -> SessionState:
             lock_file=Path(record["lockFile"]),
             thread_id=str(record.get("threadId") or "").strip() or None,
             chat=list(record.get("recentChat") or []),
+            use_global_codex_sessions=normalize_internal_bool_flag(record.get("useGlobalCodexSessions"), default=False),
         )
         bot.sessions[key] = sess
         add_log(bot, f"[{key}] new session")
         add_event_log(bot, "session.created", chatKey=key, sessionId=sess.session_id)
     sess = bot.sessions[key]
+    if sess.use_global_codex_sessions:
+        revoke_reason = None
+        if not local_resume_binding_allowed_for_chat(bot.config, key):
+            revoke_reason = "unauthorized"
+        elif sess.thread_id:
+            with local_resume_thread_binding_lock(sess.thread_id):
+                if find_local_resume_thread_binding(sess.thread_id, excluding_session_id=sess.session_id) is not None:
+                    revoke_reason = "duplicate"
+        if revoke_reason:
+            if acquire_session_lease(bot, sess, key):
+                restore_bridge_state_from_local_resume_backup(bot, sess, key)
+                add_log(bot, f"[{key}] revoked {revoke_reason} local session binding")
+            else:
+                add_log(bot, f"[{key}] deferred {revoke_reason} local session binding revocation; lease not owned")
     sess.work_dir = str(get_session_runtime_cwd(bot, key, session_id=sess.session_id))
     sess.last_active = time.time()
     return sess
@@ -4200,7 +4454,14 @@ async def get_or_create_session_ready(bot: BotState, key: str) -> SessionState:
 
 
 def build_prompt(
-    bot: BotState, sess: SessionState, key: str, text: str, pending_media: list[dict[str, Any]], pending_media_notes: list[str]
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    text: str,
+    pending_media: list[dict[str, Any]],
+    pending_media_notes: list[str],
+    *,
+    compat_history: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     media_context = build_pending_media_context(pending_media)
     media_notes = build_pending_media_notes(pending_media_notes)
@@ -4211,7 +4472,8 @@ def build_prompt(
     if bot_agent_backend(bot.config) in {"codex", "claude"}:
         return prompt
     history_lines: list[str] = []
-    for item in sess.chat[-12:]:
+    history_items = sess.chat if compat_history is None else compat_history
+    for item in history_items[-12:]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip()
@@ -4228,9 +4490,16 @@ def build_prompt(
     )
 
 
-def build_compat_history_prompt(bot: BotState, sess: SessionState, prompt: str) -> str:
+def build_compat_history_prompt(
+    bot: BotState,
+    sess: SessionState,
+    prompt: str,
+    *,
+    compat_history: Optional[list[dict[str, Any]]] = None,
+) -> str:
     history_lines: list[str] = []
-    for item in sess.chat[-MAX_COMPAT_HISTORY_ITEMS:]:
+    history_items = sess.chat if compat_history is None else compat_history
+    for item in history_items[-MAX_COMPAT_HISTORY_ITEMS:]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip()
@@ -4245,12 +4514,308 @@ def build_compat_history_prompt(bot: BotState, sess: SessionState, prompt: str) 
         "Use this recent bridge-local chat history for continuity when native resume is unavailable.\n"
         f"{chr(10).join(history_lines)}\n[/RecentConversation]"
     )
+
+
+def session_compat_history_snapshot(
+    sess: SessionState,
+    key: str,
+    current_text: str,
+    pending_queue: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    pending_texts = [str(current_text or "").strip()]
+    pending_texts.extend(str(item.get("text") or "").strip() for item in pending_queue if isinstance(item, dict))
+    pending_texts = [text for text in pending_texts if text]
+    pending_index = len(pending_texts) - 1
+    excluded_indices: set[int] = set()
+    for index in range(len(sess.chat) - 1, -1, -1):
+        if pending_index < 0:
+            break
+        item = sess.chat[index]
+        if not isinstance(item, dict) or str(item.get("role") or "").strip() != "user":
+            continue
+        source = str(item.get("from") or "").strip()
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if (not source or source == key) and text == pending_texts[pending_index]:
+            excluded_indices.add(index)
+            pending_index -= 1
+    history = [dict(item) for index, item in enumerate(sess.chat) if index not in excluded_indices]
+    return normalize_session_chat_items(history, limit=MAX_COMPAT_HISTORY_ITEMS)
+
+
+def local_codex_sessions_root() -> Path:
+    return (DEFAULT_CODEX_HOME / "sessions").resolve()
+
+
+def parse_jsonl_timestamp_ms(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        return int(datetime.fromisoformat(normalized).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def iter_local_codex_rollout_files() -> list[Path]:
+    root = local_codex_sessions_root()
+    if not root.exists() or not root.is_dir():
+        return []
+    files: list[Path] = []
+    try:
+        for candidate in root.rglob("rollout-*.jsonl"):
+            if candidate.is_file():
+                files.append(candidate)
+    except Exception:
+        return []
+
+    def sort_key(item: Path) -> tuple[int, str]:
+        try:
+            modified_at = int(item.stat().st_mtime_ns)
+        except OSError:
+            modified_at = 0
+        return modified_at, str(item)
+
+    files.sort(
+        key=sort_key,
+        reverse=True,
+    )
+    return files
+
+
+def read_local_codex_session_meta(rollout_file: Path) -> Optional[dict[str, Any]]:
+    try:
+        with rollout_file.open("r", encoding="utf-8") as handle:
+            first_line = handle.readline()
+    except Exception:
+        return None
+    if not first_line:
+        return None
+    try:
+        payload = json.loads(first_line)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("type") or "").strip() != "session_meta":
+        return None
+    meta = payload.get("payload")
+    if not isinstance(meta, dict):
+        return None
+    session_id = str(meta.get("session_id") or meta.get("id") or "").strip()
+    cwd_text = str(meta.get("cwd") or "").strip()
+    if not session_id or not cwd_text:
+        return None
+    try:
+        cwd = Path(cwd_text).expanduser().resolve()
+    except Exception:
+        return None
+    rollout_mtime_ns = 0
+    rollout_size = -1
+    try:
+        rollout_stat = rollout_file.stat()
+        rollout_mtime_ns = int(rollout_stat.st_mtime_ns)
+        rollout_size = int(rollout_stat.st_size)
+        timestamp_ms = int(rollout_mtime_ns / 1_000_000)
+    except OSError:
+        timestamp_ms = parse_jsonl_timestamp_ms(meta.get("timestamp"))
+    return {
+        "sessionId": session_id,
+        "threadId": session_id,
+        "cwd": cwd,
+        "rolloutFile": rollout_file,
+        "rolloutMtimeNs": rollout_mtime_ns,
+        "rolloutSize": rollout_size,
+        "updatedAt": timestamp_ms,
+        "lastRunAt": timestamp_ms,
+        "status": "local",
+        "source": "local",
+    }
+
+
+def extract_local_codex_message_text(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def sanitize_imported_local_user_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^(?:(?:<image\b[^>]*>|</image>)\s*)+", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    if cleaned.startswith("<environment_context>") or cleaned.startswith("<turn_aborted>"):
+        return ""
+    if cleaned.startswith("<codex_internal_context"):
+        return ""
+    if cleaned.startswith("<goal_context>") or cleaned.startswith("<user_action>"):
+        return ""
+    bubblewrap_warning_tail = "Codex will use the bundled bubblewrap in the meantime."
+    if cleaned.startswith("⚠ Codex could not find bubblewrap on PATH."):
+        if bubblewrap_warning_tail in cleaned:
+            cleaned = cleaned.split(bubblewrap_warning_tail, 1)[1].lstrip()
+        else:
+            return ""
+        if not cleaned:
+            return ""
+    had_bridge_wrapper = False
+    if cleaned.startswith("[BridgeContext]"):
+        had_bridge_wrapper = True
+        marker = "\n\nUser request:\n"
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[1].strip()
+        elif "[/BridgeContext]" in cleaned:
+            cleaned = cleaned.split("[/BridgeContext]", 1)[1].strip()
+    compat_marker = "\n\n[RecentConversation]\n"
+    if (had_bridge_wrapper or cleaned.startswith("[RecentConversation]")) and compat_marker in cleaned:
+        cleaned = cleaned.split(compat_marker, 1)[0].rstrip()
+    return cleaned
+
+
+def load_local_codex_recent_chat(rollout_file: Path, *, limit: int = MAX_PERSISTED_SESSION_CHAT_ITEMS) -> list[dict[str, Any]]:
+    effective_limit = max(0, int(limit))
+    history: deque[dict[str, Any]] = deque(maxlen=effective_limit)
+    try:
+        with rollout_file.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("type") or "").strip() != "response_item":
+                    continue
+                item = payload.get("payload")
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").strip() != "message":
+                    continue
+                role = str(item.get("role") or "").strip()
+                if role not in {"user", "assistant"}:
+                    continue
+                text = extract_local_codex_message_text(item.get("content"))
+                if not text:
+                    continue
+                if role == "user":
+                    text = sanitize_imported_local_user_text(text)
+                    if not text:
+                        continue
+                else:
+                    if str(item.get("phase") or "").strip() == "commentary":
+                        continue
+                message = {"role": "user" if role == "user" else "bot", "text": text}
+                timestamp_sec = int(parse_jsonl_timestamp_ms(payload.get("timestamp")) / 1000)
+                if timestamp_sec > 0:
+                    message["time"] = timestamp_sec
+                history.append(message)
+    except Exception:
+        return []
+    return normalize_session_chat_items(list(history), limit=effective_limit)
+
+
+def list_local_codex_resume_candidates(current_cwd: Path) -> list[dict[str, Any]]:
+    resolved_cwd = current_cwd.expanduser().resolve()
+    latest_by_session: dict[str, dict[str, Any]] = {}
+    for rollout_file in iter_local_codex_rollout_files():
+        meta = read_local_codex_session_meta(rollout_file)
+        if not meta:
+            continue
+        session_id = str(meta["sessionId"])
+        if session_id in latest_by_session:
+            continue
+        latest_by_session[session_id] = dict(meta)
+    candidates = [candidate for candidate in latest_by_session.values() if candidate["cwd"] == resolved_cwd]
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("lastRunAt") or 0),
+            int(item.get("updatedAt") or 0),
+            str(item.get("sessionId") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def find_local_codex_resume_candidate(session_id: str, current_cwd: Path) -> Optional[dict[str, Any]]:
+    target_id = str(session_id or "").strip()
+    if not target_id:
+        return None
+    for candidate in list_local_codex_resume_candidates(current_cwd):
+        if target_id == str(candidate.get("sessionId") or "").strip():
+            return candidate
+    return None
 
 
 def session_run_is_current(sess: SessionState, current_task: Optional[asyncio.Task], run_generation: Optional[int]) -> bool:
     if run_generation is None:
         return sess.run_task is None or sess.run_task is current_task
     return sess.run_task is current_task and sess.run_generation == run_generation
+
+
+def create_agent_output_file(session_id: str) -> Path:
+    session_digest = hashlib.sha256(str(session_id or "").encode("utf-8")).hexdigest()[:16]
+    fd, path_text = tempfile.mkstemp(prefix=f"wecom-codex-py-{session_digest}-", suffix=".txt")
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return Path(path_text)
+
+
+def checkpoint_session_run_thread(sess: SessionState) -> None:
+    sess.active_run_thread_checkpoint = sess.thread_id
+    sess.active_run_thread_checkpoint_set = True
+
+
+def clear_session_run_thread_checkpoint(sess: SessionState) -> None:
+    sess.active_run_thread_checkpoint = None
+    sess.active_run_thread_checkpoint_set = False
+
+
+def restore_session_run_thread_checkpoint(sess: SessionState) -> None:
+    if sess.active_run_thread_checkpoint_set:
+        sess.thread_id = sess.active_run_thread_checkpoint
+    clear_session_run_thread_checkpoint(sess)
+
+
+def session_context_switch_is_quiescent(sess: SessionState) -> bool:
+    active_task = sess.run_task
+    active_proc = sess.proc
+    return not (
+        sess.running
+        or sess.queue
+        or sess.pending_final_payload
+        or sess.pending_media_downloads > 0
+        or sess.pending_media
+        or sess.pending_media_notes
+        or (active_task is not None and not active_task.done())
+        or (active_proc is not None and active_proc.returncode is None)
+    )
+
+
+def ensure_session_context_switch_quiescent(sess: SessionState) -> None:
+    if not session_context_switch_is_quiescent(sess):
+        raise BridgeError(409, "当前仍有任务或待发送结果，不能切换会话上下文。请先等待完成或使用 /bridge-interrupt。")
+    record = read_session_record_by_id(sess.session_id)
+    if record is not None:
+        ensure_session_control_safe(record)
+
+
+def acquire_session_context_switch_lease(bot: BotState, sess: SessionState, key: str) -> None:
+    if not acquire_session_lease(bot, sess, key):
+        raise BridgeError(409, f"session is owned by another instance: {key}")
 
 
 def resume_session_queue(bot: BotState, sess: SessionState, key: str, reason: str) -> None:
@@ -4277,10 +4842,20 @@ def process_queue(bot: BotState, sess: SessionState, key: str) -> None:
     sess.active_schedule_request_id = str(item.get("scheduleRequestId") or "").strip() or None
     pending_media = list(sess.pending_media)
     pending_media_notes = list(sess.pending_media_notes)
-    prompt = build_prompt(bot, sess, key, item["text"], pending_media, pending_media_notes)
+    compat_history = session_compat_history_snapshot(sess, key, item["text"], sess.queue)
+    prompt = build_prompt(
+        bot,
+        sess,
+        key,
+        item["text"],
+        pending_media,
+        pending_media_notes,
+        compat_history=compat_history,
+    )
     image_paths = [media["path"] for media in pending_media if media.get("kind") == "image"]
     sess.active_run_media = list(pending_media)
     sess.active_run_media_notes = list(pending_media_notes)
+    checkpoint_session_run_thread(sess)
     sess.pending_media = []
     sess.pending_media_notes = []
     task = asyncio.create_task(
@@ -4293,6 +4868,7 @@ def process_queue(bot: BotState, sess: SessionState, key: str) -> None:
             image_paths,
             scheduled_job_file=item.get("scheduledJobFile"),
             run_generation=run_generation,
+            compat_history=compat_history,
         )
     )
     sess.run_task = task
@@ -4318,6 +4894,7 @@ async def run_codex(
     allow_fresh_fallback: bool = True,
     scheduled_job_file: Optional[str] = None,
     run_generation: Optional[int] = None,
+    compat_history: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     semaphore = get_codex_run_semaphore()
     current_task = asyncio.current_task()
@@ -4330,17 +4907,24 @@ async def run_codex(
     process_started = False
     active_schedule_id = str(sess.active_schedule_id or "").strip() or None
     final_delivery_pending = False
+    local_resume_fallback = False
 
     def owns_context() -> bool:
-        return session_run_is_current(sess, current_task, run_generation)
+        return session_run_is_current(sess, current_task, run_generation) and session_lease_is_owned_by_current_instance(sess)
+
+    if owns_context():
+        checkpoint_session_run_thread(sess)
 
     try:
+        if not owns_context():
+            return
         await send_session_status(bot, key, sess, req_id, build_session_status_text("正在启动处理"))
         async with semaphore:
             while True:
                 if not owns_context():
                     return
                 if sess.interrupt_requested:
+                    restore_session_run_thread_checkpoint(sess)
                     sess.interrupt_requested = False
                     sess.running = False
                     sess.proc = None
@@ -4348,20 +4932,30 @@ async def run_codex(
                     sess.active_scheduled_job_file = None
                     sess.active_schedule_request_id = None
                     sess.last_active = time.time()
-                    update_session_record(
-                        sess.session_id,
+                    update_owned_session_record(
+                        bot,
+                        key,
+                        sess,
                         lambda record: {**record, "status": "idle", "activeScheduleId": None},
                     )
                     return
                 sess.last_active = time.time()
-                update_session_record(
-                    sess.session_id,
+                if update_owned_session_record(
+                    bot,
+                    key,
+                    sess,
                     lambda record: {**record, "status": "running", "activeScheduleId": active_schedule_id},
-                )
+                ) is None:
+                    return
 
-                output_file = Path(tempfile.gettempdir()) / f"wecom-codex-py-{sess.session_id}-{int(time.time() * 1000)}.txt"
+                output_file = create_agent_output_file(sess.session_id)
+                checkpoint_session_run_thread(sess)
                 attempted_resume = backend in {"codex", "claude"} and bool(sess.thread_id)
-                effective_prompt = prompt if attempted_resume else build_compat_history_prompt(bot, sess, prompt)
+                effective_prompt = (
+                    prompt
+                    if attempted_resume
+                    else build_compat_history_prompt(bot, sess, prompt, compat_history=compat_history)
+                )
                 args = build_codex_base_args(
                     output_file,
                     image_paths,
@@ -4372,7 +4966,11 @@ async def run_codex(
                 )
 
                 workspace_paths = await run_blocking(ensure_session_workspace_dirs, bot, key)
-                codex_home = await run_blocking(build_codex_home_for_subprocess, sess.session_id)
+                codex_home = await run_blocking(
+                    build_codex_home_for_subprocess,
+                    sess.session_id,
+                    use_global_sessions=sess.use_global_codex_sessions,
+                )
                 env = dict(os.environ)
                 env.update(
                     {
@@ -4404,13 +5002,10 @@ async def run_codex(
                 if agent_command:
                     env["WECOM_BRIDGE_AGENT_COMMAND"] = agent_command
                 env = codex_runtime.prepare_codex_subprocess_env(env, command=args[0] if args else None)
-                argv_prefix: list[str] = []
                 process_cwd = Path(sess.work_dir)
-                if backend == "claude":
-                    argv_prefix, env, process_cwd = prepare_claude_bridge_runtime(bot, sess, key, env)
 
                 process = await asyncio.create_subprocess_exec(
-                    *(argv_prefix + args),
+                    *args,
                     cwd=process_cwd,
                     env=env,
                     stdin=asyncio.subprocess.PIPE,
@@ -4438,7 +5033,7 @@ async def run_codex(
                     while sess.running:
                         await asyncio.sleep(max(0, next_tick_at - time.monotonic()))
                         next_tick_at += STATUS_STREAM_INTERVAL_SEC
-                        if not sess.running:
+                        if not sess.running or not owns_context():
                             return
                         elapsed = int(time.monotonic() - run_started_at)
                         if latest_message:
@@ -4500,30 +5095,42 @@ async def run_codex(
                         except asyncio.CancelledError:
                             pass
 
+                if not owns_context():
+                    return
+
                 stderr_text = "\n".join(stderr_parts)
                 resume_error_text = "\n".join(part for part in (stderr_text, str(prompt_write_error or "")) if part)
                 resume_state_missing = (
                     allow_fresh_fallback
                     and attempted_resume
                     and re.search(
-                        r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|failed to record rollout items: thread [0-9a-f-]+ not found|No conversation found with session ID:",
+                        r"no rollout found|no prompt provid\w* via stdin|thread [0-9a-f-]+ not found|"
+                        r"failed to record rollout items: thread [0-9a-f-]+ not found|"
+                        r"failed to resolve rollout path .*file does not exist|No conversation found with session ID:",
                         resume_error_text,
                         re.I,
                     )
                 )
                 if resume_state_missing:
-                    add_log(bot, f"[{key}] {backend} resume state missing, fallback to fresh exec")
+                    add_log(bot, f"[{key}] {backend} resume state missing, fallback to isolated fresh exec")
                     sess.proc = None
                     sess.thread_id = None
-                    update_session_record(
-                        sess.session_id,
+                    local_resume_fallback = sess.use_global_codex_sessions
+                    sess.use_global_codex_sessions = False
+                    checkpoint_session_run_thread(sess)
+                    if update_owned_session_record(
+                        bot,
+                        key,
+                        sess,
                         lambda record: {
                             **record,
                             "status": "starting",
                             "activeScheduleId": active_schedule_id,
                             "threadId": None,
+                            "useGlobalCodexSessions": False,
                         },
-                    )
+                    ) is None:
+                        return
                     try:
                         output_file.unlink()
                     except FileNotFoundError:
@@ -4548,12 +5155,16 @@ async def run_codex(
                 if not final:
                     final = extract_agent_reply(normalize_agent_backend(backend), "") or stderr_text or "(no output)"
 
+                if local_resume_fallback:
+                    final = f"提示：原本地 Codex 会话已不可用，已基于近期聊天创建新会话。\n\n{final}"
                 final = limit_stream_content(final)
+                clear_session_run_thread_checkpoint(sess)
                 break
 
         if not owns_context():
             return
         if sess.interrupt_requested:
+            restore_session_run_thread_checkpoint(sess)
             sess.interrupt_requested = False
             sess.running = False
             sess.proc = None
@@ -4563,9 +5174,16 @@ async def run_codex(
             sess.codex_runtime_status = None
             sess.last_active = time.time()
             restore_session_active_media(sess)
-            update_session_record(
-                sess.session_id,
-                lambda record: {**record, "status": "idle", "activeScheduleId": None},
+            update_owned_session_record(
+                bot,
+                key,
+                sess,
+                lambda record: {
+                    **record,
+                    "status": "idle",
+                    "activeScheduleId": None,
+                    "threadId": sess.thread_id,
+                },
             )
             resume_session_queue(bot, sess, key, "interrupt")
             return
@@ -4585,8 +5203,10 @@ async def run_codex(
             final_delivery_pending = not await send_or_store_session_payloads(bot, key, sess, final_payloads, True)
         add_log(bot, f"[{key}] reply completed ({len(final)} chars, exit={return_code})")
         append_session_chat_message(sess, {"role": "bot", "text": final, "time": int(time.time())})
-        update_session_record(
-            sess.session_id,
+        persisted_result = update_owned_session_record(
+            bot,
+            key,
+            sess,
             lambda record: {
                 **record,
                 "status": "idle" if return_code == 0 else "error",
@@ -4596,6 +5216,8 @@ async def run_codex(
                 "recentChat": session_recent_chat_snapshot(sess),
             },
         )
+        if persisted_result is None:
+            return
         if return_code == 0:
             sess.active_run_media = []
             sess.active_run_media_notes = []
@@ -4615,6 +5237,7 @@ async def run_codex(
             await terminate_process(active_process)
             if not owns_context():
                 return
+            restore_session_run_thread_checkpoint(sess)
             sess.running = False
             sess.proc = None
             sess.active_schedule_id = None
@@ -4627,9 +5250,16 @@ async def run_codex(
             sess.pending_final_payloads = None
             sess.last_active = time.time()
             restore_session_active_media(sess)
-            update_session_record(
-                sess.session_id,
-                lambda record: {**record, "status": "idle", "activeScheduleId": None},
+            update_owned_session_record(
+                bot,
+                key,
+                sess,
+                lambda record: {
+                    **record,
+                    "status": "idle",
+                    "activeScheduleId": None,
+                    "threadId": sess.thread_id,
+                },
             )
             resume_session_queue(bot, sess, key, "interrupt")
             return
@@ -4641,6 +5271,7 @@ async def run_codex(
         await terminate_process(active_process)
         if not owns_context():
             return
+        restore_session_run_thread_checkpoint(sess)
         sess.running = False
         sess.proc = None
         sess.active_schedule_id = None
@@ -4653,7 +5284,6 @@ async def run_codex(
         sess.pending_final_payload = None
         sess.pending_final_payloads = None
         restore_session_active_media(sess)
-        error_text = f"Error: {'failed to start Codex' if not process_started else 'Codex run failed'}: {exc}"
         error_text = f"Error: {'failed to start agent' if not process_started else 'agent run failed'}: {exc}"
         add_log(bot, f"[{key}] {backend} task failed: {exc}")
         try:
@@ -4664,8 +5294,10 @@ async def run_codex(
             add_log(bot, f"[{key}] failed to report codex error: {send_exc}")
         append_session_chat_message(sess, {"role": "bot", "text": error_text, "time": int(time.time())})
         try:
-            update_session_record(
-                sess.session_id,
+            update_owned_session_record(
+                bot,
+                key,
+                sess,
                 lambda record: {
                     **record,
                     "status": "error",
@@ -4686,6 +5318,7 @@ async def run_codex(
         await terminate_process(active_process)
         if not owns_context():
             raise
+        restore_session_run_thread_checkpoint(sess)
         sess.running = False
         sess.proc = None
         sess.active_schedule_id = None
@@ -4698,9 +5331,16 @@ async def run_codex(
         sess.pending_final_payload = None
         sess.pending_final_payloads = None
         restore_session_active_media(sess)
-        update_session_record(
-            sess.session_id,
-            lambda record: {**record, "status": "idle", "activeScheduleId": None},
+        update_owned_session_record(
+            bot,
+            key,
+            sess,
+            lambda record: {
+                **record,
+                "status": "idle",
+                "activeScheduleId": None,
+                "threadId": sess.thread_id,
+            },
         )
         if sess.interrupt_requested:
             sess.interrupt_requested = False
@@ -4732,11 +5372,13 @@ def recycle_session(bot: BotState, sess: SessionState, key: str) -> None:
     sess.pending_stream_payloads = None
     sess.pending_final_payload = None
     sess.pending_final_payloads = None
+    sess.late_ack_payloads.clear()
+    sess.pending_payload_retry_after = 0.0
     sess.active_run_media = []
     sess.active_run_media_notes = []
+    clear_session_run_thread_checkpoint(sess)
     cleanup_session_reply_contexts(bot, sess)
     release_session_lease(bot, key, sess)
-    update_session_record(sess.session_id, lambda record: {**record, "status": "idle", "activeScheduleId": None})
     bot.sessions.pop(key, None)
 
 
@@ -4754,7 +5396,10 @@ def interrupt_session(
     had_active_run = bool(sess.running or (active_task and not active_task.done()) or (active_proc and active_proc.returncode is None))
     sess.interrupt_requested = had_active_run
     if had_active_run:
+        restore_session_run_thread_checkpoint(sess)
         sess.run_generation += 1
+    else:
+        clear_session_run_thread_checkpoint(sess)
     if active_task and not active_task.done():
         active_task.cancel()
     if active_proc and active_proc.returncode is None:
@@ -4771,6 +5416,7 @@ def interrupt_session(
     else:
         sess.active_run_media = []
         sess.active_run_media_notes = []
+    clear_session_run_thread_checkpoint(sess)
     if clear_queue:
         recover_session_scheduled_jobs(sess)
         sess.queue.clear()
@@ -4784,25 +5430,34 @@ def interrupt_session(
             add_log(bot, f"[{key}] cancelled pending file sends: {cancelled_file_jobs}")
     if clear_chat:
         sess.chat.clear()
-    if clear_queue:
+    if clear_thread:
         sess.pending_media.clear()
         sess.pending_media_notes.clear()
         sess.pending_media_downloads = 0
         remove_session_codex_home(sess.session_id)
+    elif clear_queue:
+        sess.pending_media.clear()
+        sess.pending_media_notes.clear()
+        sess.pending_media_downloads = 0
     sess.pending_stream_payload = None
     sess.pending_stream_payloads = None
     sess.pending_final_payload = None
     sess.pending_final_payloads = None
+    sess.late_ack_payloads.clear()
+    sess.pending_payload_retry_after = 0.0
     cleanup_session_reply_contexts(bot, sess)
     if clear_thread:
         sess.thread_id = None
+        sess.use_global_codex_sessions = False
     sess.last_active = time.time()
     keep_lease = sess.lease_owned and not clear_queue and bool(sess.queue)
     if keep_lease:
         current_lease = read_lease(sess.lock_file) if sess.lock_file else None
         lease_expires_at = current_lease.get("expiresAt") if isinstance(current_lease, dict) else None
-        update_session_record(
-            sess.session_id,
+        update_owned_session_record(
+            bot,
+            key,
+            sess,
             lambda record: {
                 **record,
                 "ownerInstance": INSTANCE_ID,
@@ -4812,13 +5467,16 @@ def interrupt_session(
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
                 "threadId": sess.thread_id,
+                "useGlobalCodexSessions": sess.use_global_codex_sessions,
+                "localResumeBackup": None if clear_thread or clear_chat else record.get("localResumeBackup"),
                 "recentChat": session_recent_chat_snapshot(sess),
             },
         )
     else:
-        release_session_lease(bot, key, sess)
-        update_session_record(
-            sess.session_id,
+        release_session_lease_and_update(
+            bot,
+            key,
+            sess,
             lambda record: {
                 **record,
                 "ownerInstance": None,
@@ -4828,9 +5486,55 @@ def interrupt_session(
                 "activeScheduleId": None,
                 "lastRunAt": now_ms(),
                 "threadId": sess.thread_id,
+                "useGlobalCodexSessions": sess.use_global_codex_sessions,
+                "localResumeBackup": None if clear_thread or clear_chat else record.get("localResumeBackup"),
                 "recentChat": session_recent_chat_snapshot(sess),
             },
         )
+
+
+def abandon_session_after_lease_loss(bot: BotState, key: str, sess: SessionState) -> None:
+    active_task = sess.run_task
+    active_proc = sess.proc
+    had_active_run = bool(
+        sess.running
+        or (active_task is not None and not active_task.done())
+        or (active_proc is not None and active_proc.returncode is None)
+    )
+    add_log(bot, f"[{key}] abandoned local session state after lease loss")
+    add_event_log(
+        bot,
+        "session.lease_lost",
+        chatKey=key,
+        sessionId=sess.session_id,
+        activeRun=had_active_run,
+    )
+    if had_active_run:
+        sess.run_generation += 1
+    if active_task is not None and not active_task.done():
+        active_task.cancel()
+    if active_proc is not None and active_proc.returncode is None:
+        try:
+            active_proc.kill()
+        except ProcessLookupError:
+            pass
+    sess.running = False
+    sess.interrupt_requested = False
+    sess.proc = None
+    sess.active_schedule_id = None
+    sess.active_scheduled_job_file = None
+    sess.active_schedule_request_id = None
+    sess.codex_runtime_status = None
+    sess.pending_stream_payload = None
+    sess.pending_stream_payloads = None
+    sess.pending_final_payload = None
+    sess.pending_final_payloads = None
+    sess.late_ack_payloads.clear()
+    sess.pending_payload_retry_after = 0.0
+    sess.active_run_media = []
+    sess.active_run_media_notes = []
+    clear_session_run_thread_checkpoint(sess)
+    cleanup_session_reply_contexts(bot, sess)
 
 
 async def reset_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
@@ -4859,30 +5563,40 @@ async def cwd_session_command(bot: BotState, key: str, req_id: Optional[str], ra
         register_reply_session(bot, req_id, sess)
         await respond_info(bot, req_id, "仅 personal 模式支持 /cwd；team 模式不允许切换。")
         return
-    if sess.running:
-        register_reply_session(bot, req_id, sess)
-        await respond_info(bot, req_id, "当前有任务在运行，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。")
-        return
     current_cwd = get_session_runtime_cwd(bot, key, session_id=sess.session_id)
     argument = str(raw_argument or "").strip()
     if not argument:
         register_reply_session(bot, req_id, sess)
         await respond_info(bot, req_id, f"Current cwd: {current_cwd}")
         return
+    if not session_context_switch_is_quiescent(sess):
+        register_reply_session(bot, req_id, sess)
+        if sess.running:
+            message = "当前有任务在运行，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。"
+        else:
+            message = "当前仍有任务或待发送结果，不能切换 cwd。请先等待完成或使用 /bridge-interrupt。"
+        await respond_info(bot, req_id, message)
+        return
+    acquire_session_context_switch_lease(bot, sess, key)
     requested_path = Path(argument).expanduser()
     resolved_argument = (current_cwd / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
     next_cwd = resolve_personal_cwd_for_bot(bot, resolved_argument)
     changed = next_cwd != current_cwd
     if changed:
         sess.thread_id = None
+        sess.use_global_codex_sessions = False
         clear_resume_selection(sess)
-    update_session_record(
-        sess.session_id,
+    update_owned_session_record(
+        bot,
+        key,
+        sess,
         lambda record: {
             **record,
             "cwdDir": str(next_cwd),
             "updatedAt": now_ms(),
             "threadId": sess.thread_id,
+            "useGlobalCodexSessions": sess.use_global_codex_sessions,
+            "localResumeBackup": None if changed else record.get("localResumeBackup"),
         },
     )
     sess.work_dir = str(next_cwd)
@@ -4979,6 +5693,8 @@ def build_resume_candidates(bot: BotState, key: str) -> list[dict[str, Any]]:
         candidate_key = str(record.get("chatKey") or "").strip()
         if not thread_id or not candidate_key or session_id in seen_session_ids:
             continue
+        if normalize_internal_bool_flag(record.get("useGlobalCodexSessions"), default=False):
+            continue
         if not resume_record_is_visible_to_chat(candidate_key, key):
             continue
         seen_session_ids.add(session_id)
@@ -4995,6 +5711,41 @@ def build_resume_candidates(bot: BotState, key: str) -> list[dict[str, Any]]:
     return candidates
 
 
+def resolve_bridge_resume_candidate(bot: BotState, key: str, session_id: str) -> dict[str, Any]:
+    target_id = str(session_id or "").strip()
+    record = read_session_record_by_id(target_id)
+    if not record:
+        raise BridgeError(404, f"session not found: {target_id}")
+    if str(record.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+        raise BridgeError(403, "session is not resumable from current bot")
+    candidate_key = str(record.get("chatKey") or "").strip()
+    if not resume_record_is_visible_to_chat(candidate_key, key):
+        raise BridgeError(403, "session is not resumable from current chat")
+    if normalize_internal_bool_flag(record.get("useGlobalCodexSessions"), default=False):
+        if not local_resume_binding_allowed_for_chat(bot.config, key):
+            raise BridgeError(403, "selected local session binding is no longer authorized")
+        raise BridgeError(409, "本地 Codex 会话不能通过 /bridge-resume 继承，请使用 /local-resume。")
+    runtime_thread_id = next(
+        (
+            str(runtime_sess.thread_id or "").strip()
+            for runtime_sess in bot.sessions.values()
+            if runtime_sess.session_id == target_id and str(runtime_sess.thread_id or "").strip()
+        ),
+        "",
+    )
+    thread_id = runtime_thread_id or str(record.get("threadId") or "").strip()
+    if not thread_id:
+        raise BridgeError(404, "selected session is no longer resumable")
+    return {
+        "sessionId": record["sessionId"],
+        "chatKey": candidate_key,
+        "threadId": thread_id,
+        "updatedAt": int(record.get("updatedAt") or record.get("createdAt") or 0),
+        "lastRunAt": int(record.get("lastRunAt") or 0),
+        "status": str(record.get("status") or "idle"),
+    }
+
+
 def format_resume_candidate_line(index: int, candidate: dict[str, Any]) -> str:
     ts = int(candidate.get("lastRunAt") or candidate.get("updatedAt") or 0)
     ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1000)) if ts > 0 else "-"
@@ -5006,6 +5757,20 @@ def build_resume_candidates_message(candidates: list[dict[str, Any]]) -> str:
     lines = ["检测到以下可恢复会话，请回复编号或直接回复 /bridge-resume <sessionId>："]
     for index, candidate in enumerate(candidates, start=1):
         lines.append(format_resume_candidate_line(index, candidate))
+    lines.append("回复“取消”可退出恢复选择。")
+    return "\n".join(lines)
+
+
+def format_local_resume_candidate_line(index: int, candidate: dict[str, Any]) -> str:
+    ts = int(candidate.get("lastRunAt") or candidate.get("updatedAt") or 0)
+    ts_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1000)) if ts > 0 else "-"
+    return f"{index}. {candidate['sessionId']}  {ts_text}  cwd={candidate['cwd']}"
+
+
+def build_local_resume_candidates_message(candidates: list[dict[str, Any]]) -> str:
+    lines = ["检测到以下当前目录下的本地会话，请回复编号或直接回复 /local-resume <sessionId>："]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.append(format_local_resume_candidate_line(index, candidate))
     lines.append("回复“取消”可退出恢复选择。")
     return "\n".join(lines)
 
@@ -5039,27 +5804,129 @@ def select_resume_candidate(sess: SessionState, token: str) -> Optional[dict[str
     return None
 
 
+def find_local_resume_thread_binding(
+    thread_id: str,
+    *,
+    excluding_session_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    target_thread_id = str(thread_id or "").strip()
+    excluded_session_id = str(excluding_session_id or "").strip()
+    if not target_thread_id:
+        return None
+    sessions_root = SESSION_REGISTRY_ROOT / "sessions"
+    if sessions_root.exists():
+        for session_file in sessions_root.glob("*.json"):
+            record = normalize_session_record(read_json_file(session_file, None))
+            if not record or str(record.get("sessionId") or "").strip() == excluded_session_id:
+                continue
+            if not normalize_internal_bool_flag(record.get("useGlobalCodexSessions"), default=False):
+                continue
+            if str(record.get("threadId") or "").strip() != target_thread_id:
+                continue
+            record_bot_config = get_authoritative_bot_config(str(record.get("botId") or ""))
+            if not record_bot_config or not local_resume_binding_allowed_for_chat(
+                record_bot_config,
+                str(record.get("chatKey") or ""),
+            ):
+                continue
+            return record
+    for runtime_bot in BOTS.values():
+        for runtime_key, runtime_sess in runtime_bot.sessions.items():
+            if runtime_sess.session_id == excluded_session_id or not runtime_sess.use_global_codex_sessions:
+                continue
+            if str(runtime_sess.thread_id or "").strip() != target_thread_id:
+                continue
+            if not local_resume_binding_allowed_for_chat(runtime_bot.config, runtime_key):
+                continue
+            return {
+                "sessionId": runtime_sess.session_id,
+                "botId": str(runtime_bot.config.get("id") or ""),
+                "chatKey": runtime_key,
+            }
+    return None
+
+
 def bind_resume_candidate_to_session(
     bot: BotState,
     sess: SessionState,
     key: str,
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
+    ensure_session_context_switch_quiescent(sess)
+    acquire_session_context_switch_lease(bot, sess, key)
     thread_id = str(candidate.get("threadId") or "").strip()
     if not thread_id:
         raise BridgeError(404, "selected session is no longer resumable")
+    source = str(candidate.get("source") or "bridge").strip().lower() or "bridge"
+    if source == "local":
+        with local_resume_thread_binding_lock(thread_id):
+            conflict = find_local_resume_thread_binding(thread_id, excluding_session_id=sess.session_id)
+            if conflict is not None:
+                raise BridgeError(409, "该本地 Codex 会话已绑定到其他企微会话，请先在原会话执行 /local-detach。")
+            copied_recent_chat = [dict(item) for item in normalize_session_chat_items(candidate.get("recentChat"))]
+            was_using_global_codex_sessions = sess.use_global_codex_sessions
+            local_resume_backup = None
+            if not was_using_global_codex_sessions:
+                current_recent_chat = session_recent_chat_snapshot(sess)
+                if sess.thread_id or current_recent_chat:
+                    local_resume_backup = {
+                        "threadId": sess.thread_id,
+                        "recentChat": current_recent_chat,
+                        "useGlobalCodexSessions": False,
+                        "savedAt": now_ms(),
+                    }
+            sess.thread_id = thread_id
+            sess.chat = copied_recent_chat
+            sess.use_global_codex_sessions = True
+            update_owned_session_record(
+                bot,
+                key,
+                sess,
+                lambda record: {
+                    **record,
+                    "lastRunAt": now_ms(),
+                    "threadId": thread_id,
+                    "useGlobalCodexSessions": True,
+                    "localResumeBackup": (
+                        normalize_local_resume_backup(record.get("localResumeBackup"))
+                        if was_using_global_codex_sessions
+                        else local_resume_backup
+                    ),
+                    "recentChat": copied_recent_chat,
+                },
+            )
+        clear_resume_selection(sess)
+        add_log(bot, f"[{key}] bound local codex session thread={thread_id} cwd={candidate.get('cwd')}")
+        return {
+            "sourceSessionId": thread_id,
+            "sourceChatKey": None,
+            "threadId": thread_id,
+            "source": "local",
+        }
     target_record = read_session_record_by_id(str(candidate["sessionId"]))
     if not target_record:
         raise BridgeError(404, f"session not found: {candidate['sessionId']}")
+    if str(target_record.get("botId") or "").strip() != str(bot.config.get("id") or "").strip():
+        raise BridgeError(403, "session is not resumable from current bot")
     copied_recent_chat = [dict(item) for item in normalize_session_chat_items(target_record.get("recentChat"))]
+    use_global_codex_sessions = normalize_internal_bool_flag(target_record.get("useGlobalCodexSessions"), default=False)
+    if use_global_codex_sessions:
+        if not local_resume_binding_allowed_for_chat(bot.config, key):
+            raise BridgeError(403, "selected local session binding is no longer authorized")
+        raise BridgeError(409, "本地 Codex 会话不能通过 /bridge-resume 继承，请使用 /local-resume。")
     sess.thread_id = thread_id
     sess.chat = copied_recent_chat
-    update_session_record(
-        sess.session_id,
+    sess.use_global_codex_sessions = False
+    update_owned_session_record(
+        bot,
+        key,
+        sess,
         lambda record: {
             **record,
             "lastRunAt": now_ms(),
             "threadId": thread_id,
+            "useGlobalCodexSessions": False,
+            "localResumeBackup": None,
             "recentChat": copied_recent_chat,
         },
     )
@@ -5089,11 +5956,116 @@ async def start_resume_selection_command(bot: BotState, key: str, req_id: Option
     await respond_info(bot, req_id, build_resume_candidates_message(candidates))
 
 
+def local_resume_owner_user_id_for_bot(config: dict[str, Any]) -> Optional[str]:
+    return normalize_optional_user_id(config.get("localResumeOwnerUserId") or config.get("local_resume_owner_user_id"))
+
+
+def local_resume_binding_allowed_for_chat(config: dict[str, Any], key: str) -> bool:
+    if bot_workspace_mode(config) != "personal" or bot_agent_backend(config) != "codex" or key.startswith("group:"):
+        return False
+    owner_user_id = local_resume_owner_user_id_for_bot(config)
+    return owner_user_id is not None and chat_key_to_user_id(key) == owner_user_id
+
+
+async def hydrate_local_resume_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    source = str(candidate.get("source") or "").strip().lower()
+    if source != "local" or candidate.get("recentChat") is not None:
+        return candidate
+    rollout_file = candidate.get("rolloutFile")
+    if not isinstance(rollout_file, Path):
+        return candidate
+    recent_chat = await run_blocking(load_local_codex_recent_chat, rollout_file)
+    return {**candidate, "recentChat": recent_chat}
+
+
+def local_resume_candidate_revision(candidate: dict[str, Any]) -> tuple[str, str, str, int, int]:
+    return (
+        str(candidate.get("sessionId") or "").strip(),
+        str(candidate.get("rolloutFile") or ""),
+        str(candidate.get("cwd") or ""),
+        int(candidate.get("rolloutMtimeNs") or 0),
+        int(candidate.get("rolloutSize") if candidate.get("rolloutSize") is not None else -1),
+    )
+
+
+async def resolve_hydrated_local_resume_candidate(session_id: str, current_cwd: Path) -> dict[str, Any]:
+    target_id = str(session_id or "").strip()
+    for _ in range(3):
+        candidate = await run_blocking(find_local_codex_resume_candidate, target_id, current_cwd)
+        if not candidate:
+            raise BridgeError(404, f"local session not found for current cwd: {target_id}")
+        hydrated = await hydrate_local_resume_candidate(candidate)
+        latest = await run_blocking(find_local_codex_resume_candidate, target_id, current_cwd)
+        if not latest:
+            raise BridgeError(404, f"local session not found for current cwd: {target_id}")
+        if local_resume_candidate_revision(candidate) == local_resume_candidate_revision(latest):
+            return hydrated
+    raise BridgeError(409, f"local session changed while loading; retry: {target_id}")
+
+
+def ensure_local_resume_allowed(bot: BotState, sess: SessionState, key: str, *, sender_user_id: Optional[str]) -> Path:
+    if bot_workspace_mode(bot.config) != "personal":
+        raise BridgeError(400, "仅 personal 模式支持本地会话命令。")
+    if bot_agent_backend(bot.config) != "codex":
+        raise BridgeError(400, "仅 codex backend 支持本地会话命令。")
+    if key.startswith("group:"):
+        raise BridgeError(403, "shared 群会话不支持本地会话命令。")
+    owner_user_id = local_resume_owner_user_id_for_bot(bot.config)
+    if not owner_user_id:
+        raise BridgeError(403, "当前 bot 未启用本地会话命令；请先配置 localResumeOwnerUserId。")
+    current_user_id = normalize_optional_user_id(sender_user_id)
+    if current_user_id != owner_user_id:
+        raise BridgeError(403, "当前用户无权使用本地会话命令。")
+    ensure_session_context_switch_quiescent(sess)
+    acquire_session_context_switch_lease(bot, sess, key)
+    return Path(sess.work_dir).expanduser().resolve()
+
+
+async def start_local_resume_selection_command(
+    bot: BotState,
+    key: str,
+    req_id: Optional[str],
+    *,
+    sender_user_id: Optional[str],
+) -> None:
+    sess = get_or_create_session(bot, key)
+    current_cwd = ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
+    candidates = await run_blocking(list_local_codex_resume_candidates, current_cwd)
+    if not candidates:
+        clear_resume_selection(sess)
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "当前目录下没有可恢复的本机会话。")
+        return
+    sess.resume_candidates = candidates
+    sess.resume_selection_expires_at = now_ms() + RESUME_SELECTION_TTL_MS
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, build_local_resume_candidates_message(candidates))
+
+
+async def local_resume_session_command(
+    bot: BotState,
+    key: str,
+    req_id: Optional[str],
+    session_id: str,
+    *,
+    sender_user_id: Optional[str],
+) -> None:
+    sess = get_or_create_session(bot, key)
+    current_cwd = ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
+    candidate = await resolve_hydrated_local_resume_candidate(session_id, current_cwd)
+    ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
+    bound = bind_resume_candidate_to_session(bot, sess, key, candidate)
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, f"已切换到本地会话 {bound['sourceSessionId']}，接下来会继续该上下文。")
+
+
 async def apply_resume_selection_command(
     bot: BotState,
     key: str,
     req_id: Optional[str],
     token: str,
+    *,
+    sender_user_id: Optional[str],
 ) -> bool:
     sess = get_or_create_session(bot, key)
     if not resume_selection_active(sess):
@@ -5110,45 +6082,80 @@ async def apply_resume_selection_command(
         register_reply_session(bot, req_id, sess)
         await respond_info(bot, req_id, "无效选择，请回复列表编号、sessionId，或回复“取消”。")
         return True
+    if str(candidate.get("source") or "").strip().lower() == "local":
+        current_cwd = ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
+        session_id = str(candidate.get("sessionId") or "").strip()
+        try:
+            candidate = await resolve_hydrated_local_resume_candidate(session_id, current_cwd)
+        except BridgeError as exc:
+            if exc.status_code == 404:
+                clear_resume_selection(sess)
+            raise
+    else:
+        candidate = resolve_bridge_resume_candidate(bot, key, str(candidate.get("sessionId") or ""))
+    if str(candidate.get("source") or "").strip().lower() == "local":
+        ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
     bound = bind_resume_candidate_to_session(bot, sess, key, candidate)
     register_reply_session(bot, req_id, sess)
-    await respond_info(
-        bot,
-        req_id,
-        f"已选择会话 {bound['sourceSessionId']}，接下来会继续该上下文。",
-    )
+    if str(bound.get("source") or "").strip() == "local":
+        await respond_info(bot, req_id, f"已切换到本地会话 {bound['sourceSessionId']}，接下来会继续该上下文。")
+    else:
+        await respond_info(bot, req_id, f"已选择会话 {bound['sourceSessionId']}，接下来会继续该上下文。")
     return True
 
 
 async def resume_session_command(bot: BotState, key: str, req_id: Optional[str], session_id: str) -> None:
     sess = get_or_create_session(bot, key)
-    record = read_session_record_by_id(session_id)
-    if not record:
-        raise BridgeError(404, f"session not found: {session_id}")
-    candidate_key = str(record.get("chatKey") or "").strip()
-    if not resume_record_is_visible_to_chat(candidate_key, key):
-        raise BridgeError(403, "session is not resumable from current chat")
-    candidate = {
-        "sessionId": record["sessionId"],
-        "chatKey": candidate_key,
-        "threadId": str(
-            next(
-                (
-                    runtime_sess.thread_id
-                    for runtime_sess in bot.sessions.values()
-                    if runtime_sess.session_id == record["sessionId"] and str(runtime_sess.thread_id or "").strip()
-                ),
-                "",
-            )
-            or ""
-        ).strip(),
-        "updatedAt": int(record.get("updatedAt") or record.get("createdAt") or 0),
-        "lastRunAt": int(record.get("lastRunAt") or 0),
-        "status": str(record.get("status") or "idle"),
-    }
+    candidate = resolve_bridge_resume_candidate(bot, key, session_id)
     bound = bind_resume_candidate_to_session(bot, sess, key, candidate)
     register_reply_session(bot, req_id, sess)
     await respond_info(bot, req_id, f"已选择会话 {bound['sourceSessionId']}，接下来会继续该上下文。")
+
+
+async def local_detach_session_command(
+    bot: BotState,
+    key: str,
+    req_id: Optional[str],
+    *,
+    sender_user_id: Optional[str],
+) -> None:
+    sess = get_or_create_session(bot, key)
+    try:
+        ensure_local_resume_allowed(bot, sess, key, sender_user_id=sender_user_id)
+    except BridgeError as exc:
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, exc.message)
+        return
+    record = read_session_record_by_id(sess.session_id) or {}
+    backup = normalize_local_resume_backup(record.get("localResumeBackup"))
+    if not sess.use_global_codex_sessions and backup is None:
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "当前未绑定本地会话。")
+        return
+    if backup is not None:
+        sess.thread_id = str(backup.get("threadId") or "").strip() or None
+        sess.use_global_codex_sessions = False
+        sess.chat = [dict(item) for item in normalize_session_chat_items(backup.get("recentChat"))]
+    else:
+        sess.thread_id = None
+        sess.use_global_codex_sessions = False
+        sess.chat = []
+    clear_resume_selection(sess)
+    update_owned_session_record(
+        bot,
+        key,
+        sess,
+        lambda record: {
+            **record,
+            "updatedAt": now_ms(),
+            "threadId": sess.thread_id,
+            "useGlobalCodexSessions": sess.use_global_codex_sessions,
+            "localResumeBackup": None,
+            "recentChat": session_recent_chat_snapshot(sess),
+        },
+    )
+    register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, "已解除本地会话绑定。")
 
 
 async def status_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
@@ -5225,25 +6232,34 @@ def control_session(bot: BotState, key: str, clear_thread: bool, clear_chat: boo
             write_json_atomic(get_registry_key_file(bot.config["id"], key), build_session_key_entry(record))
     if not record:
         raise BridgeError(404, f"session not found: {key}")
-    ensure_session_control_safe(record)
-
-    update_session_record(
-        record["sessionId"],
-        lambda current: {
-            **current,
-            "ownerInstance": None,
-            "ownerPid": None,
-            "leaseExpiresAt": None,
-            "status": "idle",
-            "activeScheduleId": None,
-            "lastRunAt": now_ms(),
-        },
-    )
-    lock_file = Path(record["lockFile"])
-    try:
-        lock_file.unlink()
-    except FileNotFoundError:
-        pass
+    with session_key_lock(str(bot.config["id"]), key):
+        current_record = read_session_record_by_id(str(record["sessionId"]))
+        if not current_record:
+            raise BridgeError(404, f"session not found: {key}")
+        ensure_session_control_safe(current_record)
+        update_session_record(
+            current_record["sessionId"],
+            lambda current: {
+                **current,
+                "ownerInstance": None,
+                "ownerPid": None,
+                "leaseExpiresAt": None,
+                "status": "idle",
+                "activeScheduleId": None,
+                "useGlobalCodexSessions": False if clear_thread else normalize_internal_bool_flag(current.get("useGlobalCodexSessions"), default=False),
+                "localResumeBackup": None if clear_thread or clear_chat else current.get("localResumeBackup"),
+                "lastRunAt": now_ms(),
+                "threadId": None if clear_thread else current.get("threadId"),
+                "recentChat": [] if clear_chat else current.get("recentChat"),
+            },
+        )
+        lock_file = Path(current_record["lockFile"])
+        try:
+            lock_file.unlink()
+        except FileNotFoundError:
+            pass
+    if clear_thread:
+        remove_session_codex_home(record["sessionId"])
     return {
         "key": key,
         "sessionId": record["sessionId"],
@@ -6686,8 +7702,7 @@ def acquire_schedule_definition_lock(schedule_id: str) -> bool:
             existing["count"] = int(existing.get("count") or 0) + 1
             return True
         return False
-    lock_file = _prepare_flock_lock_file(lock_file)
-    handle = open(lock_file, "a+", encoding="utf-8")
+    handle = _open_flock_lock_file(lock_file)
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -7524,6 +8539,10 @@ def normalize_optional_string(value: Any) -> Optional[str]:
     return text
 
 
+def normalize_optional_user_id(value: Any) -> Optional[str]:
+    return normalize_optional_string(value)
+
+
 def normalize_enabled_flag(value: Any, *, status_code: int) -> bool:
     if isinstance(value, bool):
         return value
@@ -7548,30 +8567,6 @@ def normalize_internal_bool_flag(value: Any, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off"}:
         return False
     return default
-
-
-def prepare_claude_bridge_runtime(
-    bot: BotState,
-    sess: SessionState,
-    key: str,
-    env: dict[str, str],
-) -> tuple[list[str], dict[str, str], Path]:
-    run_as_user = bot_agent_run_as_user(bot.config)
-    if not run_as_user:
-        return [], env, Path(sess.work_dir)
-    run_as_group = bot_agent_run_as_group(bot.config)
-    uid, gid = resolve_posix_identity(run_as_user, run_as_group)
-    runtime_root = bot_agent_runtime_root(bot.config) or (INSTANCE_RUNTIME_ROOT / "claude-runtime")
-    layout = prepare_claude_runtime_root(
-        runtime_root,
-        session_id=sess.session_id,
-        source_claude_root=Path("/root/.claude"),
-        uid=uid,
-        gid=gid,
-    )
-    wrapped_env = apply_claude_runtime_env(env, layout)
-    argv_prefix = build_setpriv_prefix(uid, gid)
-    return argv_prefix, wrapped_env, Path(sess.work_dir)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -7656,11 +8651,6 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
         fallback_for_missing="team" if any(key in data for key in ("createdAt", "created_at", "updatedAt", "updated_at")) else None,
     )
     config_id = normalize_optional_string(data.get("id")) or uid()
-    agent_runtime_root = normalize_optional_path(data.get("agentRuntimeRoot") or data.get("agent_runtime_root")) or None
-    if agent_runtime_root:
-        resolved_agent_runtime_root = Path(agent_runtime_root)
-        if resolved_agent_runtime_root.exists() and not resolved_agent_runtime_root.is_dir():
-            raise BridgeError(400, f"agentRuntimeRoot is not a directory: {resolved_agent_runtime_root}")
     workspace_namespace = normalize_optional_string(data.get("workspaceNamespace") or data.get("workspace_namespace")) or config_id
     normalized = {
         "id": config_id,
@@ -7674,11 +8664,14 @@ def normalize_bot_config(data: dict[str, Any], *, allow_inline_secret: bool = Fa
         "workspaceMode": workspace_mode,
         "agentBackend": agent_backend,
         "agentCommand": normalize_agent_command(data.get("agentCommand") or data.get("agent_command")),
-        "agentRunAsUser": normalize_optional_run_as(data.get("agentRunAsUser") or data.get("agent_run_as_user")),
-        "agentRunAsGroup": normalize_optional_run_as(data.get("agentRunAsGroup") or data.get("agent_run_as_group")),
-        "agentRuntimeRoot": agent_runtime_root,
+        "agentRunAsUser": None,
+        "agentRunAsGroup": None,
+        "agentRuntimeRoot": None,
         "enabled": normalize_enabled_flag(data.get("enabled", True), status_code=400),
         "restartToken": normalize_optional_string(data.get("restartToken") or data.get("restart_token")),
+        "localResumeOwnerUserId": normalize_optional_user_id(
+            data.get("localResumeOwnerUserId") or data.get("local_resume_owner_user_id")
+        ),
     }
     if secret_file:
         normalized["secretFile"] = secret_file
@@ -7739,10 +8732,12 @@ def normalize_persisted_bot_config(record: dict[str, Any]) -> dict[str, Any]:
     except ValueError as exc:
         raise BridgeError(500, str(exc)) from exc
     normalized["agentCommand"] = normalize_agent_command(normalized.get("agentCommand") or normalized.get("agent_command"))
-    normalized["agentRunAsUser"] = normalize_optional_run_as(normalized.get("agentRunAsUser") or normalized.get("agent_run_as_user"))
-    normalized["agentRunAsGroup"] = normalize_optional_run_as(normalized.get("agentRunAsGroup") or normalized.get("agent_run_as_group"))
-    agent_runtime_root = normalize_optional_path(normalized.get("agentRuntimeRoot") or normalized.get("agent_runtime_root")) or None
-    normalized["agentRuntimeRoot"] = agent_runtime_root
+    normalized["agentRunAsUser"] = None
+    normalized["agentRunAsGroup"] = None
+    normalized["agentRuntimeRoot"] = None
+    normalized["localResumeOwnerUserId"] = normalize_optional_user_id(
+        normalized.get("localResumeOwnerUserId") or normalized.get("local_resume_owner_user_id")
+    )
     if "enabled" in normalized:
         normalized["enabled"] = normalize_enabled_flag(normalized.get("enabled"), status_code=500)
     if normalize_internal_bool_flag(normalized.get("bootstrapManaged"), default=False):
@@ -7817,9 +8812,15 @@ def load_env_bootstrap_bot_configs() -> list[dict[str, Any]]:
             ).strip()
             or None,
             "agentCommand": str(os.environ.get("WECOM_BOT_AGENT_COMMAND") or os.environ.get("AGENT_COMMAND") or "").strip() or None,
-            "agentRunAsUser": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_USER") or os.environ.get("AGENT_RUN_AS_USER") or "").strip() or None,
-            "agentRunAsGroup": str(os.environ.get("WECOM_BOT_AGENT_RUN_AS_GROUP") or os.environ.get("AGENT_RUN_AS_GROUP") or "").strip() or None,
-            "agentRuntimeRoot": str(os.environ.get("WECOM_BOT_AGENT_RUNTIME_ROOT") or os.environ.get("AGENT_RUNTIME_ROOT") or "").strip() or None,
+            "agentRunAsUser": None,
+            "agentRunAsGroup": None,
+            "agentRuntimeRoot": None,
+            "localResumeOwnerUserId": str(
+                os.environ.get("WECOM_BOT_LOCAL_RESUME_OWNER_USER_ID")
+                or os.environ.get("LOCAL_RESUME_OWNER_USER_ID")
+                or ""
+            ).strip()
+            or None,
             "enabled": env_bool("WECOM_BOT_ENABLED", True),
             "__idExplicit__": bool(explicit_id),
             "__secretSourceExplicit__": True,
@@ -7942,7 +8943,13 @@ def serialize_bot_config_for_disk(config: dict[str, Any]) -> dict[str, Any]:
         persisted.pop("secretFile", None)
     if not str(persisted.get("appSecretFile") or "").strip():
         persisted.pop("appSecretFile", None)
-    for key in ("agentCommand", "agentRunAsUser", "agentRunAsGroup", "agentRuntimeRoot"):
+    for key in (
+        "agentCommand",
+        "agentRunAsUser",
+        "agentRunAsGroup",
+        "agentRuntimeRoot",
+        "localResumeOwnerUserId",
+    ):
         if not str(persisted.get(key) or "").strip():
             persisted.pop(key, None)
     return persisted
@@ -8261,6 +9268,7 @@ def clear_persisted_session_threads(bot_id: str) -> int:
             lambda current: {
                 **current,
                 "threadId": None,
+                "useGlobalCodexSessions": False,
                 "activeScheduleId": None,
                 "status": "idle",
                 "ownerInstance": None,
@@ -8372,6 +9380,7 @@ def invalidate_bot_session_threads(bot_id: str) -> int:
             if sess.thread_id is None:
                 continue
             sess.thread_id = None
+            sess.use_global_codex_sessions = False
             invalidated += 1
     invalidated += clear_persisted_session_threads(bot_id)
     return invalidated
@@ -8406,6 +9415,8 @@ def reset_bot_session_runtime_state(bot_id: str, replacement_config: Optional[di
             or sess.reply_mentions_sent
         )
         sess.thread_id = None
+        clear_session_run_thread_checkpoint(sess)
+        sess.use_global_codex_sessions = False
         sess.chat = []
         sess.queue = []
         sess.pending_media = []
@@ -8417,6 +9428,8 @@ def reset_bot_session_runtime_state(bot_id: str, replacement_config: Optional[di
         sess.pending_final_payload = None
         sess.pending_stream_payloads = None
         sess.pending_final_payloads = None
+        sess.late_ack_payloads = []
+        sess.pending_payload_retry_after = 0.0
         sess.reply_started_at = {}
         sess.reply_last_sent_at = {}
         sess.reply_proactive_req_ids = set()
@@ -8525,9 +9538,10 @@ def clone_payload_sequence(payloads: list[dict[str, Any]]) -> list[dict[str, Any
     return [dict(item) for item in payloads]
 
 
-def build_codex_home_for_subprocess(session_id: str) -> Path:
+def build_codex_home_for_subprocess(session_id: str, *, use_global_sessions: bool = False) -> Path:
     base_home = DEFAULT_CODEX_HOME
     bridge_home = get_session_codex_home_root(session_id)
+    backup_sessions_root = get_session_codex_home_local_sessions_backup_root(session_id)
     ensure_dir(bridge_home)
 
     allowed_root_files = {"auth.json", "config.toml", "version.json", "installation_id"}
@@ -8551,7 +9565,42 @@ def build_codex_home_for_subprocess(session_id: str) -> Path:
             ensure_dir_for(destination)
             shutil.copy2(child, destination)
 
-    ensure_dir(bridge_home / "sessions")
+    sessions_root = bridge_home / "sessions"
+    if use_global_sessions and base_home.exists() and base_home.is_dir():
+        global_sessions_root = base_home / "sessions"
+        same_sessions_root = False
+        try:
+            same_sessions_root = base_home.resolve() == bridge_home.resolve()
+        except Exception:
+            same_sessions_root = base_home == bridge_home
+        if same_sessions_root:
+            if sessions_root.is_symlink():
+                remove_path_if_exists(sessions_root)
+            ensure_dir(sessions_root)
+        else:
+            ensure_dir(global_sessions_root)
+            sessions_link_is_current = False
+            if sessions_root.is_symlink():
+                try:
+                    sessions_link_is_current = sessions_root.resolve() == global_sessions_root.resolve()
+                except Exception:
+                    sessions_link_is_current = False
+            if not sessions_link_is_current:
+                if sessions_root.exists() and not sessions_root.is_symlink():
+                    replace_path_if_needed(backup_sessions_root)
+                    sessions_root.replace(backup_sessions_root)
+                elif sessions_root.is_symlink():
+                    remove_path_if_exists(sessions_root)
+            if not sessions_root.exists():
+                os.symlink(global_sessions_root, sessions_root, target_is_directory=True)
+    else:
+        if sessions_root.is_symlink():
+            remove_path_if_exists(sessions_root)
+        if backup_sessions_root.exists():
+            replace_path_if_needed(sessions_root)
+            backup_sessions_root.replace(sessions_root)
+        else:
+            ensure_dir(sessions_root)
     ensure_dir(bridge_home / "tmp")
     skills_link = bridge_home / "skills"
     if skills_link.exists() or skills_link.is_symlink():
@@ -8935,6 +9984,7 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
             add_log(bot, f"WeCom response error: {message.get('errcode')} {message.get('errmsg', '')}")
         else:
             if req_id and consume_late_cached_session_payload_ack(bot, req_id):
+                await flush_pending_session_payloads_from_inbound(bot, "late_cached_ack")
                 return
             await flush_pending_session_payloads_from_inbound(bot, "ack_only")
         return
@@ -8987,6 +10037,31 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
             if command_text.startswith("/bridge-resume "):
                 await resume_session_command(bot, key, req_id, command_text.split(None, 1)[1].strip())
                 return
+            if command_text == "/local-resume":
+                await start_local_resume_selection_command(
+                    bot,
+                    key,
+                    req_id,
+                    sender_user_id=message_sender_userid(message),
+                )
+                return
+            if command_text.startswith("/local-resume "):
+                await local_resume_session_command(
+                    bot,
+                    key,
+                    req_id,
+                    command_text.split(None, 1)[1].strip(),
+                    sender_user_id=message_sender_userid(message),
+                )
+                return
+            if command_text == "/local-detach":
+                await local_detach_session_command(
+                    bot,
+                    key,
+                    req_id,
+                    sender_user_id=message_sender_userid(message),
+                )
+                return
             if command_text == "/cwd":
                 await cwd_session_command(bot, key, req_id, None)
                 return
@@ -9003,7 +10078,13 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
                 await status_session_command(bot, key, req_id)
                 return
             current_sess = bot.sessions.get(key)
-            if current_sess and await apply_resume_selection_command(bot, key, req_id, content):
+            if current_sess and await apply_resume_selection_command(
+                bot,
+                key,
+                req_id,
+                content,
+                sender_user_id=message_sender_userid(message),
+            ):
                 return
         except BridgeError as exc:
             await respond_info(bot, req_id, f"Bridge command failed: {exc.message}")
@@ -9388,8 +10469,26 @@ async def lease_renew_loop() -> None:
             await asyncio.sleep(SESSION_LEASE_RENEW_MS / 1000)
             for bot in list(BOTS.values()):
                 for key, sess in list(bot.sessions.items()):
-                    if sess.running or sess.queue or sess.pending_media_downloads > 0:
-                        renew_session_lease(bot, key, sess)
+                    pending_delivery = bool(sess.pending_final_payload or sess.pending_stream_payload)
+                    needs_renewal = bool(
+                        sess.running
+                        or sess.queue
+                        or sess.pending_media_downloads > 0
+                        or (sess.lease_owned and (pending_delivery or sess.send_lock.locked()))
+                    )
+                    if not needs_renewal:
+                        continue
+                    if renew_session_lease(bot, key, sess):
+                        continue
+                    active_task = sess.run_task
+                    active_proc = sess.proc
+                    if (
+                        sess.running
+                        or pending_delivery
+                        or (active_task is not None and not active_task.done())
+                        or (active_proc is not None and active_proc.returncode is None)
+                    ):
+                        abandon_session_after_lease_loss(bot, key, sess)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -9546,37 +10645,19 @@ async def deleted_bot_reaper_loop() -> None:
 
 
 def extract_request_token(request: web.Request) -> str:
-    auth = request.headers.get("Authorization", "").strip()
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return request.headers.get("X-Bridge-Token", "").strip()
+    return extract_bearer_token(request.headers)
 
 
 def extract_basic_auth(request: web.Request) -> str:
-    auth = request.headers.get("Authorization", "").strip()
-    if not auth.startswith("Basic "):
-        return ""
-    encoded = auth[6:].strip()
-    if not encoded:
-        return ""
-    try:
-        return base64.b64decode(encoded, validate=True).decode("utf-8")
-    except Exception:
-        return ""
+    return extract_basic_credentials(request.headers)
 
 
 def api_auth_enabled() -> bool:
-    return bool(BRIDGE_TOKEN or BRIDGE_BASIC_AUTH)
+    return shared_api_auth_enabled(BRIDGE_TOKEN, BRIDGE_BASIC_AUTH)
 
 
 def api_auth_mode_label() -> str:
-    if BRIDGE_TOKEN and BRIDGE_BASIC_AUTH:
-        return "token or basic auth required"
-    if BRIDGE_BASIC_AUTH:
-        return "basic auth required"
-    if BRIDGE_TOKEN:
-        return "token required"
-    return "localhost only"
+    return shared_api_auth_mode_label(BRIDGE_TOKEN, BRIDGE_BASIC_AUTH)
 
 
 def build_api_auth_error(message: str, status: int) -> web.Response:
@@ -9587,20 +10668,32 @@ def build_api_auth_error(message: str, status: int) -> web.Response:
 
 
 def request_is_loopback(request: web.Request) -> bool:
-    remote = request.remote or ""
-    return remote in {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+    return is_loopback_address(request.remote)
+
+
+def secure_text_equal(candidate: str, expected: str) -> bool:
+    return shared_secure_text_equal(candidate, expected)
 
 
 async def require_api_access(request: web.Request) -> Optional[web.Response]:
-    if api_auth_enabled():
-        if BRIDGE_TOKEN and extract_request_token(request) == BRIDGE_TOKEN:
-            return None
-        if BRIDGE_BASIC_AUTH and extract_basic_auth(request) == BRIDGE_BASIC_AUTH:
-            return None
-        return build_api_auth_error(f"API auth required ({api_auth_mode_label()})", 401)
-    if request_is_loopback(request):
+    decision = authorize_api_access(
+        request.headers,
+        request.remote,
+        token=BRIDGE_TOKEN,
+        basic_auth=BRIDGE_BASIC_AUTH,
+    )
+    if decision.allowed:
         return None
-    return web.json_response({"ok": False, "error": "API is limited to localhost unless BRIDGE_TOKEN or BRIDGE_BASIC_AUTH is configured"}, status=403)
+    return build_api_auth_error(decision.message, decision.status)
+
+
+@web.middleware
+async def api_access_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    if request.path == "/healthz" or request.path.startswith("/api/"):
+        denied = await require_api_access(request)
+        if denied is not None:
+            return denied
+    return await handler(request)
 
 
 async def read_json_body(request: web.Request) -> dict[str, Any]:
@@ -9649,6 +10742,7 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "agentRunAsUser": bot.config.get("agentRunAsUser"),
         "agentRunAsGroup": bot.config.get("agentRunAsGroup"),
         "agentRuntimeRoot": bot.config.get("agentRuntimeRoot"),
+        "localResumeOwnerUserId": bot.config.get("localResumeOwnerUserId"),
         "secretSource": bot_secret_source(bot.config),
         "status": bot.status,
         "healthy": health["healthy"],
@@ -9686,6 +10780,7 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "agentRunAsUser": config.get("agentRunAsUser"),
         "agentRunAsGroup": config.get("agentRunAsGroup"),
         "agentRuntimeRoot": config.get("agentRuntimeRoot"),
+        "localResumeOwnerUserId": config.get("localResumeOwnerUserId"),
         "secretSource": bot_secret_source(config),
         "status": "disabled" if config.get("enabled") is False else "not_loaded",
         "healthy": False,
@@ -9710,9 +10805,6 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
 
 
 async def api_get_bots(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     payload_by_id = {
         bot.config["id"]: bot_to_payload(bot)
         for bot in BOTS.values()
@@ -9727,9 +10819,6 @@ async def api_get_bots(request: web.Request) -> web.Response:
 
 
 async def api_add_bot(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         data = await read_json_body(request)
         wecom_bot_id = str(data.get("botId") or "").strip()
@@ -9748,9 +10837,6 @@ async def api_add_bot(request: web.Request) -> web.Response:
 
 
 async def api_delete_bot(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         await remove_bot(request.match_info["bot_id"])
         return web.json_response({"ok": True})
@@ -9759,9 +10845,6 @@ async def api_delete_bot(request: web.Request) -> web.Response:
 
 
 async def api_restart_bot(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         bot_id = request.match_info["bot_id"]
         current = get_authoritative_bot_config(bot_id)
@@ -9780,9 +10863,6 @@ async def api_restart_bot(request: web.Request) -> web.Response:
 
 
 async def api_stop_bot(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         bot_id = request.match_info["bot_id"]
         current = get_authoritative_bot_config(bot_id)
@@ -9799,9 +10879,6 @@ async def api_stop_bot(request: web.Request) -> web.Response:
 
 
 async def api_get_chat(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     bot = BOTS.get(request.match_info["bot_id"])
     if not bot:
         return web.json_response({"ok": False, "error": "bot not found"}, status=404)
@@ -9813,9 +10890,6 @@ async def api_get_chat(request: web.Request) -> web.Response:
 
 
 async def api_interrupt_session(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     bot = BOTS.get(request.match_info["bot_id"])
     if not bot:
         return web.json_response({"ok": False, "error": "bot not found"}, status=404)
@@ -9831,9 +10905,6 @@ async def api_interrupt_session(request: web.Request) -> web.Response:
 
 
 async def api_reset_session(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     bot = BOTS.get(request.match_info["bot_id"])
     if not bot:
         return web.json_response({"ok": False, "error": "bot not found"}, status=404)
@@ -9846,9 +10917,6 @@ async def api_reset_session(request: web.Request) -> web.Response:
 
 
 async def api_send_file(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         data = await read_json_body(request)
         return web.json_response(submit_file_send_request(data))
@@ -9857,9 +10925,6 @@ async def api_send_file(request: web.Request) -> web.Response:
 
 
 async def api_send_message(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         data = await read_json_body(request)
         return web.json_response(await submit_send_message_request(data))
@@ -9868,17 +10933,11 @@ async def api_send_message(request: web.Request) -> web.Response:
 
 
 async def api_get_schedules(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     schedules = [{**item, "botConfigId": item["botId"]} for item in list_schedule_definitions()]
     return web.json_response(schedules)
 
 
 async def api_add_schedule(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         data = await read_json_body(request)
         return web.json_response(submit_schedule_definition_request(data))
@@ -9887,9 +10946,6 @@ async def api_add_schedule(request: web.Request) -> web.Response:
 
 
 async def api_get_schedule(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     schedule = read_schedule_definition(request.match_info["schedule_id"])
     if not schedule:
         return web.json_response({"ok": False, "error": "schedule not found"}, status=404)
@@ -9897,9 +10953,6 @@ async def api_get_schedule(request: web.Request) -> web.Response:
 
 
 async def api_pause_schedule(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         result = pause_schedule_definition(request.match_info["schedule_id"])
         return web.json_response({"ok": True, "action": "pause", **result})
@@ -9908,9 +10961,6 @@ async def api_pause_schedule(request: web.Request) -> web.Response:
 
 
 async def api_resume_schedule(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         result = resume_schedule_definition(request.match_info["schedule_id"])
         return web.json_response({"ok": True, "action": "resume", **result})
@@ -9919,9 +10969,6 @@ async def api_resume_schedule(request: web.Request) -> web.Response:
 
 
 async def api_delete_schedule(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         delete_schedule_definition(request.match_info["schedule_id"])
         return web.json_response({"ok": True})
@@ -9930,9 +10977,6 @@ async def api_delete_schedule(request: web.Request) -> web.Response:
 
 
 async def api_schedule_message(request: web.Request) -> web.Response:
-    denied = await require_api_access(request)
-    if denied:
-        return denied
     try:
         data = await read_json_body(request)
         return web.json_response(submit_schedule_message_request(data))
@@ -10007,7 +11051,7 @@ async def app_cleanup(_: web.Application) -> None:
 
 
 def build_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[api_access_middleware])
     app.router.add_get("/", api_root)
     app.router.add_get("/livez", api_livez)
     app.router.add_get("/healthz", api_healthz)
@@ -10035,7 +11079,11 @@ def build_app() -> web.Application:
 async def main() -> None:
     global HTTP_SESSION, CODEX_RUN_SEMAPHORE
 
-    if HOST not in {"127.0.0.1", "::1", "localhost"} and not api_auth_enabled():
+    ensure_secure_state_root(SHARED_RUNTIME_ROOT, "BRIDGE_SHARED_RUNTIME_ROOT")
+    ensure_secure_state_root(INSTANCE_RUNTIME_ROOT, "BRIDGE_RUNTIME_ROOT")
+    ensure_secure_state_root(DATA_FILE.parent, "BOTS_FILE parent")
+
+    if not is_loopback_address(HOST) and not api_auth_enabled():
         print_log("[SECURITY] HOST is not loopback but API auth is not configured. Refusing to start.")
         raise SystemExit(1)
     if CODEX_EXEC_MODE not in VALID_CODEX_EXEC_MODES:
@@ -10044,17 +11092,23 @@ async def main() -> None:
 
     ensure_local_file_send_dirs()
     ensure_schedule_dirs()
-    ensure_dir(BOT_TOMBSTONE_ROOT)
-    ensure_dir(BOT_RUNTIME_LOCK_ROOT)
-    ensure_dir(SESSION_LOCK_ROOT)
-    ensure_dir(SESSION_REGISTRY_ROOT / "keys")
-    ensure_dir(SESSION_REGISTRY_ROOT / "sessions")
+    ensure_state_directory(BOT_TOMBSTONE_ROOT)
+    ensure_state_directory(BOT_RUNTIME_LOCK_ROOT)
+    ensure_state_directory(SESSION_LOCK_ROOT)
+    ensure_state_directory(SESSION_REGISTRY_ROOT)
+    ensure_state_directory(SESSION_REGISTRY_ROOT / "keys")
+    ensure_state_directory(SESSION_REGISTRY_ROOT / "sessions")
+    ensure_state_directory(USER_ALIAS_ROOT)
+    ensure_state_directory(TEMPLATE_CARD_STATE_ROOT)
     ensure_dir(CHATFILE_ROOT)
     ensure_dir(WORKSPACE_ROOT)
-    ensure_dir(USER_ALIAS_ROOT)
-    ensure_dir(get_bridge_codex_home_root())
+    ensure_state_directory(get_bridge_codex_home_root())
+    if DATA_FILE.is_symlink():
+        raise RuntimeError(f"BOTS_FILE must not be a symlink: {DATA_FILE}")
     if not DATA_FILE.exists():
         write_json_atomic(DATA_FILE, [])
+    elif DATA_FILE.is_file():
+        os.chmod(DATA_FILE, state_file_mode(DATA_FILE.parent))
 
     HTTP_SESSION = aiohttp.ClientSession(trust_env=True)
     CODEX_RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CODEX_RUNS)

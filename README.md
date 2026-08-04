@@ -19,7 +19,7 @@ English overview: [README.en.md](README.en.md)
 - 为会话启动可选 agent backend（`codex` / `claude`），并在当前运行态可恢复时尝试原生 resume
 - 为组内多人协作提供隔离 workspace，保证每人文件和代码操作互不影响
 - 提供全局共享 skill 与个人私有 skill 的分层注入和隔离
-- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`、`/cwd`
+- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`、`/local-resume`、`/local-detach`、`/cwd`
 - 下载企微图片/文件到本地 workspace
 - 对外暴露运行状态和最新摘要，便于前端轮询刷新
 - 对超长运行会话支持企微 10 分钟后的分段回复与后续续传
@@ -51,13 +51,15 @@ echo "${CODEX_HOME:-$HOME/.codex}"
 ### 2. 安装依赖
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 如需跑测试：
 
 ```bash
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 ```
 
 ### 3. 准备配置
@@ -72,10 +74,12 @@ cp .env.example .env
 
 ```bash
 BRIDGE_BIND=127.0.0.1:9299
+BRIDGE_PYTHON=/path/to/connect2cli-bridge/.venv/bin/python
 WORK_DIR=/home/jenkins
 BRIDGE_BASIC_AUTH=bridge:change-me
 BRIDGE_SHARED_RUNTIME_ROOT=/srv/wecom-bridge-shared
 BRIDGE_RUNTIME_ROOT=/var/tmp/wecom-bridge-runtime
+BRIDGE_CONTROL_ROOT=/var/tmp/wecom-bridge-control
 CODEX_EXEC_MODE=host
 WECOM_BOT_AGENT_BACKEND=codex
 
@@ -90,7 +94,9 @@ WECOM_BOT_ENABLED=true
 
 说明：
 
-- `BRIDGE_BASIC_AUTH` 和 `BRIDGE_TOKEN` 二选一即可；如果都不配，API 只允许 localhost 访问
+- `BRIDGE_BASIC_AUTH` 和 `BRIDGE_TOKEN` 二选一即可；如果都不配，`/healthz` 和 `/api/*` 只允许 localhost 访问
+- `/livez` 只暴露进程存活状态，保持免鉴权以供 watchdog 使用；包含 Bot 明细的 `/healthz` 受上述鉴权规则保护
+- `BRIDGE_PYTHON` 是拉起 `bridge.py` 的解释器；推荐固定到项目 `.venv/bin/python`
 - `WECOM_BOT_SECRET_FILE` 必须指向 secret 文件；当前版本不再支持明文 `secret`
 - 模板卡片原位更新严格走企业微信 `101031`：只在模板卡片点击回调当次即时更新
 - 如果要延迟推进状态，应通过 `101032` 的 `response_url` 主动补发一条新消息或新卡，而不是继续原位更新旧卡
@@ -100,6 +106,10 @@ WECOM_BOT_ENABLED=true
   - `personal`：默认给新建 `claude` bot；所有会话直接使用 `workDir`
 - `BRIDGE_SHARED_RUNTIME_ROOT` 用于 Bot 锁、session 注册表、schedule、用户别名等共享协调状态；多实例部署时应指向共享且持久的目录
 - `BRIDGE_RUNTIME_ROOT` 用于实例本地 workspace、chatfile、per-session `CODEX_HOME` 等高频 I/O 目录；建议放在本地快盘
+- `BRIDGE_CONTROL_ROOT` 用于 PID、watchdog 状态和日志；目录必须可创建、可写，同一代码目录并行运行多个实例时必须分别配置
+- 运行目录可以由多个系统用户共享；推荐让这些用户加入同一组，并把共享根设为 setgid 的 `2770` 或 `2775`
+- Bridge 会继承父目录策略：组可写父目录下的新状态目录保持组协作，状态文件和锁文件允许同组读写；不要求所有实例使用同一 UID
+- 启动隔离实例时，可在命令环境中设置 `BRIDGE_ENV_FILE=/path/to/instance.env`；默认仍读取仓库根 `.env`，显式指定的文件不存在时启动会失败
 - `WECOM_BOT_AGENT_BACKEND` 默认是 `codex`；切到 `claude` 时，bridge 会改用 Claude CLI 的流式 JSON 输出协议
 
 ### 4. 启动服务
@@ -111,7 +121,8 @@ sh ./start.sh
 说明：
 
 - `start.sh` 默认会先启动仓库内置 watchdog，再由 watchdog 拉起 `bridge.py`
-- watchdog 会定期检查 Bridge 进程和 `GET /` 健康状态
+- `bridge.py` 是唯一生产服务入口；`workspace_bridge.service` 仅保留为兼容库 API 和独立回归路径，不由 `start.sh` 启动
+- watchdog 会定期检查 Bridge 进程和 `GET /livez` 存活状态
 - 连续失败达到阈值后会自动重启 Bridge，避免单次异常退出后服务一直挂着
 - 如果你明确不需要这层保护，可在 `.env` 中设置 `BRIDGE_WATCHDOG_ENABLED=false`
 
@@ -125,14 +136,22 @@ sh ./start.sh
 查看日志：
 
 ```bash
-tail -f ./bridge.log
+tail -f /var/tmp/wecom-bridge-control/bridge.log
 ```
 
 快速健康检查：
 
 ```bash
-curl -s http://127.0.0.1:9299/
+curl -s http://127.0.0.1:9299/livez
 ```
+
+对当前代码执行隔离的 launcher、watchdog 恢复、HTTP 负载和资源门禁：
+
+```bash
+python3 ./check_production_readiness.py --duration-sec 60 --concurrency 20
+```
+
+探针使用临时端口和独立运行目录，不读取生产 Bot 凭据；它不能替代真实企微订阅、重连和多聊天验收。
 
 ## 运行模型
 
@@ -155,8 +174,6 @@ curl -s http://127.0.0.1:9299/
     当前会话的文件交换区
   - `.bridge-codex-home/sessions/<session-id>/`
     当前会话隔离出来的 `CODEX_HOME`
-  - `claude-runtime/sessions/<session-id>/`
-    `claude` backend 在启用 `agentRunAsUser` 时使用的独立运行态目录
 
 - `~/.codex/skills/<skill>/SKILL.md`
   用户级全局 skills
@@ -181,13 +198,12 @@ Bridge 运行 agent 时：
 
 如果 Bot 配置切到 `claude` backend：
 
-- 默认执行命令是 `claude -p --verbose --output-format stream-json`
+- 默认执行命令是 `claude -p --verbose --permission-mode bypassPermissions --output-format stream-json`
 - 有可用 `threadId` 时会尝试 `claude --resume <threadId>`
 - 如果原生 resume 状态缺失，bridge 会回退到 fresh run，并把最近本地聊天历史拼进 prompt 做连续性兜底
-- 配置了 `agentRunAsUser` 后，会用 `setpriv` 以目标用户身份启动 `claude`
-- 这类运行态目录默认落在 `BRIDGE_RUNTIME_ROOT/claude-runtime/`，也可单独用 `agentRuntimeRoot` 改掉
-- `claude-runtime/sessions/<session-id>/` 只承载 Claude 的会话级配置、`TMPDIR`、`CODEX_HOME` 等运行态；真实 `cwd` 由 `workspaceMode` 决定
-- 若 `/root/.claude/plugins` 或 `/root/.claude/settings.json` 存在，会在首次准备 session 运行态时复制到独立 Claude 配置目录
+- Claude 与 Codex 一样直接继承 Bridge 进程的系统用户、补充组和文件访问能力，不使用 `setpriv`、`chown` 或独立降权目录
+- 默认 `CODEX_EXEC_MODE=host` 时，Claude 使用 `bypassPermissions`，不再弹出或卡在 Claude CLI 自身的工具授权检查
+- Claude 的真实 `cwd` 由 `workspaceMode` 决定，`TMPDIR` 仍使用当前会话的 `chatfile`
 
 用户目录命名说明：
 
@@ -257,12 +273,6 @@ Bridge 自身不内置网页 UI，但会暴露足够的运行态和会话数据�
   当前支持 `codex`、`claude`
 - `agentCommand`
   覆盖该 Bot 的实际可执行命令；不配时，`codex` 走 `CODEX_COMMAND`/`codex`，`claude` 走 `CLAUDE_COMMAND`/`claude`
-- `agentRunAsUser`
-  仅对 `claude` backend 生效；bridge 会用 `setpriv` 切到这个系统用户执行
-- `agentRunAsGroup`
-  可选；和 `agentRunAsUser` 配合指定目标组
-- `agentRuntimeRoot`
-  仅对 `claude` backend 生效；用于放独立 Claude 运行态目录
 - `workspaceMode`
   可选；`team` 或 `personal`。未显式配置时，新建 `codex` bot 默认 `team`，新建 `claude` bot 默认 `personal`；历史缺字段配置保持 `team`
 - `workspaceNamespace`
@@ -272,7 +282,7 @@ Bridge 自身不内置网页 UI，但会暴露足够的运行态和会话数据�
 
 - 默认继续用 `codex` backend，最贴合当前 bridge 的原生 resume 和 `CODEX_HOME` 模型
 - 只有在你明确需要 Claude CLI 时再切换到 `claude`
-- 如果用了 `agentRunAsUser`，确认 bridge 进程具备 `setpriv` 能力，且目标 runtime 目录对 bridge 和目标用户都可访问
+- 历史配置中的 `agentRunAsUser`、`agentRunAsGroup`、`agentRuntimeRoot` 会继续被读取以兼容旧 Bot 配置，但执行时不再生效
 
 ## Bot 管理
 
@@ -311,8 +321,6 @@ WECOM_BOOTSTRAP_BOTS_JSON_FILE=/run/secrets/wecom_bots.json
     "groupSessionMode": "per-user",
     "agentBackend": "claude",
     "agentCommand": "/usr/local/bin/claude",
-    "agentRunAsUser": "jenkins",
-    "agentRuntimeRoot": "/var/tmp/wecom-bridge-claude",
     "enabled": true
   }
 ]
@@ -375,7 +383,7 @@ curl -s -X POST http://127.0.0.1:9299/api/bots \
 - 明文 `secret` 已不再支持
 - `chat_key` 放到 URL 前需要先做 URL 编码
 - 如果传入的 `botId` 已存在，`POST /api/bots` 会按现有配置 ID 更新；请求里未显式传入的字段会沿用旧配置
-- Bot JSON/API 也支持 `agentCommand`、`agentRunAsUser`、`agentRunAsGroup`、`agentRuntimeRoot`、`workspaceNamespace`、`workspaceMode`
+- Bot JSON/API 支持 `agentCommand`、`workspaceNamespace`、`workspaceMode`；旧的 `agentRunAsUser`、`agentRunAsGroup`、`agentRuntimeRoot` 字段仅做配置兼容，不改变执行身份
 
 ## 本地命令
 
@@ -438,6 +446,9 @@ python3 ./schedule_message.py \
 - `/bridge-interrupt`
 - `/bridge-reset`
 - `/bridge-resume`
+- `/local-resume`
+- `/local-resume <sessionId>`
+- `/local-detach`
 - `/cwd`
 
 语义：
@@ -450,8 +461,20 @@ python3 ./schedule_message.py \
   中断当前任务，并清空当前会话上下文
 - `/bridge-resume`
   列出当前用户在当前运行态内可恢复的会话；回复编号可选择，或直接发送 `/bridge-resume <sessionId>`
+- `/local-resume`
+  列出 `$CODEX_HOME/sessions` 中最新 rollout 的 `cwd` 与当前目录一致的本地 Codex 会话；回复编号可选择
+- `/local-resume <sessionId>`
+  直接绑定指定的当前目录本地会话，并导入最近聊天记录
+- `/local-detach`
+  解除本地会话绑定，并恢复绑定前的 Bridge thread 和聊天记录（如有）
 - `/cwd`
   仅 `workspaceMode=personal` 可用；`/cwd` 查看当前目录，`/cwd <path>` 切换到 `workDir` 内的子目录；任务运行中不允许切换
+
+本地会话命令仅适用于 `workspaceMode=personal` 且 `agentBackend=codex` 的 Bot。需要将 Bot 的
+`localResumeOwnerUserId` 配置为获准使用该能力的企业微信用户 ID；单 Bot 环境可通过
+`WECOM_BOT_LOCAL_RESUME_OWNER_USER_ID` 配置，未设置时兼容读取 `LOCAL_RESUME_OWNER_USER_ID`。
+shared 群会话不支持该能力，且同一个本地 Codex 会话同一时间只能绑定到一个有效的企微会话。
+切换上下文前，当前会话必须没有运行中、排队中或待发送的任务。
 
 ## 长时运行回复策略
 
@@ -494,13 +517,7 @@ python3 ./schedule_message.py \
 - `WECOM_BOT_AGENT_COMMAND`
   单 Bot backend 命令覆盖
   如果值里包含空格，例如 `claude --model sonnet`，放进 `.env` 时请写成带引号的 shell 赋值
-- `WECOM_BOT_AGENT_RUN_AS_USER`
-  单 Bot 目标执行用户，当前只对 `claude` 生效
-- `WECOM_BOT_AGENT_RUN_AS_GROUP`
-  单 Bot 目标执行组，当前只对 `claude` 生效
-- `WECOM_BOT_AGENT_RUNTIME_ROOT`
-  单 Bot 的 Claude 运行态根目录
-- `AGENT_BACKEND` / `AGENT_COMMAND` / `AGENT_RUN_AS_USER` / `AGENT_RUN_AS_GROUP` / `AGENT_RUNTIME_ROOT`
+- `AGENT_BACKEND` / `AGENT_COMMAND`
   `WECOM_BOT_AGENT_*` 未配置时的兜底默认值
 - `FILE_SEND_ROOTS`
   允许回传文件的额外目录白名单
@@ -590,6 +607,16 @@ python3 ./schedule_message.py \
 ```bash
 sh ./test.sh
 ```
+
+提交前质量与 runtime 门禁：
+
+```bash
+sh ./check_quality.sh
+sh ./check_production_runtime.sh
+sh ./check_compatibility_runtime.sh
+```
+
+`check_multi_user_readiness.sh` 会依次执行后两套门禁。GitHub Actions 使用相同命令，避免 CI 与本地验收标准分叉。
 
 ## 相关文档
 

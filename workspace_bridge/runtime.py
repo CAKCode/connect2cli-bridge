@@ -9,6 +9,7 @@ from typing import cast
 from urllib.parse import quote
 
 from .agent_backends import normalize_agent_backend
+from .atomic_io import atomic_write_json, ensure_state_directory
 from .context import build_runtime_context, resolve_workspace_cwd
 from .layout import build_workspace_ref
 from .models import BotConfig, CodexLaunchSpec, SessionRecord, SourceConfig, WorkspaceMode
@@ -97,14 +98,6 @@ def build_bot_config(
     resolved_chatfile_root = Path(chatfile_root).expanduser().resolve()
     if resolved_chatfile_root.exists() and not resolved_chatfile_root.is_dir():
         raise ValueError(f"chatfile_root is not a directory: {resolved_chatfile_root}")
-    normalized_agent_runtime_root = str(agent_runtime_root or "").strip()
-    if normalized_agent_runtime_root.lower() in {"none", "null"}:
-        normalized_agent_runtime_root = ""
-    resolved_agent_runtime_root = (
-        Path(normalized_agent_runtime_root).expanduser().resolve() if normalized_agent_runtime_root else None
-    )
-    if resolved_agent_runtime_root is not None and resolved_agent_runtime_root.exists() and not resolved_agent_runtime_root.is_dir():
-        raise ValueError(f"agent_runtime_root is not a directory: {resolved_agent_runtime_root}")
     resolved_file_send_roots = tuple(Path(item).expanduser().resolve() for item in file_send_roots)
     for root in resolved_file_send_roots:
         if root.exists() and not root.is_dir():
@@ -124,9 +117,9 @@ def build_bot_config(
         codex_exec_mode=normalized_codex_exec_mode,
         agent_backend=normalized_backend,
         agent_command=_normalize_optional_text(agent_command),
-        agent_run_as_user=_normalize_optional_text(agent_run_as_user),
-        agent_run_as_group=_normalize_optional_text(agent_run_as_group),
-        agent_runtime_root=resolved_agent_runtime_root,
+        agent_run_as_user=None,
+        agent_run_as_group=None,
+        agent_runtime_root=None,
         file_send_roots=resolved_file_send_roots,
         max_upload_size=max(1, int(max_upload_size)),
         platform="wecom",
@@ -134,7 +127,7 @@ def build_bot_config(
 
 
 def session_registry_root(runtime_root: Path | str) -> Path:
-    return Path(runtime_root).expanduser().resolve() / "sessions"
+    return ensure_state_directory(Path(runtime_root).expanduser().resolve() / "sessions")
 
 
 def session_record_file(runtime_root: Path | str, session_id: str) -> Path:
@@ -142,11 +135,12 @@ def session_record_file(runtime_root: Path | str, session_id: str) -> Path:
 
 
 def session_codex_home_root(runtime_root: Path | str) -> Path:
-    return Path(runtime_root).expanduser().resolve() / ".bridge-codex-home" / "sessions"
+    codex_home_root = ensure_state_directory(Path(runtime_root).expanduser().resolve() / ".bridge-codex-home")
+    return ensure_state_directory(codex_home_root / "sessions")
 
 
 def _state_root(runtime_root: Path | str) -> Path:
-    return Path(runtime_root).expanduser().resolve() / "template-card-state"
+    return ensure_state_directory(Path(runtime_root).expanduser().resolve() / "template-card-state")
 
 
 def _state_file_component(bot_id: str) -> str:
@@ -197,13 +191,12 @@ def remove_session_chatfile(chatfile_root: Path | str, session_id: str) -> None:
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, payload)
 
 
 def read_json_file(path: Path) -> dict | None:
+    if path.is_symlink():
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -598,12 +591,6 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
         }
         if bot.agent_command:
             env["WECOM_BRIDGE_AGENT_COMMAND"] = bot.agent_command
-        if bot.agent_run_as_user:
-            env["WECOM_BRIDGE_AGENT_RUN_AS_USER"] = bot.agent_run_as_user
-        if bot.agent_run_as_group:
-            env["WECOM_BRIDGE_AGENT_RUN_AS_GROUP"] = bot.agent_run_as_group
-        if bot.agent_runtime_root is not None:
-            env["WECOM_BRIDGE_AGENT_RUNTIME_ROOT"] = str(bot.agent_runtime_root)
         return CodexLaunchSpec(
             session=session,
             workspace=provisioned,

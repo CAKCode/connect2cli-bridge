@@ -10,10 +10,21 @@ These test suites must pass together:
 sh ./check_multi_user_readiness.sh
 ```
 
+This command runs two explicit gates in order:
+
+- `check_production_runtime.sh` covers the deployed `bridge.py` path.
+- `check_compatibility_runtime.sh` covers the retained `workspace_bridge.service` library/API path.
+
+Static checks are a separate required gate:
+
+```bash
+sh ./check_quality.sh
+```
+
 Optional local concurrency probe:
 
 ```bash
-python3 ./check_multi_user_concurrency.py --env-file .env --chat-count 10 --message "readiness check" --mode mock --rounds 5
+python3 ./check_multi_user_concurrency.py --chat-count 10 --message "readiness check" --mode mock --rounds 5
 ```
 
 If you want to exercise the real Codex backend instead of the built-in mock mode:
@@ -31,9 +42,8 @@ Minimum real-mode preconditions:
 
 Notes:
 
-- the default `mock` mode is intended for repeatable local validation without depending on a live Codex backend
+- the default `mock` mode is self-contained: it uses a temporary secret and runtime directory, does not connect to WeCom, and does not write into a configured production runtime
 - the `real` mode performs preflight checks and fails fast with structured errors if required paths or settings are missing
-- prefer pointing `RUNTIME_ROOT` at a disposable path when running probes outside the test suite
 - generated runtime directories should not be treated as delivery artifacts
 
 Optional runtime hygiene probe:
@@ -41,6 +51,14 @@ Optional runtime hygiene probe:
 ```bash
 python3 ./cleanup_recursive_runtime.py --runtime-root .runtime
 ```
+
+Required isolated launcher/watchdog/resource probe:
+
+```bash
+python3 ./check_production_readiness.py --duration-sec 60 --concurrency 20
+```
+
+This starts the current worktree through the real `start.sh` and watchdog on a temporary port, verifies recovery after `SIGKILL`, applies HTTP latency/error thresholds, samples RSS/CPU/descendants/queue depth, and cleans up only processes carrying the temporary control-root identity.
 
 At minimum, the regression evidence must cover:
 
@@ -60,7 +78,7 @@ At minimum, the regression evidence must cover:
 Before calling the service ready for team use, verify all of the following against a running instance:
 
 1. Start the service with `sh ./start.sh`.
-2. Confirm `/healthz` returns `200` and `ok: true`.
+2. Confirm public `/livez` returns `200`, then confirm authenticated `/healthz` returns `200` and `ok: true`.
 3. Confirm the bot logs show `subscribed`.
 4. Send two messages from different chats at nearly the same time and verify both progress.
 5. Send two overlapping messages from the same chat and verify the second receives a busy/queued response.
@@ -68,13 +86,13 @@ Before calling the service ready for team use, verify all of the following again
 7. Force a WeCom disconnect and verify the runtime reconnects automatically.
 8. Confirm the short reconnect window does not trigger unnecessary watchdog restarts.
 
-## 3. Stress / Soak Evidence Still Required
+## 3. Production Activation Evidence Still Required
 
-The current repository now contains stronger correctness checks, but true multi-user delivery still requires system-level evidence:
+The isolated probe covers launcher/watchdog behavior and HTTP resource evidence. True multi-user delivery still requires deployment-specific evidence:
 
 - concurrent chat load test with at least 10 active chats
 - soak run over an extended period
-- resource observations for CPU, memory, subprocess count, and queue depth
-- watchdog recovery verification under restart conditions
+- resource observations during the real workload, in addition to the isolated probe
+- watchdog recovery verification on the deployment host, in addition to the isolated probe
 
-Without those artifacts, the code can be called improved and better verified, but not fully proven for multi-user delivery.
+These checks require real credentials and a production-like host. They are an activation gate, not a claim the repository-only test suite can establish. Without their artifacts, the code may be released as a candidate, but the specific deployment must not be described as production-proven.

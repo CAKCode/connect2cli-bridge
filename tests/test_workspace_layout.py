@@ -78,6 +78,8 @@ def test_ensure_workspace_dirs_creates_expected_directories(tmp_path: Path) -> N
     assert workspace.workfile_dir.is_dir()
     assert workspace.lock_file.parent.is_dir()
     assert (workspace.cwd_dir / ".codex").is_dir()
+    assert workspace.state_dir.stat().st_mode & 0o777 == 0o700
+    assert workspace.lock_file.parent.stat().st_mode & 0o777 == 0o700
 
 
 def test_personal_workspace_mode_uses_source_dir_as_cwd_and_skill_root(tmp_path: Path) -> None:

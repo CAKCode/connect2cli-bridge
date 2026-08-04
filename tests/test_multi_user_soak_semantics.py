@@ -40,4 +40,8 @@ async def test_multi_user_concurrency_soak_mock_mode_keeps_all_rounds_passing(tm
     for item in payload["roundsPayload"]:
         assert item["allSessionsUnique"] is True
         assert item["allThreadsUnique"] is True
+        assert item["allSessionIdsPresent"] is True
+        assert item["allThreadIdsPresent"] is True
+        assert item["maxConcurrentProcesses"] >= 2
+        assert item["concurrencyProven"] is True
         assert len(item["results"]) == 5

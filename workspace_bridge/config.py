@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agent_backends import normalize_agent_backend
+from .api_security import api_auth_enabled, is_loopback_address
 from .runtime import VALID_CODEX_EXEC_MODES, build_bot_config
 
 
@@ -90,6 +91,8 @@ def read_secret_file(secret_file: Path) -> str:
 class AppConfig:
     bind_host: str
     bind_port: int
+    api_token: str | None
+    api_basic_auth: str | None
     runtime_root: Path
     source_dir: Path
     workspace_namespace: str
@@ -116,6 +119,10 @@ class AppConfig:
 def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | None = None) -> AppConfig:
     values = merge_env(environ, env_file=env_file)
     bind_host, bind_port = resolve_bind(values.get("BRIDGE_BIND", "127.0.0.1:6288"))
+    api_token = _normalize_optional_text(values.get("BRIDGE_TOKEN"))
+    api_basic_auth = _normalize_optional_text(values.get("BRIDGE_BASIC_AUTH"))
+    if not is_loopback_address(bind_host) and not api_auth_enabled(api_token or "", api_basic_auth or ""):
+        raise ValueError("non-loopback BRIDGE_BIND requires BRIDGE_TOKEN or BRIDGE_BASIC_AUTH")
     runtime_root = Path(values.get("RUNTIME_ROOT") or ".workspace-bridge-runtime").expanduser().resolve()
     if runtime_root.exists() and not runtime_root.is_dir():
         raise ValueError(f"runtime root is not a directory: {runtime_root}")
@@ -141,16 +148,6 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
     max_upload_size = max(1, int(str(values.get("MAX_UPLOAD_SIZE") or str(100 * 1024 * 1024)).strip()))
     bot_secret_file = Path(require_env(values, "WECOM_BOT_SECRET_FILE")).expanduser().resolve()
     bot_secret = read_secret_file(bot_secret_file)
-    normalized_agent_runtime_root = str(values.get("WECOM_AGENT_RUNTIME_ROOT") or values.get("AGENT_RUNTIME_ROOT") or "").strip()
-    if normalized_agent_runtime_root.lower() in {"none", "null"}:
-        normalized_agent_runtime_root = ""
-    resolved_agent_runtime_root = (
-        Path(normalized_agent_runtime_root).expanduser().resolve()
-        if normalized_agent_runtime_root
-        else None
-    )
-    if resolved_agent_runtime_root is not None and resolved_agent_runtime_root.exists() and not resolved_agent_runtime_root.is_dir():
-        raise ValueError(f"agent runtime root is not a directory: {resolved_agent_runtime_root}")
     workspace_mode = (str(values.get("WECOM_BOT_WORKSPACE_MODE") or values.get("WECOM_WORKSPACE_MODE") or "").strip().lower() or "")
     if workspace_mode in {"none", "null"}:
         workspace_mode = ""
@@ -165,6 +162,8 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
     return AppConfig(
         bind_host=bind_host,
         bind_port=bind_port,
+        api_token=api_token,
+        api_basic_auth=api_basic_auth,
         runtime_root=runtime_root,
         source_dir=source_dir,
         workspace_namespace=workspace_namespace,
@@ -174,9 +173,9 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
         codex_exec_mode=codex_exec_mode,
         agent_backend=normalize_agent_backend(values.get("WECOM_AGENT_BACKEND") or values.get("AGENT_BACKEND") or "codex"),
         agent_command=_normalize_optional_text(values.get("WECOM_AGENT_COMMAND") or values.get("AGENT_COMMAND")),
-        agent_run_as_user=_normalize_optional_text(values.get("WECOM_AGENT_RUN_AS_USER") or values.get("AGENT_RUN_AS_USER")),
-        agent_run_as_group=_normalize_optional_text(values.get("WECOM_AGENT_RUN_AS_GROUP") or values.get("AGENT_RUN_AS_GROUP")),
-        agent_runtime_root=resolved_agent_runtime_root,
+        agent_run_as_user=None,
+        agent_run_as_group=None,
+        agent_runtime_root=None,
         file_send_roots=file_send_roots,
         max_upload_size=max_upload_size,
         wecom_enabled=str(values.get("WECOM_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"},

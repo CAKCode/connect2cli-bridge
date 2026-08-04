@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "check_multi_user_readiness.sh"
 
 
-def test_check_multi_user_readiness_script_includes_agent_runtime_regression_gate(tmp_path: Path) -> None:
+def test_check_multi_user_readiness_script_runs_production_and_compatibility_gates(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True, exist_ok=True)
     fake_pytest = fake_bin / "pytest"
@@ -19,8 +19,9 @@ def test_check_multi_user_readiness_script_includes_agent_runtime_regression_gat
         "\n".join(
             [
                 "#!/usr/bin/env bash",
-                f"printf '%s\\n' \"$@\" > {str(args_file)!r}",
-                f"printf '%s' \"$PYTEST_DISABLE_PLUGIN_AUTOLOAD\" > {str(env_file)!r}",
+                f"printf '%s\\n' \"$@\" >> {str(args_file)!r}",
+                f"printf '%s\\n' __END__ >> {str(args_file)!r}",
+                f"printf '%s\\n' \"$PYTEST_DISABLE_PLUGIN_AUTOLOAD\" >> {str(env_file)!r}",
             ]
         )
         + "\n",
@@ -41,7 +42,16 @@ def test_check_multi_user_readiness_script_includes_agent_runtime_regression_gat
     )
 
     assert result.returncode == 0
-    args = args_file.read_text(encoding="utf-8").splitlines()
-    assert args[:3] == ["-q", "-p", "pytest_asyncio.plugin"]
-    assert "tests/test_agent_runtime.py" in args
-    assert env_file.read_text(encoding="utf-8") == "1"
+    raw_calls = args_file.read_text(encoding="utf-8").split("__END__\n")
+    calls = [item.splitlines() for item in raw_calls if item.strip()]
+
+    assert len(calls) == 2
+    assert calls[0][:3] == ["-q", "-p", "pytest_asyncio.plugin"]
+    assert "tests/test_api_security.py" in calls[0]
+    assert "tests/test_bridge_core.py" in calls[0]
+    assert "tests/test_production_readiness_probe.py" in calls[0]
+    assert "tests/test_execution_and_service_runtime.py" not in calls[0]
+    assert calls[1][:3] == ["-q", "-p", "pytest_asyncio.plugin"]
+    assert "tests/test_execution_and_service_runtime.py" in calls[1]
+    assert "tests/test_bridge_core.py" not in calls[1]
+    assert env_file.read_text(encoding="utf-8").splitlines() == ["1", "1"]

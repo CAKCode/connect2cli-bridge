@@ -90,6 +90,95 @@ def write_secret_file(path: Path, value: str) -> Path:
     return path
 
 
+def test_bridge_fixture_isolates_all_writable_runtime_roots(bridge_module):
+    isolated_roots = (
+        bridge_module.DATA_FILE,
+        bridge_module.SHARED_RUNTIME_ROOT,
+        bridge_module.INSTANCE_RUNTIME_ROOT,
+        bridge_module.DEFAULT_CODEX_HOME,
+        bridge_module.LOCAL_FILE_SEND_QUEUE_ROOT,
+        bridge_module.LOCAL_SEND_MESSAGE_QUEUE_ROOT,
+        bridge_module.TEMPLATE_CARD_STATE_ROOT,
+    )
+
+    for target in isolated_roots:
+        target.resolve().relative_to(bridge_module.BASE_DIR.resolve())
+
+
+def test_bridge_fixture_ignores_host_import_configuration(request, monkeypatch):
+    monkeypatch.setenv("BRIDGE_BIND", "203.0.113.10:4567")
+    monkeypatch.setenv("BRIDGE_TOKEN", "host-token")
+    monkeypatch.setenv("CODEX_EXEC_MODE", "sandboxed")
+    monkeypatch.setenv("MAX_JSON_BODY", "17")
+    monkeypatch.setenv("STREAM_TEXT_MAX_CHARS", "9999")
+
+    module = request.getfixturevalue("bridge_module")
+
+    assert (module.HOST, module.PORT) == ("127.0.0.1", 9299)
+    assert module.BRIDGE_TOKEN == ""
+    assert module.CODEX_EXEC_MODE == "host"
+    assert module.MAX_JSON_BODY == 1024 * 1024
+    assert module.STREAM_TEXT_MAX_CHARS == 3500
+
+
+def write_local_codex_rollout(
+    base_home: Path,
+    *,
+    session_id: str,
+    cwd: Path,
+    transcript=None,
+    session_timestamp: str = "2026-07-20T06:13:28.929Z",
+    rollout_timestamp: str = "2026-07-20T06-13-28",
+    mtime_ms: int | None = None,
+) -> Path:
+    transcript = list(transcript or [])
+    rollout_dir = base_home / "sessions" / "2026" / "07" / "20"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    rollout_file = rollout_dir / f"rollout-{rollout_timestamp}-{session_id}.jsonl"
+    started_at = session_timestamp
+    lines = [
+        {
+            "timestamp": started_at,
+            "type": "session_meta",
+            "payload": {
+                "session_id": session_id,
+                "id": session_id,
+                "timestamp": started_at,
+                "cwd": str(cwd),
+            },
+        }
+    ]
+    for index, entry in enumerate(transcript, start=1):
+        if isinstance(entry, dict):
+            role = str(entry["role"])
+            text = str(entry["text"])
+            phase = str(entry.get("phase") or "").strip()
+        else:
+            role, text = entry
+            phase = ""
+        lines.append(
+            {
+                "timestamp": f"2026-07-20T06:13:{28 + index:02d}.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "input_text" if role == "user" else "output_text",
+                            "text": text,
+                        }
+                    ],
+                    **({"phase": phase} if phase else {}),
+                },
+            }
+        )
+    rollout_file.write_text("\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n", encoding="utf-8")
+    if mtime_ms is not None:
+        os.utime(rollout_file, ns=(mtime_ms * 1_000_000, mtime_ms * 1_000_000))
+    return rollout_file
+
+
 class FakeStdin:
     def __init__(self) -> None:
         self.buffer = bytearray()
@@ -1002,6 +1091,214 @@ def test_release_session_lease_tolerates_malformed_lock_file(bridge_module):
     assert persisted["leaseExpiresAt"] is None
 
 
+def test_release_session_lease_preserves_foreign_takeover(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    lease_expires_at = bridge_module.now_ms() + 60_000
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": lease_expires_at,
+    }
+    bridge_module.write_lease(sess.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": "foreign-instance",
+            "ownerPid": 12345,
+            "leaseExpiresAt": lease_expires_at,
+            "status": "running",
+            "activeScheduleId": "schedule-1",
+        },
+    )
+    job = {"sessionId": sess.session_id, "scheduleId": "schedule-1"}
+
+    bridge_module.release_session_lease(bot, "single:test-user", sess)
+
+    assert sess.lease_owned is False
+    assert bridge_module.read_lease(sess.lock_file) == foreign_lease
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] == "foreign-instance"
+    assert persisted["ownerPid"] == 12345
+    assert persisted["leaseExpiresAt"] == lease_expires_at
+    assert persisted["status"] == "running"
+    assert persisted["activeScheduleId"] == "schedule-1"
+    assert bridge_module.is_schedule_job_running(job, bridge_module.now_ms()) is True
+
+
+def test_interrupt_session_preserves_foreign_takeover_record(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    lease_expires_at = bridge_module.now_ms() + 60_000
+    bridge_module.write_lease(
+        sess.lock_file,
+        {
+            "instanceId": "foreign-instance",
+            "pid": 12345,
+            "botId": bot.config["id"],
+            "chatKey": "single:test-user",
+            "updatedAt": bridge_module.now_ms(),
+            "expiresAt": lease_expires_at,
+        },
+    )
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": "foreign-instance",
+            "ownerPid": 12345,
+            "leaseExpiresAt": lease_expires_at,
+            "status": "running",
+            "activeScheduleId": "schedule-1",
+        },
+    )
+
+    bridge_module.interrupt_session(
+        bot,
+        "single:test-user",
+        sess,
+        clear_thread=False,
+        clear_chat=False,
+        clear_queue=True,
+    )
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] == "foreign-instance"
+    assert persisted["ownerPid"] == 12345
+    assert persisted["leaseExpiresAt"] == lease_expires_at
+    assert persisted["status"] == "running"
+    assert persisted["activeScheduleId"] == "schedule-1"
+
+
+def test_owned_session_record_update_skips_after_foreign_takeover(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    lease_expires_at = bridge_module.now_ms() + 60_000
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": lease_expires_at,
+    }
+    bridge_module.write_lease(sess.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": "foreign-instance",
+            "ownerPid": 12345,
+            "leaseExpiresAt": lease_expires_at,
+            "status": "running",
+            "activeScheduleId": "schedule-1",
+        },
+    )
+
+    updated = bridge_module.update_owned_session_record(
+        bot,
+        "single:test-user",
+        sess,
+        lambda record: {**record, "status": "idle", "activeScheduleId": None},
+    )
+
+    assert updated is None
+    assert sess.lease_owned is False
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] == "foreign-instance"
+    assert persisted["status"] == "running"
+    assert persisted["activeScheduleId"] == "schedule-1"
+
+
+@pytest.mark.asyncio
+async def test_abandon_session_after_lease_loss_cancels_local_run_without_touching_foreign_record(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    lease_expires_at = bridge_module.now_ms() + 60_000
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": lease_expires_at,
+    }
+    bridge_module.write_lease(sess.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": "foreign-instance",
+            "ownerPid": 12345,
+            "leaseExpiresAt": lease_expires_at,
+            "status": "running",
+            "activeScheduleId": "schedule-1",
+        },
+    )
+    started = asyncio.Event()
+
+    async def wait_forever():
+        started.set()
+        await asyncio.Event().wait()
+
+    class FakeProcess:
+        returncode = None
+        killed = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    task = asyncio.create_task(wait_forever())
+    await started.wait()
+    process = FakeProcess()
+    sess.running = True
+    sess.run_task = task
+    sess.proc = process
+    sess.queue.append({"text": "next", "reqId": "req-next"})
+    sess.pending_final_payload = {"headers": {"req_id": "req-current"}}
+
+    bridge_module.abandon_session_after_lease_loss(bot, "single:test-user", sess)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.killed is True
+    assert sess.running is False
+    assert sess.queue == [{"text": "next", "reqId": "req-next"}]
+    assert sess.pending_final_payload is None
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted["ownerInstance"] == "foreign-instance"
+    assert persisted["status"] == "running"
+    assert persisted["activeScheduleId"] == "schedule-1"
+
+
+@pytest.mark.asyncio
+async def test_lease_renew_loop_renews_lease_during_pending_final_delivery(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.running = False
+    sess.pending_final_payload = {"headers": {"req_id": "req-final"}}
+    renewed = []
+
+    async def stop_after_first_sleep(_delay):
+        bridge_module.SHUTDOWN_EVENT.set()
+
+    def fake_renew(_bot, key, _sess):
+        renewed.append(key)
+        return True
+
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", stop_after_first_sleep)
+    monkeypatch.setattr(bridge_module, "renew_session_lease", fake_renew)
+
+    await bridge_module.lease_renew_loop()
+
+    assert renewed == ["single:test-user"]
+
+
 def test_normalize_session_record_rejects_path_like_session_id(bridge_module):
     record = bridge_module.normalize_session_record(
         {
@@ -1383,6 +1680,77 @@ def test_get_or_create_session_uses_current_bot_workdir(bridge_module):
     assert reused.work_dir == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user"))
 
 
+def test_get_or_create_session_revokes_local_binding_after_owner_changes(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "new-owner"
+    record = bridge_module.create_session_record(bot, "single:former-owner")
+    bridge_module.update_session_record(
+        record["sessionId"],
+        lambda current: {
+            **current,
+            "threadId": "local-thread",
+            "useGlobalCodexSessions": True,
+            "recentChat": [{"role": "user", "text": "local conversation"}],
+            "localResumeBackup": {
+                "threadId": "bridge-thread",
+                "recentChat": [{"role": "user", "text": "bridge conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+
+    sess = bridge_module.get_or_create_session(bot, "single:former-owner")
+
+    persisted = bridge_module.read_session_record_by_id(record["sessionId"])
+    assert sess.thread_id == "bridge-thread"
+    assert sess.use_global_codex_sessions is False
+    assert [item["text"] for item in sess.chat] == ["bridge conversation"]
+    assert persisted.get("threadId") == "bridge-thread"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("localResumeBackup") is None
+
+
+def test_get_or_create_session_revokes_preexisting_duplicate_local_binding(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = bridge_module.create_session_record(bot, "single:test-user")
+    other = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        current["sessionId"],
+        lambda record: {
+            **record,
+            "threadId": "duplicate-local-thread",
+            "useGlobalCodexSessions": True,
+            "recentChat": [{"role": "user", "text": "local conversation"}],
+            "localResumeBackup": {
+                "threadId": "bridge-thread",
+                "recentChat": [{"role": "user", "text": "bridge conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+    bridge_module.update_session_record(
+        other["sessionId"],
+        lambda record: {
+            **record,
+            "threadId": "duplicate-local-thread",
+            "useGlobalCodexSessions": True,
+        },
+    )
+
+    sess = bridge_module.get_or_create_session(bot, "single:test-user")
+
+    persisted = bridge_module.read_session_record_by_id(current["sessionId"])
+    assert sess.thread_id == "bridge-thread"
+    assert sess.use_global_codex_sessions is False
+    assert [item["text"] for item in sess.chat] == ["bridge conversation"]
+    assert persisted.get("threadId") == "bridge-thread"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("localResumeBackup") is None
+
+
 @pytest.mark.asyncio
 async def test_start_bot_clears_session_runtime_state_when_workdir_changes(bridge_module, monkeypatch):
     old_work_dir = bridge_module.BASE_DIR / "old-workdir"
@@ -1674,15 +2042,188 @@ def test_start_sh_exports_runtime_tuning_envs():
 
     assert "load_bridge_runtime_env" in content
     assert "export_bridge_runtime_env" in content
+    assert 'nohup setsid "$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py"' in content
+    assert 'nohup "$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py"' in content
     assert ".bridge.guard.pid" in content
+    assert 'CONTROL_STATE_ROOT="$(prepare_bridge_state_root' in content
+    assert 'if is_truthy "$CONTROL_STATE_IS_CUSTOM"; then' in content
+    assert 'bridge_pid_matches_instance_process' in content
+
+
+def test_prepare_bridge_state_root_does_not_follow_predictable_probe_symlink(tmp_path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep-content", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            (
+                '. "$1/bridge_env.sh"; '
+                'ln -s "$3" "$2/.bridge-write-test.$$"; '
+                'prepare_bridge_state_root "$1" "$2" "TEST_STATE_ROOT"'
+            ),
+            "sh",
+            str(REPO_ROOT),
+            str(state_root),
+            str(victim),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(state_root.resolve())
+    assert victim.read_text(encoding="utf-8") == "keep-content"
+
+
+def test_prepare_bridge_state_root_accepts_group_writable_directory(tmp_path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state_root.chmod(0o770)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; prepare_bridge_state_root "$1" "$2" "TEST_STATE_ROOT"',
+            "sh",
+            str(REPO_ROOT),
+            str(state_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(state_root.resolve())
+
+
+def test_prepare_bridge_state_root_rejects_world_writable_directory(tmp_path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state_root.chmod(0o777)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; prepare_bridge_state_root "$1" "$2" "TEST_STATE_ROOT"',
+            "sh",
+            str(REPO_ROOT),
+            str(state_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "TEST_STATE_ROOT must not be world-writable" in result.stderr
+
+
+def test_shutdown_reason_writer_replaces_symlink_without_touching_victim(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep-content", encoding="utf-8")
+    state_file = tmp_path / "shutdown.json"
+    state_file.symlink_to(victim)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; write_bridge_shutdown_reason_file "$2" "watchdog_restart"',
+            "sh",
+            str(REPO_ROOT),
+            str(state_file),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert victim.read_text(encoding="utf-8") == "keep-content"
+    assert not state_file.is_symlink()
+    assert json.loads(state_file.read_text(encoding="utf-8"))["reason"] == "watchdog_restart"
+    assert state_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_start_sh_cleans_watchdog_on_failed_start():
     content = START_SH_PATH.read_text(encoding="utf-8")
 
-    assert 'if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then' in content
-    assert 'kill "$GUARD_PID" 2>/dev/null || true' in content
-    assert 'rm -f "$GUARD_PID_FILE"' in content
+    assert 'LAUNCHED_PID=$!' in content
+    assert 'bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" false "$LAUNCHED_KIND" "$LAUNCHED_PID"' in content
+    assert 'kill "$LAUNCHED_PID" 2>/dev/null || true' in content
+    assert 'rm -f "$GUARD_PID_FILE" "$PID_FILE"' in content
+
+
+def test_start_sh_fails_and_cleans_bridge_when_watchdog_exits_during_startup(tmp_path, unused_tcp_port):
+    script_dir = tmp_path / "bridge-scripts"
+    control_root = tmp_path / "control"
+    runtime_root = tmp_path / "runtime"
+    script_dir.mkdir()
+    control_root.mkdir()
+    for source in (START_SH_PATH, BRIDGE_ENV_SH_PATH, BRIDGE_RUNTIME_CONFIG_PATH):
+        shutil.copy2(source, script_dir / source.name)
+    (script_dir / "bridge.py").write_text(
+        "import time\nwhile True:\n    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    (script_dir / "bridge_watchdog.sh").write_text(
+        "#!/bin/sh\n"
+        'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'python3 "$SCRIPT_DIR/bridge.py" </dev/null >> "$BRIDGE_CONTROL_ROOT/bridge.log" 2>&1 &\n'
+        "child_pid=$!\n"
+        'printf "%s\\n" "$child_pid" > "$BRIDGE_CONTROL_ROOT/.bridge.pid"\n'
+        'printf "%s\\n" "$child_pid" > "$BRIDGE_CONTROL_ROOT/launched-bridge.pid"\n'
+        "sleep 0.2\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(
+        f"BRIDGE_CONTROL_ROOT='{control_root}'\n"
+        f"BRIDGE_RUNTIME_ROOT='{runtime_root}'\n"
+        f"BRIDGE_BIND='127.0.0.1:{unused_tcp_port}'\n"
+        "BRIDGE_WATCHDOG_ENABLED='true'\n",
+        encoding="utf-8",
+    )
+    env = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "PYTHONPATH")
+        if key in os.environ
+    }
+    env["BRIDGE_ENV_FILE"] = str(env_file)
+    env["BRIDGE_ENV_FILE_REQUIRED"] = "true"
+    bridge_pid = 0
+
+    try:
+        result = subprocess.run(
+            ["sh", str(script_dir / "start.sh")],
+            cwd=script_dir,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+        bridge_pid = int((control_root / "launched-bridge.pid").read_text(encoding="utf-8").strip())
+
+        assert result.returncode == 1
+        assert "start failed" in result.stdout
+        assert not (control_root / ".bridge.guard.pid").exists()
+        assert not (control_root / ".bridge.pid").exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(bridge_pid, 0)
+    finally:
+        if bridge_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(bridge_pid, 9)
 
 
 def test_env_example_declares_watchdog_controls():
@@ -1698,13 +2239,52 @@ def test_watchdog_script_exists_and_uses_livez_probe():
     content = WATCHDOG_SH_PATH.read_text(encoding="utf-8")
 
     assert "export_bridge_runtime_env" in content
+    assert 'setsid "$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py"' in content
+    assert '"$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py"' in content
     assert "GET /" not in content
     assert "bridge_health_ok()" in content
     assert "/livez" in content
     assert ".bridge.guard.pid" in content
     assert "restart triggered" in content
     assert "bridge recovered before restart; skip restart" in content
+    assert 'CONTROL_STATE_ROOT="$(prepare_bridge_state_root' in content
+    assert 'bridge_pid_matches_instance_process' in content
     assert 'load_bridge_runtime_env "$SCRIPT_DIR" || exit 1' in content.split("start_bridge_process() {", 1)[1]
+
+
+def test_watchdog_preserves_fatal_exit_when_guard_pid_target_is_directory(tmp_path):
+    control_root = tmp_path / "control"
+    runtime_root = tmp_path / "runtime"
+    control_root.mkdir()
+    (control_root / ".bridge.guard.pid").mkdir()
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(
+        f"BRIDGE_CONTROL_ROOT='{control_root}'\n"
+        f"BRIDGE_RUNTIME_ROOT='{runtime_root}'\n"
+        "BRIDGE_BIND='127.0.0.1:19490'\n",
+        encoding="utf-8",
+    )
+    env = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "PYTHONPATH")
+        if key in os.environ
+    }
+    env["BRIDGE_ENV_FILE"] = str(env_file)
+    env["BRIDGE_ENV_FILE_REQUIRED"] = "true"
+
+    result = subprocess.run(
+        ["sh", str(WATCHDOG_SH_PATH)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "failed to write watchdog PID file" in (control_root / "bridge.log").read_text(encoding="utf-8")
+    assert list((control_root / ".bridge.guard.pid").iterdir()) == []
+    assert not (control_root / ".bridge.pid").exists()
 
 
 def test_check_bridge_health_uses_shared_runtime_schedule_dirs(tmp_path):
@@ -1754,7 +2334,7 @@ def _fake_urlopen(req, timeout=None):
     url = req.full_url if hasattr(req, "full_url") else str(req)
     if url.endswith("/api/bots"):
         return _Resp(BOTS)
-    if url.endswith("/healthz"):
+    if url.endswith("/livez"):
         return _Resp(ROOT)
     raise RuntimeError(f"unexpected url: {url}")
 
@@ -1961,6 +2541,8 @@ def test_deploy_from_codex_quotes_env_values_for_paths_with_spaces(tmp_path):
         capture_output=True,
         text=True,
     )
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
 
     subprocess.run(
         [
@@ -1968,8 +2550,8 @@ def test_deploy_from_codex_quotes_env_values_for_paths_with_spaces(tmp_path):
             str(script_dir / "deploy_from_codex.sh"),
             "--bot-id",
             "bot-id",
-            "--bot-secret",
-            "secret-value",
+            "--bot-secret-file",
+            str(input_secret),
             "--github-repo",
             "git@github.com:example/demo-repo.git",
             "--work-root",
@@ -1984,6 +2566,8 @@ def test_deploy_from_codex_quotes_env_values_for_paths_with_spaces(tmp_path):
 
     env_file = script_dir / ".env"
     assert env_file.exists()
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert list(script_dir.glob(".env.tmp.*")) == []
 
     result = subprocess.run(
         [
@@ -2002,6 +2586,308 @@ def test_deploy_from_codex_quotes_env_values_for_paths_with_spaces(tmp_path):
     assert lines[0] == str(target_repo_dir)
     assert lines[1] == str(target_repo_dir)
     assert lines[2] == str(script_dir / ".secrets" / "demo-repo.secret")
+
+
+def test_deploy_from_codex_installs_dependencies_in_project_venv(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    venv_python = script_dir / ".venv" / "bin" / "python"
+    assert venv_python.is_file()
+    env_content = (script_dir / ".env").read_text(encoding="utf-8")
+    assert f"BRIDGE_PYTHON='{venv_python}'" in env_content
+
+
+def test_deploy_from_codex_skip_install_keeps_system_python_without_existing_venv(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BRIDGE_PYTHON='python3'" in (script_dir / ".env").read_text(encoding="utf-8")
+    assert not (script_dir / ".venv").exists()
+
+
+def test_deploy_from_codex_copies_secret_file_with_private_permissions(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    destination = script_dir / ".secrets" / "demo-repo.secret"
+    assert destination.read_text(encoding="utf-8") == "secret-value\n"
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert destination.parent.stat().st_mode & 0o777 == 0o700
+    assert list(destination.parent.glob(".*.tmp.*")) == []
+    assert "secret-value" not in result.stdout
+    assert "secret-value" not in result.stderr
+
+
+def test_deploy_from_codex_replaces_env_symlink_without_touching_target(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
+    work_root = tmp_path / "work-root"
+    target_repo_dir = work_root / "demo-repo"
+    target_repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=target_repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/demo-repo.git"],
+        cwd=target_repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    victim = tmp_path / "victim.env"
+    victim.write_text("KEEP=true\n", encoding="utf-8")
+    env_file = script_dir / ".env"
+    env_file.symlink_to(victim)
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--work-root",
+            str(work_root),
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert victim.read_text(encoding="utf-8") == "KEEP=true\n"
+    assert env_file.is_file() and not env_file.is_symlink()
+    assert "WECOM_BOT_ID='bot-id'" in env_file.read_text(encoding="utf-8")
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert list(script_dir.glob(".env.tmp.*")) == []
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "empty", "unreadable"])
+def test_deploy_from_codex_rejects_invalid_secret_file(tmp_path, kind):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    if kind == "directory":
+        input_secret.mkdir()
+    elif kind == "empty":
+        input_secret.write_text(" \n", encoding="utf-8")
+    elif kind == "unreadable":
+        input_secret.write_text("secret-value\n", encoding="utf-8")
+        input_secret.chmod(0)
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--skip-install",
+            "--skip-start",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    expected_error = {
+        "missing": "--bot-secret-file does not exist",
+        "directory": "--bot-secret-file is not a regular file",
+        "empty": "--bot-secret-file is empty",
+        "unreadable": "--bot-secret-file is not readable UTF-8 text",
+    }[kind]
+    assert expected_error in result.stderr
+
+
+def test_deploy_from_codex_rejects_both_secret_inputs(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+    input_secret = tmp_path / "input.secret"
+    input_secret.write_text("secret-value\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret-file",
+            str(input_secret),
+            "--bot-secret",
+            "legacy-secret",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--skip-install",
+            "--skip-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "mutually exclusive" in result.stderr
+
+
+def test_deploy_from_codex_legacy_inline_secret_warns(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "deploy_from_codex.sh").write_text(
+        DEPLOY_FROM_CODEX_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (script_dir / "requirements.txt").write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "sh",
+            str(script_dir / "deploy_from_codex.sh"),
+            "--bot-id",
+            "bot-id",
+            "--bot-secret",
+            "legacy-secret",
+            "--github-repo",
+            "git@github.com:example/demo-repo.git",
+            "--skip-install",
+            "--skip-start",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "exposes the secret in shell history and process listings" in result.stderr
 
 
 def test_deploy_from_codex_rejects_path_like_bot_name(tmp_path):
@@ -2415,6 +3301,30 @@ def test_bridge_module_rejects_file_instance_runtime_root(monkeypatch, tmp_path)
     assert str(excinfo.value) == f"BRIDGE_RUNTIME_ROOT is not a directory: {bad_root.resolve()}"
 
 
+def test_secure_state_root_accepts_group_writable_directory(bridge_module, tmp_path):
+    state_root = tmp_path / "shared-state"
+    state_root.mkdir()
+    state_root.chmod(0o2770)
+
+    assert bridge_module.ensure_secure_state_root(state_root, "TEST_STATE_ROOT") == state_root
+
+
+def test_secure_state_root_rejects_world_writable_directory(bridge_module, tmp_path):
+    state_root = tmp_path / "shared-state"
+    state_root.mkdir()
+    state_root.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="must not be world-writable"):
+        bridge_module.ensure_secure_state_root(state_root, "TEST_STATE_ROOT")
+
+
+def test_secure_state_root_accepts_owner_writable_directory(bridge_module, tmp_path):
+    state_root = tmp_path / "private-state"
+    state_root.mkdir(mode=0o700)
+
+    assert bridge_module.ensure_secure_state_root(state_root, "TEST_STATE_ROOT") == state_root
+
+
 def test_bridge_module_rejects_file_send_root_that_is_not_directory(monkeypatch, tmp_path):
     bad_root = tmp_path / "file-send-root.txt"
     bad_root.write_text("not a dir", encoding="utf-8")
@@ -2452,6 +3362,266 @@ def test_bridge_env_load_uses_bridge_bind_from_dotenv(tmp_path):
     assert result.stdout.strip() == "127.0.0.1 19399"
 
 
+def test_bridge_env_load_uses_explicit_env_file_without_reading_default(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text("BRIDGE_BIND=127.0.0.1:19399\n", encoding="utf-8")
+    alternate_env = tmp_path / "isolated.env"
+    alternate_env.write_text("BRIDGE_BIND=127.0.0.1:19400\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["BRIDGE_ENV_FILE"] = str(alternate_env)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; printf "%s %s\\n%s\\n" "$HOST" "$PORT" "$BRIDGE_ENV_FILE"',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout.strip().splitlines() == ["127.0.0.1 19400", str(alternate_env.resolve())]
+
+
+def test_bridge_env_load_rejects_directory_env_file(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_dir = tmp_path / "env-dir"
+    env_dir.mkdir()
+    env = dict(os.environ)
+    env["BRIDGE_ENV_FILE"] = str(env_dir)
+
+    result = subprocess.run(
+        ["sh", "-c", '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"', "sh", str(script_dir)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert f"BRIDGE_ENV_FILE is not a file: {env_dir.resolve()}" in result.stderr
+
+
+def test_bridge_env_load_rejects_explicit_missing_env_file(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    missing_env = tmp_path / "missing.env"
+    env = dict(os.environ)
+    env["BRIDGE_ENV_FILE"] = str(missing_env)
+
+    result = subprocess.run(
+        ["sh", "-c", '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"', "sh", str(script_dir)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert f"BRIDGE_ENV_FILE does not exist: {missing_env.resolve()}" in result.stderr
+
+
+def test_bridge_env_default_missing_env_file_remains_optional_across_reloads(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("BRIDGE_ENV_FILE", None)
+    env.pop("BRIDGE_ENV_FILE_REQUIRED", None)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; load_bridge_runtime_env "$1"; '
+            'printf "%s %s %s\\n" "$HOST" "$PORT" "$BRIDGE_ENV_FILE_REQUIRED"',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout.strip() == "127.0.0.1 9299 false"
+
+
+def test_bridge_env_defaults_bridge_python_to_python3(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
+            'sh -c \'printf "%s\\n" "$BRIDGE_PYTHON"\'',
+            "sh",
+            str(script_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "python3"
+
+
+def test_bridge_env_rejects_missing_bridge_python(tmp_path):
+    script_dir = tmp_path / "bridge-scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bridge_env.sh").write_text(BRIDGE_ENV_SH_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_dir / "bridge_runtime_config.py").write_text(
+        BRIDGE_RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (script_dir / ".env").write_text("BRIDGE_PYTHON=/missing/bridge-python\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["sh", "-c", '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"', "sh", str(script_dir)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "BRIDGE_PYTHON is not executable: /missing/bridge-python" in result.stderr
+
+
+def test_start_sh_rejects_control_root_file_before_launch(tmp_path):
+    control_file = tmp_path / "control-file"
+    control_file.write_text("not a directory", encoding="utf-8")
+    runtime_root = tmp_path / "runtime"
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(
+        f"BRIDGE_CONTROL_ROOT='{control_file}'\n"
+        f"BRIDGE_RUNTIME_ROOT='{runtime_root}'\n"
+        "BRIDGE_BIND='127.0.0.1:19491'\n"
+        "BRIDGE_WATCHDOG_ENABLED='false'\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["BRIDGE_ENV_FILE"] = str(env_file)
+
+    result = subprocess.run(
+        ["sh", str(START_SH_PATH)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert f"BRIDGE_CONTROL_ROOT is not a directory: {control_file.resolve()}" in result.stderr
+    assert not (control_file / ".bridge.pid").exists()
+
+
+def test_start_sh_rejects_concurrent_start_for_same_control_root(tmp_path):
+    control_root = tmp_path / "control"
+    runtime_root = tmp_path / "runtime"
+    control_root.mkdir()
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(
+        f"BRIDGE_CONTROL_ROOT='{control_root}'\n"
+        f"BRIDGE_RUNTIME_ROOT='{runtime_root}'\n"
+        "BRIDGE_BIND='127.0.0.1:19489'\n"
+        "BRIDGE_WATCHDOG_ENABLED='false'\n",
+        encoding="utf-8",
+    )
+    env = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "PYTHONPATH")
+        if key in os.environ
+    }
+    env["BRIDGE_ENV_FILE"] = str(env_file)
+    env["BRIDGE_ENV_FILE_REQUIRED"] = "true"
+    lock_fd = os.open(control_root, os.O_RDONLY)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        result = subprocess.run(
+            ["sh", str(START_SH_PATH)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    assert result.returncode == 1
+    assert f"another start.sh is already running for BRIDGE_CONTROL_ROOT={control_root.resolve()}" in result.stderr
+    assert not (control_root / ".bridge.pid").exists()
+    assert not (control_root / ".bridge.guard.pid").exists()
+    assert not (control_root / "bridge.log").exists()
+
+
+def test_start_sh_does_not_kill_unrelated_pid_from_custom_control_root(tmp_path):
+    control_root = tmp_path / "control"
+    control_root.mkdir()
+    runtime_root = tmp_path / "runtime"
+    (control_root / "bridge.log").mkdir()
+    unrelated = subprocess.Popen(["sleep", "30"])
+    try:
+        (control_root / ".bridge.pid").write_text(f"{unrelated.pid}\n", encoding="utf-8")
+        env_file = tmp_path / "instance.env"
+        env_file.write_text(
+            f"BRIDGE_CONTROL_ROOT='{control_root}'\n"
+            f"BRIDGE_RUNTIME_ROOT='{runtime_root}'\n"
+            "BRIDGE_BIND='127.0.0.1:19492'\n"
+            "BRIDGE_WATCHDOG_ENABLED='false'\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["BRIDGE_ENV_FILE"] = str(env_file)
+
+        result = subprocess.run(
+            ["sh", str(START_SH_PATH)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+
+        assert result.returncode == 1
+        assert f"refusing to stop unrelated process pid={unrelated.pid}" in result.stderr
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
 def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
     script_dir = tmp_path / "bridge-scripts"
     script_dir.mkdir(parents=True, exist_ok=True)
@@ -2468,6 +3638,8 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "CODEX_HOME=/tmp/custom-codex-home\n"
         "WECOM_BOT_WORKSPACE_MODE=personal\n"
         "WECOM_WORKSPACE_MODE=team\n"
+        "WECOM_BOT_LOCAL_RESUME_OWNER_USER_ID=local-owner\n"
+        "LOCAL_RESUME_OWNER_USER_ID=fallback-owner\n"
         "WECOM_BOT_AGENT_BACKEND=claude\n"
         'WECOM_BOT_AGENT_COMMAND="claude --model sonnet"\n'
         "WECOM_BOT_AGENT_RUN_AS_USER=claudebot\n"
@@ -2491,7 +3663,7 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
             "sh",
             "-c",
             '. "$1/bridge_env.sh"; load_bridge_runtime_env "$1"; export_bridge_runtime_env; '
-            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'CODEX_COMMAND\')); print(os.getenv(\'CODEX_HOME\')); print(os.getenv(\'WECOM_BOT_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_BOT_AGENT_BACKEND\')); print(os.getenv(\'WECOM_BOT_AGENT_COMMAND\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_USER\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_GROUP\')); print(os.getenv(\'WECOM_BOT_AGENT_RUNTIME_ROOT\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_SEND_MESSAGE_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'REPLY_SEND_ACK_TIMEOUT_SEC\')); print(os.getenv(\'STREAM_TEXT_MAX_CHARS\')); print(os.getenv(\'WECOM_INBOUND_IDLE_TIMEOUT_MS\')); print(os.getenv(\'WECOM_HEARTBEAT_ACK_TIMEOUT_MS\')); print(os.getenv(\'WECOM_DISCONNECT_GRACE_MS\')); print(os.getenv(\'WECOM_RAW_INBOUND_LOG_ENABLED\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
+            'python3 -c "import os; print(os.getenv(\'WORK_DIR\')); print(os.getenv(\'BRIDGE_TOKEN\')); print(os.getenv(\'CODEX_COMMAND\')); print(os.getenv(\'CODEX_HOME\')); print(os.getenv(\'WECOM_BOT_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_WORKSPACE_MODE\')); print(os.getenv(\'WECOM_BOT_LOCAL_RESUME_OWNER_USER_ID\')); print(os.getenv(\'LOCAL_RESUME_OWNER_USER_ID\')); print(os.getenv(\'WECOM_BOT_AGENT_BACKEND\')); print(os.getenv(\'WECOM_BOT_AGENT_COMMAND\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_USER\')); print(os.getenv(\'WECOM_BOT_AGENT_RUN_AS_GROUP\')); print(os.getenv(\'WECOM_BOT_AGENT_RUNTIME_ROOT\')); print(os.getenv(\'LOCAL_FILE_SEND_POLL_MS\')); print(os.getenv(\'LOCAL_SEND_MESSAGE_POLL_MS\')); print(os.getenv(\'LOCAL_FILE_SEND_RESULT_RETENTION_MS\')); print(os.getenv(\'REPLY_SEND_ACK_TIMEOUT_SEC\')); print(os.getenv(\'STREAM_TEXT_MAX_CHARS\')); print(os.getenv(\'WECOM_INBOUND_IDLE_TIMEOUT_MS\')); print(os.getenv(\'WECOM_HEARTBEAT_ACK_TIMEOUT_MS\')); print(os.getenv(\'WECOM_DISCONNECT_GRACE_MS\')); print(os.getenv(\'WECOM_RAW_INBOUND_LOG_ENABLED\')); print(os.getenv(\'PROACTIVE_TEXT_MAX_CHARS\'))"',
             "sh",
             str(script_dir),
         ],
@@ -2507,6 +3679,8 @@ def test_bridge_env_export_propagates_runtime_variables_to_child(tmp_path):
         "/tmp/custom-codex-home",
         "personal",
         "team",
+        "local-owner",
+        "fallback-owner",
         "claude",
         "claude --model sonnet",
         "claudebot",
@@ -3131,7 +4305,7 @@ def test_require_api_access_accepts_basic_auth(bridge_module):
     bridge_module.BRIDGE_BASIC_AUTH = "czh:test"
     bridge_module.BRIDGE_TOKEN = ""
     header = "Basic " + base64.b64encode(b"czh:test").decode("ascii")
-    request = SimpleNamespace(headers={"Authorization": header}, remote="114.236.137.79")
+    request = SimpleNamespace(headers={"Authorization": header}, remote="203.0.113.10")
 
     result = asyncio.run(bridge_module.require_api_access(request))
 
@@ -3141,13 +4315,79 @@ def test_require_api_access_accepts_basic_auth(bridge_module):
 def test_require_api_access_rejects_missing_basic_auth(bridge_module):
     bridge_module.BRIDGE_BASIC_AUTH = "czh:test"
     bridge_module.BRIDGE_TOKEN = ""
-    request = SimpleNamespace(headers={}, remote="114.236.137.79")
+    request = SimpleNamespace(headers={}, remote="203.0.113.10")
 
     result = asyncio.run(bridge_module.require_api_access(request))
 
     assert result is not None
     assert result.status == 401
     assert result.headers["WWW-Authenticate"] == 'Basic realm="WeCom Codex Bridge"'
+
+
+def test_require_api_access_accepts_non_ascii_basic_auth(bridge_module):
+    credential = "user:\u5bc6\u7801"
+    bridge_module.BRIDGE_BASIC_AUTH = credential
+    bridge_module.BRIDGE_TOKEN = ""
+    header = "Basic " + base64.b64encode(credential.encode("utf-8")).decode("ascii")
+    request = SimpleNamespace(headers={"Authorization": header}, remote="203.0.113.10")
+
+    result = asyncio.run(bridge_module.require_api_access(request))
+
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    ("configured_token", "configured_basic_auth", "authorization"),
+    [
+        ("expected-token", "", "Bearer wrong-\u51ed\u636e"),
+        ("", "expected:credential", "Basic " + base64.b64encode("wrong:\u51ed\u636e".encode("utf-8")).decode("ascii")),
+    ],
+)
+def test_require_api_access_rejects_non_ascii_invalid_credentials(
+    bridge_module,
+    configured_token,
+    configured_basic_auth,
+    authorization,
+):
+    bridge_module.BRIDGE_TOKEN = configured_token
+    bridge_module.BRIDGE_BASIC_AUTH = configured_basic_auth
+    request = SimpleNamespace(headers={"Authorization": authorization}, remote="203.0.113.10")
+
+    result = asyncio.run(bridge_module.require_api_access(request))
+
+    assert result is not None
+    assert result.status == 401
+
+
+def test_api_access_middleware_protects_detailed_health(bridge_module):
+    bridge_module.BRIDGE_TOKEN = "expected-token"
+    bridge_module.BRIDGE_BASIC_AUTH = ""
+    request = SimpleNamespace(path="/healthz", headers={}, remote="203.0.113.10")
+    handler_called = False
+
+    async def handler(_request):
+        nonlocal handler_called
+        handler_called = True
+        return object()
+
+    response = asyncio.run(bridge_module.api_access_middleware(request, handler))
+
+    assert response.status == 401
+    assert handler_called is False
+
+
+def test_api_access_middleware_keeps_livez_public(bridge_module):
+    bridge_module.BRIDGE_TOKEN = "expected-token"
+    bridge_module.BRIDGE_BASIC_AUTH = ""
+    request = SimpleNamespace(path="/livez", headers={}, remote="203.0.113.10")
+    expected = object()
+
+    async def handler(_request):
+        return expected
+
+    response = asyncio.run(bridge_module.api_access_middleware(request, handler))
+
+    assert response is expected
 
 
 def test_prepare_bot_configs_bootstraps_single_bot_from_env(bridge_module, monkeypatch):
@@ -3190,6 +4430,12 @@ def test_prepare_bot_configs_treats_null_explicit_config_id_as_default_id(bridge
 
     assert len(configs) == 1
     assert configs[0]["id"] == bridge_module.default_bot_config_id("bot-id")
+
+
+def test_serialize_bot_config_for_disk_omits_unset_local_resume_owner(bridge_module):
+    assert bridge_module.serialize_bot_config_for_disk(
+        {"id": "bot-1", "localResumeOwnerUserId": None}
+    ) == {"id": "bot-1"}
 
 
 def test_prepare_bot_configs_rejects_null_env_bot_id_when_secret_file_present(bridge_module, monkeypatch):
@@ -5058,7 +6304,7 @@ def test_normalize_bot_config_treats_null_restart_token_as_unset(bridge_module):
     assert config["restartToken"] is None
 
 
-def test_normalize_bot_config_accepts_agent_run_as_fields(bridge_module):
+def test_normalize_bot_config_ignores_legacy_agent_run_as_fields(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
 
     config = bridge_module.normalize_bot_config(
@@ -5076,9 +6322,9 @@ def test_normalize_bot_config_accepts_agent_run_as_fields(bridge_module):
         }
     )
 
-    assert config["agentRunAsUser"] == "nobody"
-    assert config["agentRunAsGroup"] == "nogroup"
-    assert str(config["agentRuntimeRoot"]).endswith("claude-runtime")
+    assert config["agentRunAsUser"] is None
+    assert config["agentRunAsGroup"] is None
+    assert config["agentRuntimeRoot"] is None
 
 
 def test_start_bot_does_not_stop_existing_bot_when_new_config_is_invalid(bridge_module):
@@ -5227,6 +6473,108 @@ def test_reset_cancels_pending_file_sends_for_session(bridge_module):
     result_2 = bridge_module.read_json_file(bridge_module.LOCAL_FILE_SEND_RESULT_ROOT / "queued-request.json", None)
     assert result_1 is not None and result_1["statusCode"] == 409
     assert result_2 is not None and result_2["statusCode"] == 409
+
+
+def test_reset_clears_local_resume_backup(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "local-thread"
+    sess.use_global_codex_sessions = True
+    sess.chat = [{"role": "user", "text": "local conversation"}]
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda current: {
+            **current,
+            "threadId": sess.thread_id,
+            "useGlobalCodexSessions": True,
+            "recentChat": list(sess.chat),
+            "localResumeBackup": {
+                "threadId": "bridge-thread",
+                "recentChat": [{"role": "user", "text": "bridge conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+
+    bridge_module.interrupt_session(
+        bot,
+        "single:test-user",
+        sess,
+        clear_thread=True,
+        clear_chat=True,
+        clear_queue=True,
+    )
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted.get("threadId") is None
+    assert persisted.get("recentChat") == []
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("localResumeBackup") is None
+
+
+def test_normalize_local_resume_backup_cannot_restore_global_session_mode(bridge_module):
+    backup = bridge_module.normalize_local_resume_backup(
+        {
+            "threadId": "bridge-thread",
+            "recentChat": [{"role": "user", "text": "bridge conversation"}],
+            "useGlobalCodexSessions": True,
+        }
+    )
+
+    assert backup == {
+        "threadId": "bridge-thread",
+        "recentChat": [{"role": "user", "text": "bridge conversation"}],
+        "useGlobalCodexSessions": False,
+    }
+
+
+def test_stop_bot_preserves_session_codex_home_for_persisted_thread(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "thread-to-resume"
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    rollout = codex_home / "sessions" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text("persisted rollout", encoding="utf-8")
+
+    asyncio.run(
+        bridge_module.stop_bot(
+            bot.config["id"],
+            persist_disable=False,
+            persist_state=False,
+            reason="test_restart",
+        )
+    )
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted.get("threadId") == "thread-to-resume"
+    assert rollout.read_text(encoding="utf-8") == "persisted rollout"
+
+
+def test_reset_inactive_session_clears_chat_and_codex_home(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "thread-to-reset"
+    sess.chat = [{"role": "user", "text": "conversation to clear"}]
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda current: {
+            **current,
+            "threadId": sess.thread_id,
+            "recentChat": list(sess.chat),
+        },
+    )
+    codex_home = bridge_module.build_codex_home_for_subprocess(sess.session_id)
+    (codex_home / "state.txt").write_text("state", encoding="utf-8")
+    bot.sessions.clear()
+
+    result = bridge_module.control_session(bot, "single:test-user", clear_thread=True, clear_chat=True)
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert result["live"] is False
+    assert persisted.get("threadId") is None
+    assert persisted.get("recentChat") == []
+    assert codex_home.exists() is False
 
 
 @pytest.mark.asyncio
@@ -5945,6 +7293,143 @@ async def test_cwd_command_resolves_relative_paths_from_current_personal_dir(bri
 
 
 @pytest.mark.asyncio
+async def test_cwd_command_rejects_switch_while_work_is_queued(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-queued-cwd"
+    next_dir = work_dir / "next"
+    next_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    sess.queue.append({"text": "earlier request", "reqId": "req-earlier"})
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.cwd_session_command(bot, "single:test-user", "req-cwd", str(next_dir))
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert sess.work_dir != str(next_dir)
+    assert persisted.get("cwdDir") != str(next_dir)
+    assert "不能切换 cwd" in replies[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_rejects_foreign_session_lease(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    next_dir = repo_dir / "next"
+    next_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    current = make_session(bridge_module, bot, "single:test-user")
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": bridge_module.now_ms() + 60_000,
+    }
+    bridge_module.write_lease(current.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": foreign_lease["instanceId"],
+            "ownerPid": foreign_lease["pid"],
+            "leaseExpiresAt": foreign_lease["expiresAt"],
+        },
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.cwd_session_command(bot, "single:test-user", "req-cwd", str(next_dir))
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert exc_info.value.status_code == 409
+    assert "owned by another instance" in exc_info.value.message
+    assert current.work_dir == str(repo_dir.resolve())
+    assert persisted.get("cwdDir") == str(repo_dir.resolve())
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_acquires_unowned_session_lease_before_switching(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    next_dir = repo_dir / "next"
+    next_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    current = make_session(bridge_module, bot, "single:test-user")
+    bridge_module.release_session_lease(bot, "single:test-user", current)
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        return None
+
+    bridge_module.respond_info = fake_respond_info
+    await bridge_module.cwd_session_command(bot, "single:test-user", "req-cwd", str(next_dir))
+
+    lease = bridge_module.read_lease(current.lock_file)
+    assert current.work_dir == str(next_dir.resolve())
+    assert current.lease_owned is True
+    assert lease.get("instanceId") == bridge_module.INSTANCE_ID
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_allows_read_only_query_while_work_is_queued(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-query-cwd"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    sess.queue.append({"text": "earlier request", "reqId": "req-earlier"})
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.cwd_session_command(bot, "single:test-user", "req-cwd", None)
+
+    assert replies == [("req-cwd", f"Current cwd: {work_dir.resolve()}", True)]
+    assert sess.queue == [{"text": "earlier request", "reqId": "req-earlier"}]
+
+
+@pytest.mark.asyncio
+async def test_cwd_command_clears_stale_local_resume_backup(bridge_module):
+    work_dir = bridge_module.BASE_DIR / "repo-personal-backup-cwd"
+    next_dir = work_dir / "next"
+    next_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(work_dir))
+    bot.config["workspaceMode"] = "personal"
+    sess = make_session(bridge_module, bot)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda current: {
+            **current,
+            "localResumeBackup": {
+                "threadId": "stale-thread",
+                "recentChat": [{"role": "user", "text": "stale conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        return None
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.cwd_session_command(bot, "single:test-user", "req-cwd", str(next_dir))
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted.get("localResumeBackup") is None
+
+
+@pytest.mark.asyncio
 async def test_resume_command_lists_candidates_for_current_chat_scope(bridge_module):
     bot = make_bot(bridge_module)
     current = make_session(bridge_module, bot, "single:test-user")
@@ -6203,6 +7688,136 @@ async def test_resume_command_copies_recent_chat_from_selected_session(bridge_mo
 
 
 @pytest.mark.asyncio
+async def test_resume_command_rejects_switch_while_work_is_queued(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.queue.append({"text": "earlier request", "reqId": "req-earlier"})
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-target"},
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.resume_session_command(bot, "single:test-user", "req-resume", target["sessionId"])
+
+    assert exc_info.value.status_code == 409
+    assert current.thread_id is None
+    assert current.queue == [{"text": "earlier request", "reqId": "req-earlier"}]
+
+
+@pytest.mark.asyncio
+async def test_resume_command_acquires_unowned_session_lease_before_binding(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    bridge_module.release_session_lease(bot, "single:test-user", current)
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-target"},
+    )
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        return None
+
+    bridge_module.respond_info = fake_respond_info
+    await bridge_module.resume_session_command(bot, "single:test-user", "req-resume", target["sessionId"])
+
+    lease = bridge_module.read_lease(current.lock_file)
+    assert current.thread_id == "thread-target"
+    assert current.lease_owned is True
+    assert lease.get("instanceId") == bridge_module.INSTANCE_ID
+
+
+@pytest.mark.asyncio
+async def test_resume_command_rejects_foreign_session_lease(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-target"},
+    )
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": bridge_module.now_ms() + 60_000,
+    }
+    bridge_module.write_lease(current.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": foreign_lease["instanceId"],
+            "ownerPid": foreign_lease["pid"],
+            "leaseExpiresAt": foreign_lease["expiresAt"],
+        },
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.resume_session_command(bot, "single:test-user", "req-resume", target["sessionId"])
+
+    assert exc_info.value.status_code == 409
+    assert "owned by another instance" in exc_info.value.message
+    assert current.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_resume_selection_revalidates_target_thread_before_binding(bridge_module):
+    bot = make_bot(bridge_module)
+    current = make_session(bridge_module, bot, "single:test-user")
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-target", "lastRunAt": bridge_module.now_ms()},
+    )
+    current.resume_candidates = bridge_module.build_resume_candidates(bot, "single:test-user")
+    current.resume_selection_expires_at = bridge_module.now_ms() + bridge_module.RESUME_SELECTION_TTL_MS
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": None},
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.apply_resume_selection_command(
+            bot,
+            "single:test-user",
+            "req-select",
+            target["sessionId"],
+            sender_user_id="test-user",
+        )
+
+    assert exc_info.value.status_code == 404
+    assert current.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_resume_command_rejects_session_owned_by_another_bot(bridge_module):
+    current_bot = make_bot(bridge_module, config_id="bot-current", remote_bot_id="remote-current")
+    make_session(bridge_module, current_bot, "single:test-user")
+    other_bot = make_bot(bridge_module, config_id="bot-other", remote_bot_id="remote-other")
+    target = bridge_module.create_session_record(other_bot, "single:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {**record, "threadId": "thread-other-bot"},
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.resume_session_command(
+            current_bot,
+            "single:test-user",
+            "req-resume",
+            target["sessionId"],
+        )
+
+    assert exc_info.value.status_code == 403
+    assert current_bot.sessions["single:test-user"].thread_id is None
+
+
+@pytest.mark.asyncio
 async def test_resume_selection_invalid_choice_is_reported(bridge_module):
     bot = make_bot(bridge_module)
     current = make_session(bridge_module, bot, "single:test-user")
@@ -6235,6 +7850,1435 @@ async def test_resume_selection_invalid_choice_is_reported(bridge_module):
 
     assert "无效选择" in replies[-1][1]
     assert current.resume_candidates
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_lists_matching_local_codex_sessions(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-match",
+            cwd=repo_dir,
+            transcript=[("user", "local question"), ("assistant", "local answer")],
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-other",
+            cwd=other_dir,
+            transcript=[("user", "other question")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        assert replies
+        content = replies[0][1]
+        assert "当前目录下的本地会话" in content
+        assert "local-match" in content
+        assert "local-other" not in content
+        assert len(current.resume_candidates) == 1
+        assert current.resume_candidates[0]["source"] == "local"
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_lists_candidates_without_loading_transcripts(bridge_module, tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-match",
+            cwd=repo_dir,
+            transcript=[("user", "local question"), ("assistant", "local answer")],
+        )
+
+        def fail_load(*args, **kwargs):
+            raise AssertionError("candidate listing should not load transcript content")
+
+        monkeypatch.setattr(bridge_module, "load_local_codex_recent_chat", fail_load)
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        assert replies
+        assert "local-match" in replies[0][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_binds_local_session_and_persists_global_session_mode(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-bind",
+            cwd=repo_dir,
+            transcript=[("user", "older user turn"), ("assistant", "older bot turn")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume"}, "from": {"userid": "test-user"}},
+            },
+        )
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-select"},
+                "body": {"msgtype": "text", "text": {"content": "1"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert current.thread_id == "local-bind"
+        assert current.use_global_codex_sessions is True
+        assert [item["text"] for item in current.chat] == ["older user turn", "older bot turn"]
+        assert persisted.get("threadId") == "local-bind"
+        assert persisted.get("useGlobalCodexSessions") is True
+        assert "已切换到本地会话" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_detach_restores_previous_bridge_state_after_local_resume(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "bridge-thread"
+    current.chat = [
+        {"role": "user", "text": "bridge user turn"},
+        {"role": "bot", "text": "bridge bot turn"},
+    ]
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": "bridge-thread",
+            "recentChat": list(current.chat),
+        },
+    )
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-bind",
+            cwd=repo_dir,
+            transcript=[("user", "local user turn"), ("assistant", "local bot turn")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume local-bind"}, "from": {"userid": "test-user"}},
+            },
+        )
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-detach"},
+                "body": {"msgtype": "text", "text": {"content": "/local-detach"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert current.thread_id == "bridge-thread"
+        assert current.use_global_codex_sessions is False
+        assert [item["text"] for item in current.chat] == ["bridge user turn", "bridge bot turn"]
+        assert persisted.get("threadId") == "bridge-thread"
+        assert persisted.get("useGlobalCodexSessions") is False
+        assert [item["text"] for item in persisted.get("recentChat") or []] == ["bridge user turn", "bridge bot turn"]
+        assert persisted.get("localResumeBackup") is None
+        assert "已解除本地会话绑定" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_new_local_resume_replaces_stale_backup_after_binding_was_cleared(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "current-thread"
+    current.chat = [
+        {"role": "user", "text": "current user turn"},
+        {"role": "bot", "text": "current bot turn"},
+    ]
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": current.thread_id,
+            "useGlobalCodexSessions": False,
+            "recentChat": list(current.chat),
+            "localResumeBackup": {
+                "threadId": "stale-thread",
+                "recentChat": [{"role": "user", "text": "stale user turn"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+
+    bridge_module.bind_resume_candidate_to_session(
+        bot,
+        current,
+        "single:test-user",
+        {
+            "sessionId": "new-local-thread",
+            "threadId": "new-local-thread",
+            "source": "local",
+            "recentChat": [{"role": "user", "text": "local user turn"}],
+            "cwd": repo_dir,
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+    await bridge_module.local_detach_session_command(
+        bot,
+        "single:test-user",
+        "req-local-detach",
+        sender_user_id="test-user",
+    )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert current.thread_id == "current-thread"
+    assert [item["text"] for item in current.chat] == ["current user turn", "current bot turn"]
+    assert persisted.get("threadId") == "current-thread"
+    assert [item["text"] for item in persisted.get("recentChat") or []] == ["current user turn", "current bot turn"]
+
+
+@pytest.mark.asyncio
+async def test_local_resume_rejects_thread_already_bound_to_another_chat(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    first = make_session(bridge_module, bot, "single:test-user")
+    second = make_session(bridge_module, bot, "group-user:room-1:test-user")
+    candidate = {
+        "sessionId": "local-shared-thread",
+        "threadId": "local-shared-thread",
+        "source": "local",
+        "recentChat": [{"role": "user", "text": "local conversation"}],
+        "cwd": repo_dir.resolve(),
+    }
+
+    bridge_module.bind_resume_candidate_to_session(bot, first, "single:test-user", candidate)
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.bind_resume_candidate_to_session(bot, second, "group-user:room-1:test-user", candidate)
+
+    persisted_second = bridge_module.read_session_record_by_id(second.session_id)
+    assert exc_info.value.status_code == 409
+    assert "/local-detach" in exc_info.value.message
+    assert second.thread_id is None
+    assert second.use_global_codex_sessions is False
+    assert persisted_second.get("threadId") is None
+    assert persisted_second.get("useGlobalCodexSessions") is False
+
+
+@pytest.mark.asyncio
+async def test_local_resume_allows_rebinding_after_original_chat_detaches(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    first = make_session(bridge_module, bot, "single:test-user")
+    second = make_session(bridge_module, bot, "group-user:room-1:test-user")
+    candidate = {
+        "sessionId": "local-transfer-thread",
+        "threadId": "local-transfer-thread",
+        "source": "local",
+        "recentChat": [{"role": "user", "text": "local conversation"}],
+        "cwd": repo_dir.resolve(),
+    }
+    bridge_module.bind_resume_candidate_to_session(bot, first, "single:test-user", candidate)
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        return None
+
+    bridge_module.respond_info = fake_respond_info
+    await bridge_module.local_detach_session_command(
+        bot,
+        "single:test-user",
+        "req-detach",
+        sender_user_id="test-user",
+    )
+    bridge_module.bind_resume_candidate_to_session(bot, second, "group-user:room-1:test-user", candidate)
+
+    assert first.use_global_codex_sessions is False
+    assert second.thread_id == "local-transfer-thread"
+    assert second.use_global_codex_sessions is True
+
+
+def test_local_resume_ignores_stale_team_mode_binding(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    team_bot = make_bot(
+        bridge_module,
+        config_id="bot-team",
+        remote_bot_id="remote-team",
+        work_dir=str(repo_dir),
+    )
+    stale = make_session(bridge_module, team_bot, "single:test-user")
+    stale.thread_id = "local-thread"
+    stale.use_global_codex_sessions = True
+    bridge_module.update_session_record(
+        stale.session_id,
+        lambda record: {
+            **record,
+            "threadId": "local-thread",
+            "useGlobalCodexSessions": True,
+        },
+    )
+    personal_bot = make_bot(
+        bridge_module,
+        config_id="bot-personal",
+        remote_bot_id="remote-personal",
+        work_dir=str(repo_dir),
+    )
+    personal_bot.config["workspaceMode"] = "personal"
+    personal_bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, personal_bot, "single:test-user")
+
+    bridge_module.bind_resume_candidate_to_session(
+        personal_bot,
+        current,
+        "single:test-user",
+        {
+            "sessionId": "local-thread",
+            "threadId": "local-thread",
+            "source": "local",
+            "recentChat": [],
+            "cwd": repo_dir.resolve(),
+        },
+    )
+
+    assert current.thread_id == "local-thread"
+    assert current.use_global_codex_sessions is True
+
+
+def test_local_resume_rejects_thread_bound_by_another_personal_bot(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    first_bot = make_bot(
+        bridge_module,
+        config_id="bot-personal-a",
+        remote_bot_id="remote-personal-a",
+        work_dir=str(repo_dir),
+    )
+    first_bot.config["workspaceMode"] = "personal"
+    first_bot.config["localResumeOwnerUserId"] = "test-user"
+    first = make_session(bridge_module, first_bot, "single:test-user")
+    candidate = {
+        "sessionId": "shared-global-thread",
+        "threadId": "shared-global-thread",
+        "source": "local",
+        "recentChat": [],
+        "cwd": repo_dir.resolve(),
+    }
+    bridge_module.bind_resume_candidate_to_session(first_bot, first, "single:test-user", candidate)
+    second_bot = make_bot(
+        bridge_module,
+        config_id="bot-personal-b",
+        remote_bot_id="remote-personal-b",
+        work_dir=str(repo_dir),
+    )
+    second_bot.config["workspaceMode"] = "personal"
+    second_bot.config["localResumeOwnerUserId"] = "test-user"
+    second = make_session(bridge_module, second_bot, "single:test-user")
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.bind_resume_candidate_to_session(second_bot, second, "single:test-user", candidate)
+
+    assert exc_info.value.status_code == 409
+    assert second.thread_id is None
+    assert second.use_global_codex_sessions is False
+
+
+@pytest.mark.asyncio
+async def test_local_resume_rejected_while_earlier_work_is_queued(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.queue.append({"text": "earlier request", "reqId": "req-earlier"})
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.ensure_local_resume_allowed(
+            bot,
+            current,
+            "single:test-user",
+            sender_user_id="test-user",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert current.queue == [{"text": "earlier request", "reqId": "req-earlier"}]
+
+
+def test_local_resume_rejected_while_final_delivery_is_pending(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.pending_final_payload = {"cmd": "aibot_respond_msg"}
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.ensure_local_resume_allowed(
+            bot,
+            current,
+            "single:test-user",
+            sender_user_id="test-user",
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+def test_local_resume_rejected_while_foreign_instance_owns_session_lease(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": bridge_module.now_ms() + 60_000,
+    }
+    bridge_module.write_lease(current.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": foreign_lease["instanceId"],
+            "ownerPid": foreign_lease["pid"],
+            "leaseExpiresAt": foreign_lease["expiresAt"],
+        },
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.ensure_local_resume_allowed(
+            bot,
+            current,
+            "single:test-user",
+            sender_user_id="test-user",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "owned by another instance" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    ("field_name", "pending_value"),
+    [
+        ("pending_media_downloads", 1),
+        ("pending_media", [{"kind": "image", "path": "/tmp/pending.png"}]),
+        ("pending_media_notes", ["attachment download failed"]),
+    ],
+)
+def test_local_resume_rejected_while_attachment_state_is_pending(
+    bridge_module,
+    tmp_path,
+    field_name,
+    pending_value,
+):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    setattr(current, field_name, pending_value)
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        bridge_module.ensure_local_resume_allowed(
+            bot,
+            current,
+            "single:test-user",
+            sender_user_id="test-user",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert getattr(current, field_name) == pending_value
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_strips_bridge_wrapper_from_imported_local_chat(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        wrapped_user_turn = (
+            "[BridgeContext]\n"
+            "chatKey: single:test-user\n"
+            "sessionId: old-session\n"
+            "[/BridgeContext]\n\n"
+            "User request:\n"
+            "真正的问题\n\n"
+            "[RecentConversation]\n"
+            "User: stale context\n"
+            "[/RecentConversation]"
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-wrapped",
+            cwd=repo_dir,
+            transcript=[("user", wrapped_user_turn), ("assistant", "older bot turn")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume local-wrapped"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert [item["text"] for item in current.chat] == ["真正的问题", "older bot turn"]
+        assert [item["text"] for item in persisted.get("recentChat") or []] == ["真正的问题", "older bot turn"]
+        assert "BridgeContext" not in current.chat[0]["text"]
+        assert "RecentConversation" not in current.chat[0]["text"]
+        assert "已切换到本地会话" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_strips_image_prefixed_bridge_wrapper_from_imported_local_chat(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        wrapped_user_turn = (
+            "<image name=[Image #1] path=\"/tmp/a.png\">\n"
+            "</image>\n"
+            "<image name=[Image #2] path=\"/tmp/b.png\">\n"
+            "</image>\n"
+            "[BridgeContext]\n"
+            "chatKey: single:test-user\n"
+            "sessionId: old-session\n"
+            "[/BridgeContext]\n\n"
+            "User request:\n"
+            "图片相关的问题"
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-image-wrapped",
+            cwd=repo_dir,
+            transcript=[("user", wrapped_user_turn), ("assistant", "图片答案")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume local-image-wrapped"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert [item["text"] for item in current.chat] == ["图片相关的问题", "图片答案"]
+        assert [item["text"] for item in persisted.get("recentChat") or []] == ["图片相关的问题", "图片答案"]
+        assert "BridgeContext" not in current.chat[0]["text"]
+        assert "<image" not in current.chat[0]["text"]
+        assert "已切换到本地会话" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_filters_protocol_noise_from_imported_local_chat(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="local-protocol-noise",
+            cwd=repo_dir,
+            transcript=[
+                {"role": "user", "text": "<codex_internal_context source=\"goal\">\ninternal\n</codex_internal_context>"},
+                {"role": "user", "text": "<goal_context>\nignore me\n</goal_context>"},
+                {"role": "user", "text": "<user_action>\nignore me too\n</user_action>"},
+                {
+                    "role": "user",
+                    "text": "⚠ Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites:\n  https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.\n帮我解决这个环境问题",
+                },
+                {"role": "assistant", "text": "我先检查当前目录和最近改动。", "phase": "commentary"},
+                {"role": "user", "text": "真正的问题"},
+                {"role": "assistant", "text": "最终答案", "phase": "final_answer"},
+            ],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {"msgtype": "text", "text": {"content": "/local-resume local-protocol-noise"}, "from": {"userid": "test-user"}},
+            },
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert [item["text"] for item in current.chat] == ["帮我解决这个环境问题", "真正的问题", "最终答案"]
+        assert [item["text"] for item in persisted.get("recentChat") or []] == ["帮我解决这个环境问题", "真正的问题", "最终答案"]
+        assert "已切换到本地会话" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+def test_local_resume_candidates_use_rollout_mtime_for_recency(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        older_mtime = 1_784_528_000_000
+        newer_mtime = older_mtime + 60_000
+        write_local_codex_rollout(
+            local_home,
+            session_id="older-session",
+            cwd=repo_dir,
+            session_timestamp="2026-07-20T06:59:28.929Z",
+            mtime_ms=older_mtime,
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="newer-session",
+            cwd=repo_dir,
+            session_timestamp="2026-07-20T05:13:28.929Z",
+            mtime_ms=newer_mtime,
+        )
+
+        candidates = bridge_module.list_local_codex_resume_candidates(repo_dir)
+
+        assert [item["sessionId"] for item in candidates[:2]] == ["newer-session", "older-session"]
+        assert candidates[0]["lastRunAt"] == newer_mtime
+        assert candidates[1]["lastRunAt"] == older_mtime
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+def test_local_resume_candidates_ignore_non_object_rollout_metadata(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        valid_rollout = write_local_codex_rollout(
+            local_home,
+            session_id="valid-session",
+            cwd=repo_dir,
+        )
+        malformed_rollout = valid_rollout.parent / "rollout-2026-07-20T06-14-28-malformed.jsonl"
+        malformed_rollout.write_text("[]\n", encoding="utf-8")
+
+        candidates = bridge_module.list_local_codex_resume_candidates(repo_dir)
+
+        assert [item["sessionId"] for item in candidates] == ["valid-session"]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+def test_local_resume_history_ignores_non_object_jsonl_entries(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    rollout = write_local_codex_rollout(
+        tmp_path / "codex-home",
+        session_id="valid-session",
+        cwd=repo_dir,
+        transcript=[("user", "question"), ("assistant", "answer")],
+    )
+    lines = rollout.read_text(encoding="utf-8").splitlines()
+    rollout.write_text("\n".join([lines[0], "[]", *lines[1:]]) + "\n", encoding="utf-8")
+
+    history = bridge_module.load_local_codex_recent_chat(rollout)
+
+    assert [(item["role"], item["text"]) for item in history] == [
+        ("user", "question"),
+        ("bot", "answer"),
+    ]
+
+
+def test_local_resume_history_is_bounded_while_scanning(bridge_module, tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    transcript = [
+        ("user" if index % 2 == 0 else "assistant", f"message-{index}")
+        for index in range(20)
+    ]
+    rollout = write_local_codex_rollout(
+        tmp_path / "codex-home",
+        session_id="long-session",
+        cwd=repo_dir,
+        transcript=transcript,
+    )
+    normalized_input_lengths = []
+    original_normalize = bridge_module.normalize_session_chat_items
+
+    def tracking_normalize(items, *, limit=bridge_module.MAX_PERSISTED_SESSION_CHAT_ITEMS):
+        normalized_input_lengths.append(len(items))
+        return original_normalize(items, limit=limit)
+
+    monkeypatch.setattr(bridge_module, "normalize_session_chat_items", tracking_normalize)
+
+    history = bridge_module.load_local_codex_recent_chat(rollout, limit=3)
+
+    assert normalized_input_lengths == [3]
+    assert [(item["role"], item["text"]) for item in history] == [
+        ("bot", "message-17"),
+        ("user", "message-18"),
+        ("bot", "message-19"),
+    ]
+
+
+def test_local_resume_candidates_tolerate_rollout_deleted_during_sort(bridge_module, tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    valid_rollout = write_local_codex_rollout(
+        local_home,
+        session_id="valid-session",
+        cwd=repo_dir,
+    )
+    disappearing_rollout = valid_rollout.parent / "rollout-2026-07-20T06-14-28-disappearing.jsonl"
+    disappearing_rollout.write_text("{}\n", encoding="utf-8")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    original_exists = Path.exists
+    original_stat = Path.stat
+    disappearing_stat_calls = 0
+
+    def always_exists_during_sort(path):
+        if path == disappearing_rollout:
+            return True
+        return original_exists(path)
+
+    def disappear_after_discovery(path, *args, **kwargs):
+        nonlocal disappearing_stat_calls
+        if path == disappearing_rollout:
+            disappearing_stat_calls += 1
+            if disappearing_stat_calls >= 2:
+                raise FileNotFoundError(str(path))
+        return original_stat(path, *args, **kwargs)
+
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    monkeypatch.setattr(Path, "exists", always_exists_during_sort)
+    monkeypatch.setattr(Path, "stat", disappear_after_discovery)
+    try:
+        candidates = bridge_module.list_local_codex_resume_candidates(repo_dir)
+
+        assert [item["sessionId"] for item in candidates] == ["valid-session"]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+def test_local_resume_candidates_exclude_sessions_whose_latest_rollout_moved_to_other_cwd(bridge_module, tmp_path):
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    local_home = tmp_path / "codex-home"
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        older_mtime = 1_784_528_000_000
+        newer_mtime = older_mtime + 60_000
+        write_local_codex_rollout(
+            local_home,
+            session_id="moved-session",
+            cwd=repo_a,
+            rollout_timestamp="2026-07-20T06-13-28",
+            mtime_ms=older_mtime,
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="moved-session",
+            cwd=repo_b,
+            rollout_timestamp="2026-07-20T06-14-28",
+            mtime_ms=newer_mtime,
+        )
+        write_local_codex_rollout(
+            local_home,
+            session_id="stable-a",
+            cwd=repo_a,
+            mtime_ms=older_mtime + 30_000,
+        )
+
+        repo_a_candidates = bridge_module.list_local_codex_resume_candidates(repo_a)
+        repo_b_candidates = bridge_module.list_local_codex_resume_candidates(repo_b)
+
+        assert [item["sessionId"] for item in repo_a_candidates] == ["stable-a"]
+        assert [item["sessionId"] for item in repo_b_candidates] == ["moved-session"]
+        assert bridge_module.find_local_codex_resume_candidate("moved-session", repo_a) is None
+        assert bridge_module.find_local_codex_resume_candidate("moved-session", repo_b) is not None
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_detach_clears_local_session_binding(bridge_module):
+    repo_dir = bridge_module.BASE_DIR / "repo-local-detach"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "local-bind"
+    current.use_global_codex_sessions = True
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": "local-bind",
+            "useGlobalCodexSessions": True,
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-local-detach"},
+            "body": {"msgtype": "text", "text": {"content": "/local-detach"}, "from": {"userid": "test-user"}},
+        },
+    )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert current.thread_id is None
+    assert current.use_global_codex_sessions is False
+    assert current.chat == []
+    assert persisted.get("threadId") is None
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("recentChat") == []
+    assert "已解除本地会话绑定" in replies[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_local_detach_restores_backup_after_native_resume_falls_back_to_fresh_session(bridge_module):
+    repo_dir = bridge_module.BASE_DIR / "repo-local-detach-after-fallback"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "fresh-fallback-thread"
+    current.chat = [{"role": "user", "text": "fallback conversation"}]
+    current.use_global_codex_sessions = False
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": current.thread_id,
+            "recentChat": list(current.chat),
+            "useGlobalCodexSessions": False,
+            "localResumeBackup": {
+                "threadId": "bridge-thread",
+                "recentChat": [{"role": "user", "text": "bridge conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.local_detach_session_command(
+        bot,
+        "single:test-user",
+        "req-local-detach",
+        sender_user_id="test-user",
+    )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert current.thread_id == "bridge-thread"
+    assert current.use_global_codex_sessions is False
+    assert [item["text"] for item in current.chat] == ["bridge conversation"]
+    assert persisted.get("threadId") == "bridge-thread"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert [item["text"] for item in persisted.get("recentChat") or []] == ["bridge conversation"]
+    assert persisted.get("localResumeBackup") is None
+    assert "已解除本地会话绑定" in replies[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_rejects_non_owner_user(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "owner-user"
+    make_session(bridge_module, bot, "single:test-user")
+
+    replies = []
+
+    async def fake_respond_info(_bot, req_id, message, final=True):
+        replies.append((req_id, message, final))
+
+    bridge_module.respond_info = fake_respond_info
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-local-resume"},
+            "body": {"msgtype": "text", "text": {"content": "/local-resume"}, "from": {"userid": "test-user"}},
+        },
+    )
+
+    assert replies
+    assert replies[-1][1] == "Bridge command failed: 当前用户无权使用本地会话命令。"
+
+
+@pytest.mark.asyncio
+async def test_local_resume_command_rejects_shared_group_mode_even_for_owner(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["groupSessionMode"] = "shared"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="shared-group-local",
+            cwd=repo_dir,
+            transcript=[("user", "hello"), ("assistant", "world")],
+        )
+
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        bridge_module.respond_info = fake_respond_info
+
+        await bridge_module.handle_wecom_message(
+            bot,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-local-resume"},
+                "body": {
+                    "msgtype": "text",
+                    "chattype": "group",
+                    "chatid": "room-1",
+                    "text": {"content": "/local-resume"},
+                    "from": {"userid": "test-user"},
+                },
+            },
+        )
+
+        assert replies
+        assert replies[-1][1] == "Bridge command failed: shared 群会话不支持本地会话命令。"
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_selection_rechecks_owner_before_binding(bridge_module, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "owner-user"
+    current = make_session(bridge_module, bot, "group:room-1")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        rollout = write_local_codex_rollout(
+            local_home,
+            session_id="owner-local-session",
+            cwd=repo_dir,
+            transcript=[("user", "secret"), ("assistant", "answer")],
+        )
+        current.resume_candidates = [
+            {
+                "sessionId": "owner-local-session",
+                "threadId": "owner-local-session",
+                "cwd": repo_dir.resolve(),
+                "rolloutFile": rollout,
+                "updatedAt": 1,
+                "lastRunAt": 1,
+                "status": "local",
+                "source": "local",
+            }
+        ]
+        current.resume_selection_expires_at = bridge_module.now_ms() + 60_000
+
+        with pytest.raises(bridge_module.BridgeError) as exc_info:
+            await bridge_module.apply_resume_selection_command(
+                bot,
+                "group:room-1",
+                "req-select",
+                "1",
+                sender_user_id="intruder-user",
+            )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert current.thread_id is None
+        assert persisted.get("threadId") is None
+        assert exc_info.value.message == "shared 群会话不支持本地会话命令。"
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_selection_rechecks_current_cwd_before_binding(bridge_module, tmp_path):
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_a))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    try:
+        older_mtime = 1_784_528_000_000
+        newer_mtime = older_mtime + 60_000
+        write_local_codex_rollout(
+            local_home,
+            session_id="moved-session",
+            cwd=repo_a,
+            transcript=[("user", "repo a conversation")],
+            mtime_ms=older_mtime,
+        )
+        current.resume_candidates = bridge_module.list_local_codex_resume_candidates(repo_a)
+        current.resume_selection_expires_at = bridge_module.now_ms() + 60_000
+        write_local_codex_rollout(
+            local_home,
+            session_id="moved-session",
+            cwd=repo_b,
+            transcript=[("user", "repo b conversation")],
+            mtime_ms=newer_mtime,
+        )
+
+        with pytest.raises(bridge_module.BridgeError) as exc_info:
+            await bridge_module.apply_resume_selection_command(
+                bot,
+                "single:test-user",
+                "req-select",
+                "1",
+                sender_user_id="test-user",
+            )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert exc_info.value.status_code == 404
+        assert current.thread_id is None
+        assert current.use_global_codex_sessions is False
+        assert current.resume_candidates == []
+        assert persisted.get("threadId") is None
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_rejects_rollout_that_moves_during_transcript_load(
+    bridge_module,
+    tmp_path,
+    monkeypatch,
+):
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_a))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "bridge-thread"
+    current.chat = [{"role": "user", "text": "bridge conversation"}]
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": current.thread_id,
+            "recentChat": list(current.chat),
+        },
+    )
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    original_load = bridge_module.load_local_codex_recent_chat
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    older_mtime = 1_784_528_000_000
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="moving-during-load",
+            cwd=repo_a,
+            transcript=[("user", "repo a conversation")],
+            mtime_ms=older_mtime,
+        )
+
+        def move_rollout_during_load(rollout_file, *, limit=bridge_module.MAX_PERSISTED_SESSION_CHAT_ITEMS):
+            recent_chat = original_load(rollout_file, limit=limit)
+            write_local_codex_rollout(
+                local_home,
+                session_id="moving-during-load",
+                cwd=repo_b,
+                transcript=[("user", "repo b conversation")],
+                mtime_ms=older_mtime + 60_000,
+            )
+            return recent_chat
+
+        monkeypatch.setattr(bridge_module, "load_local_codex_recent_chat", move_rollout_during_load)
+
+        with pytest.raises(bridge_module.BridgeError) as exc_info:
+            await bridge_module.local_resume_session_command(
+                bot,
+                "single:test-user",
+                "req-local-resume",
+                "moving-during-load",
+                sender_user_id="test-user",
+            )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert exc_info.value.status_code == 404
+        assert current.thread_id == "bridge-thread"
+        assert current.use_global_codex_sessions is False
+        assert [item["text"] for item in current.chat] == ["bridge conversation"]
+        assert persisted.get("threadId") == "bridge-thread"
+        assert persisted.get("useGlobalCodexSessions") is False
+        assert [item["text"] for item in persisted.get("recentChat") or []] == ["bridge conversation"]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_local_resume_reloads_rollout_changed_in_same_cwd_during_transcript_load(
+    bridge_module,
+    tmp_path,
+    monkeypatch,
+):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    local_home = tmp_path / "codex-home"
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    original_load = bridge_module.load_local_codex_recent_chat
+    bridge_module.DEFAULT_CODEX_HOME = local_home
+    older_mtime = 1_784_528_000_000
+    loads = 0
+    try:
+        write_local_codex_rollout(
+            local_home,
+            session_id="updated-during-load",
+            cwd=repo_dir,
+            transcript=[("user", "older conversation")],
+            mtime_ms=older_mtime,
+        )
+
+        def update_rollout_during_first_load(rollout_file, *, limit=bridge_module.MAX_PERSISTED_SESSION_CHAT_ITEMS):
+            nonlocal loads
+            loads += 1
+            recent_chat = original_load(rollout_file, limit=limit)
+            if loads == 1:
+                write_local_codex_rollout(
+                    local_home,
+                    session_id="updated-during-load",
+                    cwd=repo_dir,
+                    transcript=[("user", "newer conversation"), ("assistant", "newer answer")],
+                    mtime_ms=older_mtime + 60_000,
+                )
+            return recent_chat
+
+        monkeypatch.setattr(bridge_module, "load_local_codex_recent_chat", update_rollout_during_first_load)
+        replies = []
+
+        async def fake_respond_info(_bot, req_id, message, final=True):
+            replies.append((req_id, message, final))
+
+        monkeypatch.setattr(bridge_module, "respond_info", fake_respond_info)
+
+        await bridge_module.local_resume_session_command(
+            bot,
+            "single:test-user",
+            "req-local-resume",
+            "updated-during-load",
+            sender_user_id="test-user",
+        )
+
+        persisted = bridge_module.read_session_record_by_id(current.session_id)
+        assert loads == 2
+        assert current.thread_id == "updated-during-load"
+        assert current.use_global_codex_sessions is True
+        assert [item["text"] for item in current.chat] == ["newer conversation", "newer answer"]
+        assert persisted.get("threadId") == "updated-during-load"
+        assert persisted.get("useGlobalCodexSessions") is True
+        assert "已切换到本地会话" in replies[-1][1]
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+
+@pytest.mark.asyncio
+async def test_bridge_resume_rejects_unauthorized_inherited_local_binding(bridge_module):
+    bot = make_bot(bridge_module)
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "other-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "current-thread"
+    current.chat = [{"role": "user", "text": "current conversation"}]
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": current.thread_id,
+            "recentChat": list(current.chat),
+        },
+    )
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {
+            **record,
+            "threadId": "local-thread",
+            "useGlobalCodexSessions": True,
+        },
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.resume_session_command(
+            bot,
+            "single:test-user",
+            "req-resume",
+            target["sessionId"],
+        )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert exc_info.value.status_code == 403
+    assert current.thread_id == "current-thread"
+    assert current.use_global_codex_sessions is False
+    assert [item["text"] for item in current.chat] == ["current conversation"]
+    assert persisted.get("threadId") == "current-thread"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("localResumeBackup") is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_resume_rejects_inherited_local_thread_binding(bridge_module):
+    repo_dir = bridge_module.BASE_DIR / "repo-bridge-resume-global"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    bot = make_bot(bridge_module, work_dir=str(repo_dir))
+    bot.config["workspaceMode"] = "personal"
+    bot.config["localResumeOwnerUserId"] = "test-user"
+    current = make_session(bridge_module, bot, "single:test-user")
+    current.thread_id = "bridge-thread"
+    current.chat = [
+        {"role": "user", "text": "bridge user turn"},
+        {"role": "bot", "text": "bridge bot turn"},
+    ]
+    bridge_module.update_session_record(
+        current.session_id,
+        lambda record: {
+            **record,
+            "threadId": current.thread_id,
+            "recentChat": list(current.chat),
+            "lastRunAt": bridge_module.now_ms() - 1000,
+        },
+    )
+    target = bridge_module.create_session_record(bot, "group-user:room-1:test-user")
+    target_session = bridge_module.SessionState(
+        session_id=target["sessionId"],
+        work_dir=str(bridge_module.get_session_runtime_cwd(bot, "group-user:room-1:test-user")),
+        lock_file=Path(target["lockFile"]),
+        thread_id="local-thread",
+        use_global_codex_sessions=True,
+    )
+    bot.sessions["group-user:room-1:test-user"] = target_session
+    bridge_module.update_session_record(
+        target["sessionId"],
+        lambda record: {
+            **record,
+            "threadId": "local-thread",
+            "useGlobalCodexSessions": True,
+            "recentChat": [{"role": "user", "text": "local conversation"}],
+            "lastRunAt": bridge_module.now_ms(),
+        },
+    )
+
+    assert target["sessionId"] not in {
+        candidate["sessionId"] for candidate in bridge_module.build_resume_candidates(bot, "single:test-user")
+    }
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.resume_session_command(
+            bot,
+            "single:test-user",
+            "req-resume",
+            target["sessionId"],
+        )
+
+    persisted = bridge_module.read_session_record_by_id(current.session_id)
+    assert exc_info.value.status_code == 409
+    assert "/local-resume" in exc_info.value.message
+    assert current.thread_id == "bridge-thread"
+    assert current.use_global_codex_sessions is False
+    assert [item["text"] for item in current.chat] == ["bridge user turn", "bridge bot turn"]
+    assert persisted.get("threadId") == "bridge-thread"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert [item["text"] for item in persisted.get("recentChat") or []] == ["bridge user turn", "bridge bot turn"]
+    assert persisted.get("localResumeBackup") is None
 
 
 @pytest.mark.asyncio
@@ -10462,12 +13506,17 @@ def test_api_healthz_reports_missing_enabled_persisted_bot(bridge_module):
 
 
 def test_shutdown_reason_file_follows_runtime_base_dir(bridge_module):
+    assert bridge_module.get_shutdown_reason_file() == (
+        bridge_module.INSTANCE_RUNTIME_ROOT / ".bridge.shutdown-reason.json"
+    )
+
     bridge_module.write_shutdown_reason("api_stop", "detail")
 
     payload = bridge_module.consume_shutdown_reason()
 
     assert payload["reason"] == "api_stop"
     assert payload["detail"] == "detail"
+    assert not bridge_module.get_shutdown_reason_file().exists()
     assert not (bridge_module.BASE_DIR / ".bridge.shutdown-reason.json").exists()
 
 
@@ -11157,24 +14206,22 @@ def test_build_template_card_update_payload_rejects_empty_req_id(bridge_module):
     assert str(excinfo.value) == "reqId required"
 
 
-def test_normalize_bot_config_rejects_non_directory_agent_runtime_root(bridge_module):
+def test_normalize_bot_config_ignores_non_directory_legacy_agent_runtime_root(bridge_module):
     secret_file = write_secret_file(bridge_module.BASE_DIR / "bot.secret", "secret\n")
     bad_root = bridge_module.BASE_DIR / "claude-runtime.txt"
     bad_root.write_text("not a dir", encoding="utf-8")
 
-    with pytest.raises(bridge_module.BridgeError) as excinfo:
-        bridge_module.normalize_bot_config(
-            {
-                "botId": "bot-id",
-                "secretFile": str(secret_file),
-                "workDir": str(bridge_module.BASE_DIR),
-                "groupSessionMode": "per-user",
-                "agentRuntimeRoot": str(bad_root),
-            }
-        )
+    config = bridge_module.normalize_bot_config(
+        {
+            "botId": "bot-id",
+            "secretFile": str(secret_file),
+            "workDir": str(bridge_module.BASE_DIR),
+            "groupSessionMode": "per-user",
+            "agentRuntimeRoot": str(bad_root),
+        }
+    )
 
-    assert excinfo.value.status_code == 400
-    assert excinfo.value.message == f"agentRuntimeRoot is not a directory: {bad_root.resolve()}"
+    assert config["agentRuntimeRoot"] is None
 
 
 def test_normalize_bot_config_treats_null_agent_runtime_root_as_unset(bridge_module):
@@ -11663,7 +14710,7 @@ async def test_download_incoming_media_keeps_same_named_files(bridge_module, mon
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
 
-    async def fake_download_buffer(url: str):
+    async def fake_download_buffer(url: str, _max_bytes: int):
         payload = b"first" if url.endswith("/1") else b"second"
         return {"data": payload, "contentType": "text/plain", "contentDisposition": ""}
 
@@ -11689,6 +14736,119 @@ async def test_download_incoming_media_keeps_same_named_files(bridge_module, mon
     assert Path(second["path"]).read_bytes() == b"second"
 
 
+@pytest.mark.asyncio
+async def test_download_buffer_stops_before_exceeding_memory_limit(bridge_module):
+    class FakeContent:
+        async def iter_chunked(self, _chunk_size):
+            for chunk in (b"abc", b"def"):
+                yield chunk
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        content = FakeContent()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeSession:
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    bridge_module.HTTP_SESSION = FakeSession()
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        await bridge_module.download_buffer("https://example.invalid/media", 5)
+
+    assert excinfo.value.status_code == 413
+    assert "max 5 bytes" in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_download_buffer_via_curl_rejects_oversized_partial_file(bridge_module, monkeypatch):
+    captured_args = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        captured_args.extend(args)
+        body_path = Path(args[args.index("-o") + 1])
+        body_path.write_bytes(b"123456")
+        return FakeProcess()
+
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        await bridge_module.download_buffer_via_curl("https://example.invalid/media", 5)
+
+    assert excinfo.value.status_code == 413
+    assert captured_args[captured_args.index("--max-filesize") + 1] == "5"
+
+
+@pytest.mark.asyncio
+async def test_download_incoming_encrypted_media_checks_plaintext_limit_after_decrypt(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    key = b"12345678901234567890123456789012"
+    plaintext = b"x" * 16
+    encrypted = bridge_module.AES.new(key, bridge_module.AES.MODE_CBC, key[:16]).encrypt(
+        plaintext + bytes([16]) * 16
+    )
+    monkeypatch.setattr(bridge_module, "MAX_INBOUND_FILE_SIZE", len(plaintext))
+
+    async def fake_download_buffer(_url: str, max_bytes: int):
+        assert max_bytes == len(plaintext) + 32
+        return {"data": encrypted, "contentType": "application/octet-stream", "contentDisposition": ""}
+
+    monkeypatch.setattr(bridge_module, "download_buffer", fake_download_buffer)
+
+    result = await bridge_module.download_incoming_media(
+        bot,
+        sess,
+        "single:test-user",
+        "file",
+        {"url": "https://example.test/file", "filename": "payload.bin", "aeskey": key.decode("ascii")},
+    )
+
+    assert Path(result["path"]).read_bytes() == plaintext
+
+
+@pytest.mark.asyncio
+async def test_download_incoming_encrypted_media_rejects_oversized_plaintext(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    key = b"12345678901234567890123456789012"
+    plaintext = b"x" * 17
+    encrypted = bridge_module.AES.new(key, bridge_module.AES.MODE_CBC, key[:16]).encrypt(
+        plaintext + bytes([15]) * 15
+    )
+    monkeypatch.setattr(bridge_module, "MAX_INBOUND_FILE_SIZE", 16)
+
+    async def fake_download_buffer(_url: str, _max_bytes: int):
+        return {"data": encrypted, "contentType": "application/octet-stream", "contentDisposition": ""}
+
+    monkeypatch.setattr(bridge_module, "download_buffer", fake_download_buffer)
+
+    with pytest.raises(bridge_module.BridgeError) as excinfo:
+        await bridge_module.download_incoming_media(
+            bot,
+            sess,
+            "single:test-user",
+            "file",
+            {"url": "https://example.test/file", "filename": "payload.bin", "aeskey": key.decode("ascii")},
+        )
+
+    assert excinfo.value.status_code == 413
+    assert "too large after decrypt" in excinfo.value.message
+
+
 def test_decrypt_media_buffer_rejects_invalid_aes_key_in_classic_bridge(bridge_module):
     with pytest.raises(bridge_module.BridgeError) as excinfo:
         bridge_module.decrypt_media_buffer(b"abc", "abcd")
@@ -11708,7 +14868,7 @@ async def test_download_incoming_media_skips_broken_symlink_name(bridge_module, 
     broken_target = external_dir / "report.txt"
     (chatfile_dir / "report.txt").symlink_to(broken_target)
 
-    async def fake_download_buffer(_url: str):
+    async def fake_download_buffer(_url: str, _max_bytes: int):
         return {"data": b"payload", "contentType": "text/plain", "contentDisposition": ""}
 
     monkeypatch.setattr(bridge_module, "download_buffer", fake_download_buffer)
@@ -13262,6 +16422,31 @@ async def test_respond_info_keeps_intermediate_reply_open(bridge_module):
 
 
 @pytest.mark.asyncio
+async def test_respond_info_sends_long_messages_in_chunks(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+    bridge_module.register_reply_session(bot, "req-1", sess)
+
+    message = "x" * (bridge_module.STREAM_TEXT_MAX_CHARS * 2 + 1)
+    await bridge_module.respond_info(bot, "req-1", message)
+
+    assert len(sent) == 3
+    assert [payload["body"]["stream"]["finish"] for payload in sent] == [False, False, True]
+    assert "".join(payload["body"]["stream"]["content"] for payload in sent) == message
+
+
+def test_split_text_chunks_preserves_internal_whitespace(bridge_module):
+    message = "alpha beta\n\ngamma delta  epsilon"
+
+    chunks = bridge_module.split_text_chunks(message, max_chars=12)
+
+    assert all(0 < len(chunk) <= 12 for chunk in chunks)
+    assert "".join(chunks) == message
+
+
+@pytest.mark.asyncio
 async def test_respond_info_caches_final_reply_when_ack_times_out(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -13278,6 +16463,78 @@ async def test_respond_info_caches_final_reply_when_ack_times_out(bridge_module,
     assert sess.pending_final_payload is not None
     assert sess.pending_final_payload["body"]["stream"]["content"] == "done"
     assert "req-1" in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_ack_only_message_does_not_retry_uncertain_delivery_before_backoff(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.ws = SimpleNamespace(closed=False)
+    sent_payloads = []
+
+    async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec, **_kwargs):
+        sent_payloads.append(payload)
+        if len(sent_payloads) == 1:
+            raise bridge_module.BridgeError(504, "websocket ack timeout")
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", fake_send_ws_payload_with_ack)
+    payload = bridge_module.build_proactive_chat_payload("single:test-user", "final answer")
+
+    delivered = await bridge_module.send_or_store_session_payload(bot, "single:test-user", sess, payload, True)
+
+    assert delivered is False
+    assert len(sent_payloads) == 1
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {"headers": {"req_id": "unrelated-ack"}, "errcode": 0, "errmsg": "ok"},
+    )
+
+    assert len(sent_payloads) == 1
+    assert sess.pending_final_payload is not None
+
+    sess.pending_payload_retry_after = bridge_module.time.monotonic() - 1
+    await bridge_module.handle_wecom_message(
+        bot,
+        {"headers": {"req_id": "another-ack"}, "errcode": 0, "errmsg": "ok"},
+    )
+
+    assert len(sent_payloads) == 2
+    assert sess.pending_final_payload is None
+
+
+@pytest.mark.asyncio
+async def test_late_ack_clears_same_cached_payload_after_req_id_refresh(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.ws = SimpleNamespace(closed=False)
+    old_payload = bridge_module.build_proactive_chat_payload("single:test-user", "final answer")
+    current_payload = bridge_module.clone_payload_sequence([old_payload])[0]
+    current_payload["headers"] = {**current_payload["headers"], "req_id": "refreshed-req-id"}
+    sess.pending_final_payload = dict(current_payload)
+    sess.pending_final_payloads = [dict(current_payload)]
+    sess.late_ack_payloads = [dict(old_payload)]
+    sess.pending_payload_retry_after = (
+        bridge_module.time.monotonic() + bridge_module.UNCERTAIN_DELIVERY_RETRY_SEC
+    )
+    sent_payloads = []
+
+    async def unexpected_send(*_args, **_kwargs):
+        sent_payloads.append(True)
+        raise AssertionError("late ack should clear the cached payload without resending it")
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", unexpected_send)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {"headers": {"req_id": bridge_module.payload_req_id(old_payload)}, "errcode": 0, "errmsg": "ok"},
+    )
+
+    assert sent_payloads == []
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+    assert sess.pending_payload_retry_after == 0
 
 
 @pytest.mark.asyncio
@@ -13300,6 +16557,7 @@ async def test_send_session_status_times_out_stuck_websocket_write(bridge_module
     assert delivered is False
     assert sess.send_lock.locked() is False
     assert sess.pending_stream_payload["body"]["stream"]["content"] == "status"
+    assert sess.late_ack_payloads == [sess.pending_stream_payload]
 
 
 @pytest.mark.asyncio
@@ -13324,6 +16582,7 @@ async def test_send_session_status_times_out_when_send_lock_is_busy(bridge_modul
 
     assert delivered is False
     assert sess.pending_stream_payload["body"]["stream"]["content"] == "status"
+    assert sess.late_ack_payloads == []
 
 
 @pytest.mark.asyncio
@@ -13422,6 +16681,38 @@ def test_process_queue_waits_for_cached_final_reply(bridge_module):
 
     assert sess.run_task is None
     assert sess.queue == [{"text": "next", "reqId": "req-2"}]
+
+
+def test_session_compat_history_snapshot_excludes_current_and_queued_requests(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    key = "single:test-user"
+    sess.chat = [
+        {"role": "user", "text": "first request", "from": key},
+        {"role": "user", "text": "current request", "from": key},
+        {"role": "user", "text": "future request", "from": key},
+        {"role": "bot", "text": "first answer"},
+    ]
+
+    history = bridge_module.session_compat_history_snapshot(
+        sess,
+        key,
+        "current request",
+        [{"text": "future request", "reqId": "req-future"}],
+    )
+    prompt = bridge_module.build_compat_history_prompt(
+        bot,
+        sess,
+        "User request:\ncurrent request",
+        compat_history=history,
+    )
+
+    assert [(item["role"], item["text"]) for item in history] == [
+        ("user", "first request"),
+        ("bot", "first answer"),
+    ]
+    assert prompt.count("current request") == 1
+    assert "future request" not in prompt
 
 
 @pytest.mark.asyncio
@@ -13555,6 +16846,7 @@ async def test_handle_wecom_ack_only_message_accepts_late_single_cached_final_re
     bridge_module.register_reply_session(bot, req_id, sess)
     sess.pending_final_payload = dict(payload)
     sess.pending_final_payloads = [dict(payload)]
+    sess.late_ack_payloads = [dict(payload)]
     sess.queue.append({"text": "next", "reqId": "req-2"})
     started = []
 
@@ -13576,6 +16868,73 @@ async def test_handle_wecom_ack_only_message_accepts_late_single_cached_final_re
     assert sess.pending_final_payload is None
     assert sess.pending_final_payloads is None
     assert req_id not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_late_ack_consumes_first_cached_final_fragment_before_flushing_tail(
+    bridge_module, monkeypatch
+):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    req_id = "req-1"
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, req_id, "x" * 7001, True)
+    bridge_module.register_reply_session(bot, req_id, sess)
+    sess.pending_final_payloads = bridge_module.clone_payload_sequence(payloads)
+    sess.pending_final_payload = dict(payloads[-1])
+    sess.late_ack_payloads = [dict(payloads[0])]
+    sess.queue.append({"text": "next", "reqId": "req-2"})
+    sent = []
+    started = []
+    bot.ws = make_acking_ws(bot, sent.append)
+
+    def fake_process_queue(_bot, _sess, key):
+        started.append(key)
+
+    monkeypatch.setattr(bridge_module, "process_queue", fake_process_queue)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "headers": {"req_id": req_id},
+            "errcode": 0,
+            "errmsg": "ok",
+        },
+    )
+
+    assert sent == payloads[1:]
+    assert started == ["single:test-user"]
+    assert sess.pending_final_payload is None
+    assert sess.pending_final_payloads is None
+    assert req_id not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_handle_wecom_late_ack_for_superseded_payload_keeps_current_cache(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    req_id = "req-1"
+    old_payload = bridge_module.build_session_text_payload("single:test-user", sess, req_id, "old", False)
+    current_payload = bridge_module.build_session_text_payload("single:test-user", sess, req_id, "current", True)
+    assert old_payload is not None
+    assert current_payload is not None
+    sess.late_ack_payloads = [dict(old_payload)]
+    sess.pending_final_payload = dict(current_payload)
+    sess.pending_final_payloads = [dict(current_payload)]
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "headers": {"req_id": req_id},
+            "errcode": 0,
+            "errmsg": "ok",
+        },
+    )
+
+    assert sent == [current_payload]
+    assert sess.pending_final_payload is None
+    assert sess.late_ack_payloads == []
 
 
 @pytest.mark.asyncio
@@ -13631,6 +16990,53 @@ async def test_final_reply_after_idle_gap_falls_back_to_proactive(bridge_module,
     assert delivered is True
     assert sent_payloads[0]["cmd"] == "aibot_send_msg"
     assert sent_payloads[0]["body"]["markdown"]["content"] == "final"
+    assert "req-1" not in bot.reply_sessions
+
+
+@pytest.mark.asyncio
+async def test_final_reply_after_uncertain_stream_delivery_uses_new_proactive_request(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    req_id = "req-1"
+    bridge_module.register_reply_session(bot, req_id, sess)
+    uncertain_payload = bridge_module.build_session_text_payload(
+        "single:test-user",
+        sess,
+        req_id,
+        "uncertain status",
+        False,
+    )
+    final_payload = bridge_module.build_session_text_payload(
+        "single:test-user",
+        sess,
+        req_id,
+        "final answer",
+        True,
+    )
+    assert uncertain_payload is not None
+    assert final_payload is not None
+    sess.pending_stream_payload = dict(uncertain_payload)
+    sess.pending_stream_payloads = [dict(uncertain_payload)]
+    sess.late_ack_payloads = [dict(uncertain_payload)]
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+
+    delivered = await bridge_module.send_or_store_session_payload(
+        bot,
+        "single:test-user",
+        sess,
+        final_payload,
+        True,
+    )
+
+    assert delivered is True
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_send_msg"
+    assert sent[0]["headers"]["req_id"] != req_id
+    assert sent[0]["body"]["markdown"]["content"] == "final answer"
+    assert sess.pending_stream_payload is None
+    assert sess.late_ack_payloads == []
+    assert req_id not in bot.reply_sessions
 
 
 @pytest.mark.asyncio
@@ -13800,6 +17206,65 @@ async def test_interrupt_command_resumes_preserved_queue_after_reply(bridge_modu
         ("reply", "req-interrupt", "Current task interrupted."),
         ("queue", "single:test-user"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_command_discards_provisional_thread_from_fresh_run(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.queue.append({"text": "long-running request", "reqId": "req-run"})
+    process_started = asyncio.Event()
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stdout.feed_data(
+                (json.dumps({"type": "thread.started", "thread_id": "provisional-thread"}) + "\n").encode("utf-8")
+            )
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            process_started.set()
+            await asyncio.Future()
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def fake_send_session_status(*args, **kwargs):
+        return True
+
+    async def fake_respond_info(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
+    monkeypatch.setattr(bridge_module, "respond_info", fake_respond_info)
+
+    bridge_module.process_queue(bot, sess, "single:test-user")
+    run_task = sess.run_task
+    assert run_task is not None
+    await process_started.wait()
+    for _ in range(100):
+        if sess.thread_id == "provisional-thread":
+            break
+        await asyncio.sleep(0)
+    assert sess.thread_id == "provisional-thread"
+
+    await bridge_module.interrupt_session_command(bot, "single:test-user", "req-interrupt")
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert sess.thread_id is None
+    assert sess.active_run_thread_checkpoint_set is False
+    assert persisted.get("threadId") is None
 
 
 @pytest.mark.asyncio
@@ -14137,6 +17602,90 @@ def test_build_codex_home_for_subprocess_skips_volatile_tmp_arg0_runtime(bridge_
     assert not (codex_home / "tmp" / "arg0").exists()
 
 
+def test_build_codex_home_for_subprocess_links_global_sessions_when_requested(bridge_module):
+    global_sessions_root = bridge_module.DEFAULT_CODEX_HOME / "sessions"
+    global_sessions_root.mkdir(parents=True, exist_ok=True)
+    marker = global_sessions_root / "marker.txt"
+    marker.write_text("shared", encoding="utf-8")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess("sess-global-sessions", use_global_sessions=True)
+
+    assert (codex_home / "sessions").is_symlink()
+    assert (codex_home / "sessions").resolve() == global_sessions_root.resolve()
+    assert (codex_home / "sessions" / "marker.txt").read_text(encoding="utf-8") == "shared"
+
+
+def test_create_agent_output_file_uses_private_exclusive_random_file(bridge_module, monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge_module.tempfile, "tempdir", str(tmp_path))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep-content", encoding="utf-8")
+    predictable = tmp_path / "wecom-codex-py-session-123456.txt"
+    predictable.symlink_to(victim)
+
+    first = bridge_module.create_agent_output_file("session")
+    second = bridge_module.create_agent_output_file("session")
+
+    try:
+        assert first.parent == tmp_path
+        assert second.parent == tmp_path
+        assert first != second
+        assert first != predictable
+        assert first.is_file() and not first.is_symlink()
+        assert first.stat().st_mode & 0o777 == 0o600
+        assert victim.read_text(encoding="utf-8") == "keep-content"
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+
+
+def test_build_codex_home_for_subprocess_keeps_global_sessions_link_on_repeated_prepare(bridge_module):
+    global_sessions_root = bridge_module.DEFAULT_CODEX_HOME / "sessions"
+    global_sessions_root.mkdir(parents=True, exist_ok=True)
+    marker = global_sessions_root / "marker.txt"
+    marker.write_text("shared", encoding="utf-8")
+    session_id = "sess-global-sessions-repeated"
+    local_sessions_root = bridge_module.get_session_codex_home_root(session_id) / "sessions"
+    local_sessions_root.mkdir(parents=True, exist_ok=True)
+    (local_sessions_root / "local-rollout.jsonl").write_text("local", encoding="utf-8")
+
+    first = bridge_module.build_codex_home_for_subprocess(session_id, use_global_sessions=True)
+    second = bridge_module.build_codex_home_for_subprocess(session_id, use_global_sessions=True)
+
+    assert first == second
+    assert (second / "sessions").is_symlink()
+    assert (second / "sessions").resolve() == global_sessions_root.resolve()
+    assert (second / "sessions" / "marker.txt").read_text(encoding="utf-8") == "shared"
+    assert (
+        bridge_module.get_session_codex_home_local_sessions_backup_root(session_id) / "local-rollout.jsonl"
+    ).read_text(encoding="utf-8") == "local"
+
+
+def test_build_codex_home_for_subprocess_restores_local_sessions_after_global_mode(bridge_module):
+    global_sessions_root = bridge_module.DEFAULT_CODEX_HOME / "sessions"
+    global_sessions_root.mkdir(parents=True, exist_ok=True)
+    (global_sessions_root / "global-marker.txt").write_text("global", encoding="utf-8")
+    session_id = "sess-restore-local-sessions"
+    session_home = bridge_module.get_session_codex_home_root(session_id)
+    local_sessions_root = session_home / "sessions"
+    bridge_module.ensure_dir(local_sessions_root)
+    (local_sessions_root / "local-rollout.jsonl").write_text("local", encoding="utf-8")
+
+    codex_home = bridge_module.build_codex_home_for_subprocess(session_id, use_global_sessions=True)
+
+    assert (codex_home / "sessions").is_symlink()
+    assert (bridge_module.get_session_codex_home_local_sessions_backup_root(session_id) / "local-rollout.jsonl").read_text(
+        encoding="utf-8"
+    ) == "local"
+
+    restored = bridge_module.build_codex_home_for_subprocess(session_id, use_global_sessions=False)
+
+    assert restored == codex_home
+    assert (restored / "sessions").is_dir()
+    assert not (restored / "sessions").is_symlink()
+    assert (restored / "sessions" / "local-rollout.jsonl").read_text(encoding="utf-8") == "local"
+    assert bridge_module.get_session_codex_home_local_sessions_backup_root(session_id).exists() is False
+
+
 def test_build_codex_home_for_subprocess_skips_same_file_copy_when_base_home_is_session_home(bridge_module):
     session_id = "sess-same-home"
     session_home = bridge_module.get_session_codex_home_root(session_id)
@@ -14152,6 +17701,23 @@ def test_build_codex_home_for_subprocess_skips_same_file_copy_when_base_home_is_
 
     assert result == session_home
     assert (session_home / "config.toml").read_text(encoding="utf-8") == "model = 'x'\n"
+
+
+def test_build_codex_home_for_subprocess_avoids_self_linking_sessions_when_base_home_is_session_home(bridge_module):
+    session_id = "sess-same-home-global"
+    session_home = bridge_module.get_session_codex_home_root(session_id)
+    bridge_module.ensure_dir(session_home / "sessions")
+
+    original_home = bridge_module.DEFAULT_CODEX_HOME
+    bridge_module.DEFAULT_CODEX_HOME = session_home
+    try:
+        result = bridge_module.build_codex_home_for_subprocess(session_id, use_global_sessions=True)
+    finally:
+        bridge_module.DEFAULT_CODEX_HOME = original_home
+
+    assert result == session_home
+    assert (session_home / "sessions").is_dir()
+    assert not (session_home / "sessions").is_symlink()
 
 
 def test_build_codex_home_for_subprocess_replaces_broken_symlinked_root_state_file(bridge_module):
@@ -14469,15 +18035,41 @@ async def test_run_codex_retries_fresh_exec_when_prompt_write_broken_pipe_occurs
 
 
 @pytest.mark.asyncio
-async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_module, monkeypatch):
+@pytest.mark.parametrize(
+    "resume_error",
+    [
+        "2026-05-28T10:15:41.542083Z ERROR codex_core::session: failed to record rollout items: "
+        "thread 019e6e10-fa64-73c2-9be5-4fdf694161ea not found",
+        "Error: thread/resume: thread/resume failed: failed to resolve rollout path "
+        "`/tmp/codex-home/sessions/rollout-019e6e10.jsonl`: file does not exist (code -32600)",
+    ],
+)
+async def test_run_codex_retries_fresh_exec_when_resume_state_is_missing(
+    bridge_module, monkeypatch, resume_error
+):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     sess.running = True
     sess.thread_id = "019e6e10-fa64-73c2-9be5-4fdf694161ea"
+    sess.use_global_codex_sessions = True
     sess.chat = [{"role": "user", "text": "older user turn"}, {"role": "bot", "text": "older bot turn"}]
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "threadId": sess.thread_id,
+            "useGlobalCodexSessions": True,
+            "localResumeBackup": {
+                "threadId": "bridge-thread",
+                "recentChat": [{"role": "user", "text": "bridge conversation"}],
+                "useGlobalCodexSessions": False,
+            },
+        },
+    )
     payloads = []
     invocations = []
     processes = []
+    global_session_modes = []
 
     class FakeProcess:
         def __init__(self, *, returncode: int, stdout_events: list[dict[str, object]], stderr_lines: list[str]):
@@ -14506,9 +18098,7 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
             process = FakeProcess(
                 returncode=1,
                 stdout_events=[],
-                stderr_lines=[
-                    "2026-05-28T10:15:41.542083Z ERROR codex_core::session: failed to record rollout items: thread 019e6e10-fa64-73c2-9be5-4fdf694161ea not found"
-                ],
+                stderr_lines=[resume_error],
             )
         else:
             process = FakeProcess(
@@ -14530,9 +18120,16 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
         payloads.append((final, payload["body"]["stream"]["content"]))
         return True
 
+    original_build_codex_home = bridge_module.build_codex_home_for_subprocess
+
+    def tracking_build_codex_home(session_id, *, use_global_sessions=False):
+        global_session_modes.append(use_global_sessions)
+        return original_build_codex_home(session_id, use_global_sessions=use_global_sessions)
+
     monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(bridge_module, "send_session_status", fake_send_session_status)
     monkeypatch.setattr(bridge_module, "send_or_store_session_payload", fake_send_or_store_session_payload)
+    monkeypatch.setattr(bridge_module, "build_codex_home_for_subprocess", tracking_build_codex_home)
 
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
@@ -14545,7 +18142,20 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found(bridge_
     assert "older user turn" in second_prompt
     assert "older bot turn" in second_prompt
     assert sess.thread_id == "thread-from-second-exec"
-    assert payloads[-1] == (True, "final answer")
+    assert sess.use_global_codex_sessions is False
+    assert global_session_modes == [True, False]
+    persisted = bridge_module.read_session_record_by_id(sess.session_id)
+    assert persisted.get("threadId") == "thread-from-second-exec"
+    assert persisted.get("useGlobalCodexSessions") is False
+    assert persisted.get("localResumeBackup") == {
+        "threadId": "bridge-thread",
+        "recentChat": [{"role": "user", "text": "bridge conversation"}],
+        "useGlobalCodexSessions": False,
+    }
+    assert payloads[-1] == (
+        True,
+        "提示：原本地 Codex 会话已不可用，已基于近期聊天创建新会话。\n\nfinal answer",
+    )
 
 
 @pytest.mark.asyncio
@@ -14733,7 +18343,7 @@ async def test_reset_then_image_then_text_uses_fresh_exec_with_image_and_stdin_p
 
 
 @pytest.mark.asyncio
-async def test_run_codex_wraps_claude_with_setpriv_when_run_as_user_configured(bridge_module, monkeypatch):
+async def test_run_codex_ignores_legacy_claude_run_as_configuration(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     bot.config["agentBackend"] = "claude"
     bot.config["agentCommand"] = "claude"
@@ -14784,11 +18394,10 @@ async def test_run_codex_wraps_claude_with_setpriv_when_run_as_user_configured(b
 
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
-    assert captured["args"][0] == "setpriv"
-    assert "--clear-groups" in captured["args"]
-    assert "claude" in captured["args"]
+    assert captured["args"][0] == "claude"
+    assert "setpriv" not in captured["args"]
     assert str(captured["cwd"]) == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve())
-    assert captured["env"]["CLAUDE_CONFIG_DIR"].endswith(".claude")
+    assert not (bridge_module.BASE_DIR / "claude-runtime").exists()
     assert captured["env"]["WECOM_BRIDGE_WORKFILE_DIR"] == str(
         bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
     )

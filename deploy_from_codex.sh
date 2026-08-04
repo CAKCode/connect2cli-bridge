@@ -7,6 +7,11 @@ cd "$SCRIPT_DIR"
 
 BOT_ID=""
 BOT_SECRET=""
+BOT_SECRET_SOURCE_FILE=""
+BOT_SECRET_ARG_SET="false"
+BOT_SECRET_FILE_ARG_SET="false"
+SECRET_TMP_FILE=""
+ENV_TMP_FILE=""
 GITHUB_REPO=""
 BOT_NAME=""
 BRIDGE_BIND="127.0.0.1:9299"
@@ -14,13 +19,14 @@ WORK_ROOT=""
 SKIP_INSTALL="false"
 SKIP_START="false"
 DRY_RUN="false"
+BRIDGE_PYTHON="${BRIDGE_PYTHON:-}"
 
 usage() {
   cat <<'EOF'
 Usage:
   sh ./deploy_from_codex.sh \
     --bot-id BOT_ID \
-    --bot-secret BOT_SECRET \
+    --bot-secret-file SECRET_FILE \
     --github-repo GITHUB_REPO_URL \
     [--bot-name BOT_NAME] \
     [--bridge-bind HOST:PORT] \
@@ -29,10 +35,14 @@ Usage:
     [--skip-start] \
     [--dry-run]
 
+Exactly one secret input is required:
+  --bot-secret-file SECRET_FILE  Read the secret from a protected file (recommended).
+  --bot-secret BOT_SECRET        Inline compatibility option (deprecated and insecure).
+
 Example:
   sh ./deploy_from_codex.sh \
     --bot-id "your-bot-id" \
-    --bot-secret "your-secret" \
+    --bot-secret-file "/secure/path/wecom-bot.secret" \
     --github-repo "git@github.com:your-org/your-repo.git"
 EOF
 }
@@ -76,6 +86,18 @@ run_cmd() {
   "$@"
 }
 
+cleanup_secret_tmp() {
+  if [ -n "$SECRET_TMP_FILE" ]; then
+    rm -f "$SECRET_TMP_FILE"
+  fi
+  if [ -n "$ENV_TMP_FILE" ]; then
+    rm -f "$ENV_TMP_FILE"
+  fi
+}
+
+trap cleanup_secret_tmp EXIT
+trap 'exit 1' HUP INT TERM
+
 shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
@@ -86,6 +108,33 @@ import pathlib
 import sys
 
 print(pathlib.Path(sys.argv[1]).expanduser())
+PY
+}
+
+validate_secret_file() {
+  python3 - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).expanduser()
+if not path.exists():
+    print(f"--bot-secret-file does not exist: {path}", file=sys.stderr)
+    raise SystemExit(1)
+if not path.is_file():
+    print(f"--bot-secret-file is not a regular file: {path}", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    mode = path.stat().st_mode
+    if mode & 0o444 == 0:
+        raise PermissionError
+    value = path.read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    print(f"--bot-secret-file is not readable UTF-8 text: {path}", file=sys.stderr)
+    raise SystemExit(1)
+if not value.strip():
+    print(f"--bot-secret-file is empty: {path}", file=sys.stderr)
+    raise SystemExit(1)
+print(path.resolve())
 PY
 }
 
@@ -127,6 +176,12 @@ while [ "$#" -gt 0 ]; do
       ;;
     --bot-secret)
       BOT_SECRET="${2:-}"
+      BOT_SECRET_ARG_SET="true"
+      shift 2
+      ;;
+    --bot-secret-file)
+      BOT_SECRET_SOURCE_FILE="${2:-}"
+      BOT_SECRET_FILE_ARG_SET="true"
       shift 2
       ;;
     --github-repo)
@@ -170,12 +225,29 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$BOT_ID" ] || { echo "--bot-id is required" >&2; exit 1; }
-[ -n "$BOT_SECRET" ] || { echo "--bot-secret is required" >&2; exit 1; }
 [ -n "$GITHUB_REPO" ] || { echo "--github-repo is required" >&2; exit 1; }
 
+if is_truthy "$BOT_SECRET_ARG_SET" && is_truthy "$BOT_SECRET_FILE_ARG_SET"; then
+  echo "--bot-secret-file and --bot-secret are mutually exclusive" >&2
+  exit 1
+fi
+if ! is_truthy "$BOT_SECRET_ARG_SET" && ! is_truthy "$BOT_SECRET_FILE_ARG_SET"; then
+  echo "exactly one of --bot-secret-file or --bot-secret is required" >&2
+  exit 1
+fi
+
 require_command git
+require_command mktemp
 require_command python3
 require_command sh
+
+if is_truthy "$BOT_SECRET_FILE_ARG_SET"; then
+  [ -n "$BOT_SECRET_SOURCE_FILE" ] || { echo "--bot-secret-file must not be empty" >&2; exit 1; }
+  BOT_SECRET_SOURCE_FILE="$(validate_secret_file "$BOT_SECRET_SOURCE_FILE")"
+else
+  [ -n "$BOT_SECRET" ] || { echo "--bot-secret must not be empty" >&2; exit 1; }
+  echo "warning: --bot-secret exposes the secret in shell history and process listings; use --bot-secret-file instead" >&2
+fi
 
 REPO_SLUG="$(basename "$GITHUB_REPO")"
 REPO_SLUG="${REPO_SLUG%.git}"
@@ -197,6 +269,8 @@ TARGET_REPO_DIR="$WORK_ROOT/$REPO_SLUG"
 SECRET_FILE="$SCRIPT_DIR/.secrets/$BOT_NAME.secret"
 ENV_FILE="$SCRIPT_DIR/.env"
 ENV_BACKUP_FILE="$SCRIPT_DIR/.env.backup.$(date +%Y%m%d%H%M%S)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
 
 echo "Bridge repo: $SCRIPT_DIR"
 echo "Target work repo: $TARGET_REPO_DIR"
@@ -210,6 +284,9 @@ fi
 
 if [ ! -d "$SCRIPT_DIR/.secrets" ]; then
   run_cmd mkdir -p "$SCRIPT_DIR/.secrets"
+fi
+if ! is_truthy "$DRY_RUN"; then
+  chmod 700 "$SCRIPT_DIR/.secrets"
 fi
 
 if [ -d "$TARGET_REPO_DIR/.git" ]; then
@@ -231,14 +308,32 @@ else
 fi
 
 if ! is_truthy "$SKIP_INSTALL"; then
-  run_cmd python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
+  if [ ! -x "$VENV_PYTHON" ]; then
+    run_cmd python3 -m venv "$VENV_DIR"
+  fi
+  run_cmd "$VENV_PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+  BRIDGE_PYTHON="$VENV_PYTHON"
+elif [ -z "$BRIDGE_PYTHON" ]; then
+  if [ -x "$VENV_PYTHON" ]; then
+    BRIDGE_PYTHON="$VENV_PYTHON"
+  else
+    BRIDGE_PYTHON="python3"
+  fi
 fi
 
 if is_truthy "$DRY_RUN"; then
   printf '[dry-run] write secret file: %s\n' "$SECRET_FILE"
 else
   umask 077
-  printf '%s\n' "$BOT_SECRET" > "$SECRET_FILE"
+  SECRET_TMP_FILE="$(mktemp "$SCRIPT_DIR/.secrets/.${BOT_NAME}.secret.tmp.XXXXXX")"
+  if is_truthy "$BOT_SECRET_FILE_ARG_SET"; then
+    cp "$BOT_SECRET_SOURCE_FILE" "$SECRET_TMP_FILE"
+  else
+    printf '%s\n' "$BOT_SECRET" > "$SECRET_TMP_FILE"
+  fi
+  chmod 600 "$SECRET_TMP_FILE"
+  mv -f "$SECRET_TMP_FILE" "$SECRET_FILE"
+  SECRET_TMP_FILE=""
 fi
 
 if [ -f "$ENV_FILE" ]; then
@@ -252,8 +347,11 @@ fi
 if is_truthy "$DRY_RUN"; then
   printf '[dry-run] write .env: %s\n' "$ENV_FILE"
 else
-  cat > "$ENV_FILE" <<EOF
+  ENV_TMP_FILE="$(mktemp "$SCRIPT_DIR/.env.tmp.XXXXXX")"
+  chmod 600 "$ENV_TMP_FILE"
+  cat > "$ENV_TMP_FILE" <<EOF
 BRIDGE_BIND=$(shell_quote "$BRIDGE_BIND")
+BRIDGE_PYTHON=$(shell_quote "$BRIDGE_PYTHON")
 WORK_DIR=$(shell_quote "$TARGET_REPO_DIR")
 CODEX_EXEC_MODE=$(shell_quote "host")
 BRIDGE_WATCHDOG_ENABLED=$(shell_quote "true")
@@ -266,6 +364,8 @@ WECOM_BOT_WORK_DIR=$(shell_quote "$TARGET_REPO_DIR")
 WECOM_BOT_GROUP_SESSION_MODE=$(shell_quote "per-user")
 WECOM_BOT_ENABLED=$(shell_quote "true")
 EOF
+  mv -f "$ENV_TMP_FILE" "$ENV_FILE"
+  ENV_TMP_FILE=""
 fi
 
 if ! is_truthy "$SKIP_START"; then

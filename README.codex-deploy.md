@@ -2,7 +2,7 @@
 
 这份说明的目标只有一个：
 
-- 后续其他人只要在 Codex 里提供 `botId`、`secret`、GitHub 地址
+- 后续其他人只要在 Codex 里提供 `botId`、secret 文件路径、GitHub 地址
 - Codex 就可以按固定流程把这套 bridge 部署起来
 
 ## 最小输入
@@ -11,7 +11,7 @@
 
 ```text
 botId: YOUR_BOT_ID
-secret: YOUR_SECRET
+secretFile: /secure/path/wecom-bot.secret
 github: git@github.com:your-org/your-repo.git
 ```
 
@@ -19,8 +19,8 @@ github: git@github.com:your-org/your-repo.git
 
 - `botId`
   企业微信智能机器人的 `botId`
-- `secret`
-  企业微信智能机器人的 `secret`
+- `secretFile`
+  保存企业微信智能机器人 `secret` 的本地文件；文件应只允许部署用户读取
 - `github`
   需要让 Codex 后续工作的代码仓库地址，不是本 bridge 仓库地址
 
@@ -33,7 +33,7 @@ github: git@github.com:your-org/your-repo.git
 
 sh ./deploy_from_codex.sh \
   --bot-id "YOUR_BOT_ID" \
-  --bot-secret "YOUR_SECRET" \
+  --bot-secret-file "/secure/path/wecom-bot.secret" \
   --github-repo "git@github.com:your-org/your-repo.git"
 ```
 
@@ -42,7 +42,7 @@ sh ./deploy_from_codex.sh \
 ```text
 sh ./deploy_from_codex.sh \
   --bot-id "YOUR_BOT_ID" \
-  --bot-secret "YOUR_SECRET" \
+  --bot-secret-file "/secure/path/wecom-bot.secret" \
   --github-repo "git@github.com:your-org/your-repo.git" \
   --dry-run
 ```
@@ -54,9 +54,8 @@ sh ./deploy_from_codex.sh \
 1. 检查 `git`、`python3` 是否存在
 2. 把目标 GitHub 仓库 clone 到：
    `./bot-workdirs/<repo-name>`
-3. 安装 Python 依赖：
-   `python3 -m pip install -r requirements.txt`
-4. 把 secret 写到：
+3. 在 bridge 项目内创建 `.venv`，并用 `.venv/bin/python -m pip` 安装 Python 依赖
+4. 从受保护的输入文件读取 secret，并复制到：
    `./.secrets/<bot-name>.secret`
 5. 生成最小可用 `.env`，默认 `CODEX_EXEC_MODE=host`
 6. 执行：
@@ -68,6 +67,7 @@ sh ./deploy_from_codex.sh \
 
 ```text
 BRIDGE_BIND=127.0.0.1:9299
+BRIDGE_PYTHON=<bridge 仓库>/.venv/bin/python
 WORK_DIR=<克隆下来的目标仓库目录>
 CODEX_EXEC_MODE=host
 
@@ -84,6 +84,10 @@ WECOM_BOT_ENABLED=true
 
 - `bot-name` 默认取 GitHub 仓库名
 - 监听地址默认是 `127.0.0.1:9299`
+- 默认依赖安装不会写入系统 Python；`start.sh` 和 watchdog 都使用生成的 `BRIDGE_PYTHON`
+- 使用 `--skip-install` 时，脚本优先复用已有 `.venv`，否则保持 `python3` 兼容行为
+- `.secrets` 目录权限会收紧为 `0700`，生成的 secret 文件权限为 `0600`
+- Bridge 的 shared/runtime/control 状态根和 `BOTS_FILE` 父目录必须对运行用户可写；多用户共享时使用共同用户组和 setgid `2770/2775` 目录
 - 会覆盖当前 `.env`，但如果原来已有 `.env`，会先备份成 `.env.backup.<timestamp>`
 
 ## 部署后的检查
@@ -114,5 +118,7 @@ tail -f ./bridge.log
 
 - 运行这个脚本前，当前 Linux 用户必须已经执行过 `codex login`
 - 如果 GitHub 仓库是私有仓库，当前机器必须已经具备对应的 Git 拉取权限
+- 不要把 secret 直接写在命令行中；`--bot-secret` 仅为兼容旧调用保留，会输出安全警告
+- 输入 secret 文件必须存在、是可读的 UTF-8 普通文件，且去除空白后非空
 - 这份脚本面向“单 Bot + 单代码仓库”的快速部署
 - 如果后续要做多 Bot、共享状态目录、反向代理、鉴权、容器化，请回到主 README 和使用手册配置

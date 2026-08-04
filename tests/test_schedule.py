@@ -36,6 +36,15 @@ def test_create_schedule_definition_persists_definition(tmp_path) -> None:
     assert len(stored) == 1
     assert stored[0].chat_key == "single:alice"
     assert due_schedule_definitions(tmp_path, current_ms=int(__import__("time").time() * 1000)) == []
+    roots = (
+        schedule_pending_root(tmp_path),
+        schedule_processing_root(tmp_path),
+        schedule_done_root(tmp_path),
+        schedule_failed_root(tmp_path),
+        schedule_definition_root(tmp_path),
+    )
+    assert all(root.stat().st_mode & 0o777 == 0o700 for root in roots)
+    assert next(schedule_definition_root(tmp_path).glob("*.json")).stat().st_mode & 0o777 == 0o600
 
 
 def test_create_schedule_definition_escapes_schedule_id_in_filesystem(tmp_path) -> None:

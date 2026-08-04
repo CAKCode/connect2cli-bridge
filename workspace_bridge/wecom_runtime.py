@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from .async_utils import run_blocking
-from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, stream_text_message_once
+from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, session_run_guards, stream_text_message_once
 from .layout import build_workspace_ref
 from .reply_state import cleanup_reply_state
 from .runtime import (
@@ -136,68 +136,45 @@ async def _handle_cwd_command(runtime, parsed, command_session_id: str, command_
         )
         cleanup_reply_state(runtime, parsed.req_id)
         return True
-    launch = await run_blocking(prepare_session_run, runtime.config, parsed.chat_key)
-    current_cwd = launch.cwd.resolve()
-    args = command_text.split(None, 1)
-    if len(args) == 1:
-        await ws_send_json(
-            runtime,
-            build_text_response_payload(parsed.req_id, command_session_id, f"Current cwd: {current_cwd}", final=True),
-        )
-        cleanup_reply_state(runtime, parsed.req_id)
-        return True
-    requested = args[1].strip()
-    if not requested:
-        await ws_send_json(
-            runtime,
-            build_text_response_payload(parsed.req_id, command_session_id, f"Current cwd: {current_cwd}", final=True),
-        )
-        cleanup_reply_state(runtime, parsed.req_id)
-        return True
-    requested_path = Path(requested).expanduser()
-    resolved = (current_cwd / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
-    try:
-        next_cwd = resolve_personal_session_cwd(runtime.config, resolved)
-    except ValueError as exc:
-        await ws_send_json(
-            runtime,
-            build_text_response_payload(parsed.req_id, command_session_id, str(exc), final=True),
-        )
-        cleanup_reply_state(runtime, parsed.req_id)
-        return True
-    if not path_within_root(next_cwd, runtime.config.source.source_dir):
-        await ws_send_json(
-            runtime,
-            build_text_response_payload(
-                parsed.req_id,
-                command_session_id,
-                f"cwd must stay within workDir: {runtime.config.source.source_dir}",
-                final=True,
-            ),
-        )
-        cleanup_reply_state(runtime, parsed.req_id)
-        return True
-    changed = next_cwd != current_cwd
-    if changed:
-        runtime.session_threads.pop(parsed.chat_key, None)
-        _clear_resume_selection(runtime, parsed.chat_key)
-    skill_dir = resolve_personal_skill_dir(next_cwd)
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    update_session_record(
-        runtime.config.runtime_root,
-        command_session_id,
-        lambda current: replace(
-            current,
-            workspace_mode="personal",
-            cwd_dir=next_cwd,
-            skill_dir=skill_dir,
-            thread_id=None if changed else current.thread_id,
-            updated_at=int(__import__("time").time() * 1000),
-        ),
-    )
+    async with session_run_guards(runtime.config, parsed.chat_key):
+        launch = await run_blocking(prepare_session_run, runtime.config, parsed.chat_key)
+        current_cwd = launch.cwd.resolve()
+        args = command_text.split(None, 1)
+        requested = args[1].strip() if len(args) > 1 else ""
+        response_text = f"Current cwd: {current_cwd}"
+        if requested:
+            requested_path = Path(requested).expanduser()
+            resolved = (current_cwd / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
+            try:
+                next_cwd = resolve_personal_session_cwd(runtime.config, resolved)
+            except ValueError as exc:
+                response_text = str(exc)
+            else:
+                if not path_within_root(next_cwd, runtime.config.source.source_dir):
+                    response_text = f"cwd must stay within workDir: {runtime.config.source.source_dir}"
+                else:
+                    changed = next_cwd != current_cwd
+                    if changed:
+                        runtime.session_threads.pop(parsed.chat_key, None)
+                        _clear_resume_selection(runtime, parsed.chat_key)
+                    skill_dir = resolve_personal_skill_dir(next_cwd)
+                    skill_dir.mkdir(parents=True, exist_ok=True)
+                    update_session_record(
+                        runtime.config.runtime_root,
+                        command_session_id,
+                        lambda current: replace(
+                            current,
+                            workspace_mode="personal",
+                            cwd_dir=next_cwd,
+                            skill_dir=skill_dir,
+                            thread_id=None if changed else current.thread_id,
+                            updated_at=int(__import__("time").time() * 1000),
+                        ),
+                    )
+                    response_text = f"cwd changed to {next_cwd}"
     await ws_send_json(
         runtime,
-        build_text_response_payload(parsed.req_id, command_session_id, f"cwd changed to {next_cwd}", final=True),
+        build_text_response_payload(parsed.req_id, command_session_id, response_text, final=True),
     )
     cleanup_reply_state(runtime, parsed.req_id)
     return True
@@ -348,29 +325,35 @@ def _select_resume_candidate(runtime, chat_key: str, token: str) -> dict[str, st
 
 
 async def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, str | int]) -> str:
-    records = await run_blocking(list_session_records, runtime.config.runtime_root, runtime.config.bot_id)
-    record = next(
-        (
-            item for item in records if item.session_id == candidate["sessionId"]
-        ),
-        None,
-    )
-    thread_id = str(candidate.get("threadId") or "").strip()
-    if record is None or not thread_id:
+    source_chat_key = str(candidate.get("chatKey") or "").strip()
+    if not source_chat_key:
         raise RuntimeError("selected session is no longer resumable")
-    launch = await run_blocking(prepare_session_run, runtime.config, chat_key)
-    runtime.session_threads[chat_key] = thread_id
-    update_session_record(
-        runtime.config.runtime_root,
-        launch.session.session_id,
-        lambda current: replace(
-            current,
-            updated_at=int(__import__("time").time() * 1000),
-            last_run_at=int(__import__("time").time() * 1000),
-            thread_id=thread_id,
-            recent_chat=record.recent_chat,
-        ),
-    )
+    async with session_run_guards(runtime.config, chat_key, source_chat_key):
+        records = await run_blocking(list_session_records, runtime.config.runtime_root, runtime.config.bot_id)
+        record = next(
+            (
+                item for item in records if item.session_id == candidate["sessionId"]
+            ),
+            None,
+        )
+        if record is None or record.chat_key != source_chat_key:
+            raise RuntimeError("selected session is no longer resumable")
+        thread_id = str(runtime.session_threads.get(source_chat_key) or record.thread_id or "").strip()
+        if not thread_id:
+            raise RuntimeError("selected session is no longer resumable")
+        launch = await run_blocking(prepare_session_run, runtime.config, chat_key)
+        runtime.session_threads[chat_key] = thread_id
+        update_session_record(
+            runtime.config.runtime_root,
+            launch.session.session_id,
+            lambda current: replace(
+                current,
+                updated_at=int(__import__("time").time() * 1000),
+                last_run_at=int(__import__("time").time() * 1000),
+                thread_id=thread_id,
+                recent_chat=record.recent_chat,
+            ),
+        )
     _clear_resume_selection(runtime, chat_key)
     return record.session_id
 
@@ -393,15 +376,16 @@ async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
         )
         runtime.last_status = "message_failed"
         runtime.last_error = str(exc)
-        update_session_record(
-            runtime.config.runtime_root,
-            session_id,
-            lambda current: replace(
-                current,
-                updated_at=int(__import__("time").time() * 1000),
-                last_run_at=int(__import__("time").time() * 1000),
-            ),
-        )
+        async with session_run_guards(runtime.config, parsed.chat_key):
+            update_session_record(
+                runtime.config.runtime_root,
+                session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(__import__("time").time() * 1000),
+                    last_run_at=int(__import__("time").time() * 1000),
+                ),
+            )
         if runtime.ws is None and ws is not None:
             original_ws = runtime.ws
             runtime.ws = ws
@@ -580,7 +564,6 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         return
     if command_text == "/bridge-reset":
         _clear_resume_selection(runtime, parsed.chat_key)
-        runtime.session_threads.pop(parsed.chat_key, None)
         await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
         process = runtime.active_processes.pop(parsed.chat_key, None)
         active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
@@ -594,33 +577,35 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
                 await active_task
         if process is not None:
             await _wait_for_process_exit(process)
-        session_id = stable_session_id(
-            runtime.config.bot_id,
-            parsed.chat_key,
-            runtime.config.source.source_dir,
-            runtime.config.workspace_namespace,
-            runtime.config.workspace_mode,
-        )
-        await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
-        await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
-        update_session_record(
-            runtime.config.runtime_root,
-            session_id,
-            lambda current: replace(
-                current,
-                updated_at=int(__import__("time").time() * 1000),
-                last_run_at=int(__import__("time").time() * 1000),
-                thread_id=None,
-                recent_chat=(),
-            ),
-        )
-        req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
-        for req_id in req_ids:
-            cleanup_reply_state(runtime, req_id)
-            if runtime.pending_streams is not None:
-                runtime.pending_streams.pop(req_id, None)
-            if runtime.pending_finals is not None:
-                runtime.pending_finals.pop(req_id, None)
+        async with session_run_guards(runtime.config, parsed.chat_key):
+            runtime.session_threads.pop(parsed.chat_key, None)
+            session_id = stable_session_id(
+                runtime.config.bot_id,
+                parsed.chat_key,
+                runtime.config.source.source_dir,
+                runtime.config.workspace_namespace,
+                runtime.config.workspace_mode,
+            )
+            await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
+            await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
+            update_session_record(
+                runtime.config.runtime_root,
+                session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(__import__("time").time() * 1000),
+                    last_run_at=int(__import__("time").time() * 1000),
+                    thread_id=None,
+                    recent_chat=(),
+                ),
+            )
+            req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
+            for req_id in req_ids:
+                cleanup_reply_state(runtime, req_id)
+                if runtime.pending_streams is not None:
+                    runtime.pending_streams.pop(req_id, None)
+                if runtime.pending_finals is not None:
+                    runtime.pending_finals.pop(req_id, None)
         await ws_send_json(runtime, build_text_response_payload(parsed.req_id, command_session_id, "Session reset.", final=True))
         cleanup_reply_state(runtime, parsed.req_id)
         return

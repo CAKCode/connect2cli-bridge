@@ -5,6 +5,7 @@ import shutil
 import time
 from pathlib import Path
 
+from .atomic_io import atomic_write_json
 from .layout import ensure_workspace_dirs, workspace_migration_marker_file
 from .models import ProvisionedWorkspace, WorkspaceRef
 
@@ -23,13 +24,12 @@ def normalize_optional_int(value) -> int | None:
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, payload)
 
 
 def read_json_file(path: Path) -> dict | None:
+    if path.is_symlink():
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:

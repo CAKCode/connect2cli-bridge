@@ -130,25 +130,22 @@ def test_build_bot_config_rejects_file_chatfile_root(tmp_path: Path) -> None:
         raise AssertionError("expected ValueError")
 
 
-def test_build_bot_config_rejects_file_agent_runtime_root(tmp_path: Path) -> None:
+def test_build_bot_config_ignores_file_legacy_agent_runtime_root(tmp_path: Path) -> None:
     source_dir = tmp_path / "repo"
     agent_runtime_root = tmp_path / "claude-runtime.txt"
     source_dir.mkdir()
     agent_runtime_root.write_text("not a dir", encoding="utf-8")
 
-    try:
-        build_bot_config(
-            bot_id="bot-1",
-            bot_name="codex",
-            source_dir=source_dir,
-            runtime_root=tmp_path / "runtime",
-            chatfile_root=tmp_path / "chatfiles",
-            agent_runtime_root=agent_runtime_root,
-        )
-    except ValueError as exc:
-        assert str(exc) == f"agent_runtime_root is not a directory: {agent_runtime_root.resolve()}"
-    else:
-        raise AssertionError("expected ValueError")
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=tmp_path / "runtime",
+        chatfile_root=tmp_path / "chatfiles",
+        agent_runtime_root=agent_runtime_root,
+    )
+
+    assert bot.agent_runtime_root is None
 
 
 def test_build_bot_config_treats_null_agent_runtime_root_as_unset(tmp_path: Path) -> None:
@@ -390,6 +387,10 @@ def test_prepare_session_run_builds_launch_spec_and_persists_session(tmp_path: P
     assert stored.workspace_id == launch.session.workspace_id
     assert stored.cwd_dir == launch.cwd
     assert stored.workfile_dir == launch.runtime_context.workfile_dir
+    assert (runtime_root / "sessions").stat().st_mode & 0o777 == 0o700
+    assert (runtime_root / "sessions" / f"{launch.session.session_id}.json").stat().st_mode & 0o777 == 0o600
+    assert Path(launch.env["CODEX_HOME"]).stat().st_mode & 0o777 == 0o700
+    assert launch.runtime_context.chatfile_dir.stat().st_mode & 0o777 == 0o700
 
 
 def test_prepare_session_run_session_codex_home_copies_only_lightweight_root_state(tmp_path: Path, monkeypatch) -> None:
@@ -420,6 +421,8 @@ def test_prepare_session_run_session_codex_home_copies_only_lightweight_root_sta
 
     assert (session_home / "installation_id").read_text(encoding="utf-8") == "install-1"
     assert (session_home / "logs_2.sqlite").exists() is False
+    assert session_home.stat().st_mode & 0o777 == 0o700
+    assert (session_home / "installation_id").stat().st_mode & 0o777 == 0o600
 
 
 def test_prepare_session_run_reuses_stable_session_id_for_same_chat(tmp_path: Path) -> None:
@@ -631,6 +634,29 @@ def test_state_files_escape_bot_id_path_components(tmp_path: Path) -> None:
     assert not (tmp_path / "template-card-state" / "folder").exists()
     assert load_template_card_state(tmp_path, bot_id)["task-1"]["taskId"] == "task-1"
     assert load_reply_url_state(tmp_path, bot_id)["req-1"]["responseUrl"] == "https://example.com/response"
+    assert (tmp_path / "template-card-state").stat().st_mode & 0o777 == 0o700
+    assert template_card_state_file(tmp_path, bot_id).stat().st_mode & 0o777 == 0o600
+    assert reply_url_state_file(tmp_path, bot_id).stat().st_mode & 0o777 == 0o600
+
+
+def test_state_loaders_ignore_symlink_files(tmp_path: Path) -> None:
+    external = tmp_path / "external.json"
+    external.write_text(
+        json.dumps(
+            {
+                "task-1": {"taskId": "task-1"},
+                "req-1": {"responseUrl": "https://example.test", "capturedAtMs": 9999999999999},
+            }
+        ),
+        encoding="utf-8",
+    )
+    template_path = template_card_state_file(tmp_path, "bot-1")
+    reply_path = reply_url_state_file(tmp_path, "bot-1")
+    template_path.symlink_to(external)
+    reply_path.symlink_to(external)
+
+    assert load_template_card_state(tmp_path, "bot-1") == {}
+    assert load_reply_url_state(tmp_path, "bot-1") == {}
 
 
 def test_store_reply_url_state_ignores_invalid_captured_at_values(tmp_path: Path) -> None:

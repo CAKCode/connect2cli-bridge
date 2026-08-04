@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from .agent_backends import normalize_agent_backend
+from .atomic_io import ensure_state_directory
 from .models import WorkspaceRef
 
 
@@ -109,12 +110,12 @@ def build_workspace_ref(
 def ensure_workspace_dirs(workspace: WorkspaceRef) -> WorkspaceRef:
     for path in (
         workspace.root_dir,
-        workspace.state_dir,
-        workspace.lock_file.parent,
         *([workspace.workfile_dir] if workspace.workfile_dir is not None else []),
         *([workspace.roomfile_dir] if workspace.roomfile_dir is not None else []),
     ):
         path.mkdir(parents=True, exist_ok=True)
+    ensure_state_directory(workspace.state_dir)
+    ensure_state_directory(workspace.lock_file.parent)
     if workspace.cwd_dir == workspace.source_dir:
         workspace.skill_dir.mkdir(parents=True, exist_ok=True)
         return workspace

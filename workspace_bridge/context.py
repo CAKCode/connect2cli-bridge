@@ -4,6 +4,7 @@ import os
 import shutil
 from pathlib import Path
 
+from .atomic_io import ensure_state_directory, state_file_mode
 from .models import DEFAULT_GLOBAL_SKILL_DIR, WorkspaceRef, WorkspaceRuntimeContext
 from .skills import resolve_skill_space
 
@@ -35,11 +36,11 @@ def _copy_child_to_target(source: Path, target: Path, *, replace_existing: bool)
 
 def build_session_codex_home(runtime_root: Path | str, session_id: str, workspace_skill_dir: Path) -> Path:
     runtime_root = Path(runtime_root).expanduser().resolve()
-    session_home = runtime_root / ".bridge-codex-home" / "sessions" / session_id
-    session_home.mkdir(parents=True, exist_ok=True)
-    (session_home / "tmp").mkdir(parents=True, exist_ok=True)
-    skills_root = session_home / "skills"
-    skills_root.mkdir(parents=True, exist_ok=True)
+    codex_home_root = ensure_state_directory(runtime_root / ".bridge-codex-home")
+    sessions_root = ensure_state_directory(codex_home_root / "sessions")
+    session_home = ensure_state_directory(sessions_root / session_id)
+    ensure_state_directory(session_home / "tmp")
+    skills_root = ensure_state_directory(session_home / "skills")
     for child in list(skills_root.iterdir()):
         _remove_existing_path(child)
 
@@ -50,7 +51,9 @@ def build_session_codex_home(runtime_root: Path | str, session_id: str, workspac
                 continue
             if not child.is_file() or child.name not in allowed_root_files:
                 continue
-            shutil.copy2(child, session_home / child.name)
+            target = session_home / child.name
+            shutil.copy2(child, target)
+            os.chmod(target, state_file_mode(session_home))
 
     if DEFAULT_GLOBAL_SKILL_DIR.exists() and DEFAULT_GLOBAL_SKILL_DIR.is_dir():
         for child in DEFAULT_GLOBAL_SKILL_DIR.iterdir():
@@ -82,8 +85,7 @@ def build_runtime_context(
     max_upload_size: int = 100 * 1024 * 1024,
 ) -> WorkspaceRuntimeContext:
     chatfile_root = Path(chatfile_root).expanduser().resolve()
-    chatfile_dir = chatfile_root / session_id
-    chatfile_dir.mkdir(parents=True, exist_ok=True)
+    chatfile_dir = ensure_state_directory(chatfile_root / session_id)
     resolved_workspace_mode = str(workspace_mode or "").strip().lower().replace("_", "-") or "team"
     resolved_cwd_dir = Path(cwd_dir).expanduser().resolve() if cwd_dir is not None else workspace.cwd_dir
     resolved_skill_dir = Path(skill_dir).expanduser().resolve() if skill_dir is not None else workspace.skill_dir

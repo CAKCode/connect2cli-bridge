@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -608,7 +609,7 @@ async def test_execute_and_deliver_message_uses_runtime_thread_state_when_final_
     assert runtime.session_threads[message.chat_key] == "thread-new"
 
 
-async def test_stream_text_message_once_uses_claude_resume_without_local_history_duplication(tmp_path: Path) -> None:
+async def test_stream_text_message_once_uses_claude_resume_without_run_as_identity(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
 
@@ -666,8 +667,8 @@ async def test_stream_text_message_once_uses_claude_resume_without_local_history
         bot,
         agent_backend="claude",
         agent_command="claude --permission-mode bypassPermissions",
-        agent_run_as_user=None,
-        agent_run_as_group=None,
+        agent_run_as_user="nobody",
+        agent_run_as_group="nogroup",
     )
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
     runtime.ws = make_acking_runtime_ws(runtime)
@@ -693,12 +694,13 @@ async def test_stream_text_message_once_uses_claude_resume_without_local_history
     assert session_id.startswith("session-")
     assert reply == "done"
     assert invocations[0][0] == "claude"
+    assert "setpriv" not in invocations[0]
     assert "-p" in invocations[0]
     assert "--resume" in invocations[0]
     assert "550e8400-e29b-41d4-a716-446655440000" in invocations[0]
 
 
-async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_user(tmp_path: Path) -> None:
+async def test_run_text_message_once_ignores_legacy_claude_run_as_runtime(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
 
@@ -733,11 +735,11 @@ async def test_run_text_message_once_prepares_private_runtime_for_claude_run_as_
     invocation = captured["invocation"]
     assert session_id.startswith("session-")
     assert reply == "done"
-    assert invocation.run_as_user == "nobody"
-    assert invocation.run_as_group == "nogroup"
-    assert invocation.env["CLAUDE_CONFIG_DIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
-    assert invocation.env["CODEX_HOME"].startswith(str((tmp_path / "claude-runtime").resolve()))
-    assert invocation.env["TMPDIR"].startswith(str((tmp_path / "claude-runtime").resolve()))
+    assert invocation.run_as_user is None
+    assert invocation.run_as_group is None
+    assert not (tmp_path / "claude-runtime").exists()
+    assert invocation.env["CODEX_HOME"] == launch.env["CODEX_HOME"]
+    assert invocation.env["TMPDIR"] == launch.env["TMPDIR"]
     assert invocation.cwd == launch.cwd
 
 
@@ -2669,6 +2671,95 @@ async def test_run_text_message_once_releases_session_lock_after_completion(tmp_
     )
 
     assert execution_runtime._SESSION_RUN_LOCKS == {}
+    assert execution_runtime._SESSION_ENTRY_LOCKS == {}
+    assert execution_runtime._SESSION_ENTRY_LOCK_USERS == {}
+
+
+def test_session_run_file_lock_is_private_and_cross_handle_exclusive(tmp_path: Path) -> None:
+    session_id = "session-lock-test"
+    first = execution_module._try_acquire_session_run_file_lock(tmp_path, session_id)
+    assert first is not None
+    try:
+        assert execution_module._try_acquire_session_run_file_lock(tmp_path, session_id) is None
+        lock_path = execution_module._session_run_lock_file(tmp_path, session_id)
+        assert lock_path.stat().st_mode & 0o777 == 0o600
+        assert lock_path.parent.stat().st_mode & 0o777 == 0o700
+    finally:
+        execution_module._release_session_run_file_lock(first)
+
+    second = execution_module._try_acquire_session_run_file_lock(tmp_path, session_id)
+    assert second is not None
+    execution_module._release_session_run_file_lock(second)
+
+
+@pytest.mark.asyncio
+async def test_same_session_history_is_serialized_before_second_user_append(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record, stable_session_id
+
+    bot = build_bot_from_app_config(config)
+    first_message = WeComTextMessage(req_id="req-1", chat_key="single:alice", content="one", raw_payload={})
+    second_message = WeComTextMessage(req_id="req-2", chat_key="single:alice", content="two", raw_payload={})
+    first_started = threading.Event()
+    release_first = threading.Event()
+    invocation_count = 0
+    invocation_count_lock = threading.Lock()
+    original_run_invocation = execution_module.run_invocation
+
+    def controlled_run(_invocation):
+        nonlocal invocation_count
+        with invocation_count_lock:
+            invocation_count += 1
+            current = invocation_count
+        if current == 1:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        return SimpleNamespace(returncode=0, stdout=f"reply-{current}\n", stderr="")
+
+    execution_module.run_invocation = controlled_run
+    first_task = None
+    second_task = None
+    try:
+        first_task = asyncio.create_task(run_text_message_once(config, bot, first_message))
+        for _ in range(500):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_started.is_set()
+        second_task = asyncio.create_task(run_text_message_once(config, bot, second_message))
+        await asyncio.sleep(0.1)
+
+        session_id = stable_session_id(
+            bot.bot_id,
+            first_message.chat_key,
+            bot.source.source_dir,
+            bot.workspace_namespace,
+            bot.workspace_mode,
+        )
+        during_first = load_session_record(bot.runtime_root, session_id)
+        assert during_first is not None
+        assert [(item["role"], item["text"]) for item in during_first.recent_chat] == [("user", "one")]
+
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+    finally:
+        release_first.set()
+        pending = [task for task in (first_task, second_task) if task is not None and not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        execution_module.run_invocation = original_run_invocation
+
+    stored = load_session_record(bot.runtime_root, session_id)
+    assert stored is not None
+    assert [(item["role"], item["text"]) for item in stored.recent_chat] == [
+        ("user", "one"),
+        ("bot", "reply-1"),
+        ("user", "two"),
+        ("bot", "reply-2"),
+    ]
+    assert execution_module._SESSION_ENTRY_LOCKS == {}
+    assert execution_module._SESSION_ENTRY_LOCK_USERS == {}
 
 
 async def test_run_text_message_once_releases_session_lock_after_failure(tmp_path: Path) -> None:
@@ -2706,3 +2797,5 @@ async def test_run_text_message_once_releases_session_lock_after_failure(tmp_pat
         execution_module.run_blocking = original_run_blocking
 
     assert execution_runtime._SESSION_RUN_LOCKS == {}
+    assert execution_runtime._SESSION_ENTRY_LOCKS == {}
+    assert execution_runtime._SESSION_ENTRY_LOCK_USERS == {}

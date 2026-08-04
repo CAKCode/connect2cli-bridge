@@ -1,3 +1,10 @@
+"""Compatibility application for direct ``workspace_bridge`` consumers.
+
+The deployed multi-bot service is ``bridge.py``. This module remains available
+for its existing library API and regression coverage, but it is not launched by
+``start.sh``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,9 +17,11 @@ import uuid
 
 from aiohttp import web
 
+from .api_security import authorize_api_access
 from .async_utils import run_blocking
 from .config import AppConfig, build_bot_from_app_config, load_app_config
 from .file_send import create_file_send_request
+from .execution import session_run_guards
 from .layout import build_workspace_ref, parse_chat_key
 from .messaging import get_messaging_provider
 from .models import OutboundMessage, TemplateCardUpdateRequest, WeComBotRuntime
@@ -38,6 +47,28 @@ APP_WECOM_RUNTIME_KEY = web.AppKey("wecom_runtime", object)
 APP_WECOM_TASK_KEY = web.AppKey("wecom_task", object)
 APP_SCHEDULE_TASK_KEY = web.AppKey("schedule_task", object)
 SESSION_HOME_TTL_MS = 30 * 60 * 1000
+
+
+def _api_auth_error(config: AppConfig, message: str, status: int) -> web.Response:
+    headers = {}
+    if config.api_basic_auth:
+        headers["WWW-Authenticate"] = 'Basic realm="WeCom Codex Bridge"'
+    return web.json_response({"ok": False, "error": message}, status=status, headers=headers)
+
+
+@web.middleware
+async def api_access_middleware(request: web.Request, handler) -> web.StreamResponse:
+    if request.path in {"/", "/healthz"} or request.path.startswith("/api/"):
+        config = request.app[APP_CONFIG_KEY]
+        decision = authorize_api_access(
+            request.headers,
+            request.remote,
+            token=config.api_token or "",
+            basic_auth=config.api_basic_auth or "",
+        )
+        if not decision.allowed:
+            return _api_auth_error(config, decision.message, decision.status)
+    return await handler(request)
 
 
 def _clear_deferred_schedule_cache(runtime: WeComBotRuntime, runtime_root, schedule_id: str) -> None:
@@ -229,7 +260,8 @@ async def api_prepare(request) -> web.Response:
     from .prompting import build_prompt
 
     try:
-        launch = await run_blocking(prepare_session_run, bot, chat_key)
+        async with session_run_guards(bot, chat_key):
+            launch = await run_blocking(prepare_session_run, bot, chat_key)
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     prompt = build_prompt(bot, launch, message)
@@ -269,7 +301,8 @@ async def api_send_file(request) -> web.Response:
     # This endpoint performs an immediate WeCom upload/send and returns the
     # final transport result; it is not the queue-based bridge.py endpoint.
     try:
-        launch = await run_blocking(prepare_session_run, bot, chat_key)
+        async with session_run_guards(bot, chat_key):
+            launch = await run_blocking(prepare_session_run, bot, chat_key)
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     try:
@@ -718,7 +751,7 @@ async def api_delete_schedule(request) -> web.Response:
 
 
 def create_app(config: AppConfig) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[api_access_middleware])
     bot = build_bot_from_app_config(config)
     runtime = WeComBotRuntime(config=bot, pending_requests={}, pending_streams={}, pending_finals={})
     _restore_persisted_runtime_state(runtime, config)

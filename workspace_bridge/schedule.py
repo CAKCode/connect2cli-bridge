@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .atomic_io import atomic_write_json, ensure_state_directory
 from .layout import parse_chat_key
 from .models import ScheduleDefinition, ScheduledJob
 
@@ -53,7 +54,7 @@ def _parse_optional_bool(value, *, default: bool) -> bool:
 
 
 def _schedule_root(runtime_root: Path | str) -> Path:
-    return Path(runtime_root).expanduser().resolve() / "schedules"
+    return ensure_state_directory(Path(runtime_root).expanduser().resolve() / "schedules")
 
 
 def _path_component(value: str) -> str:
@@ -61,33 +62,23 @@ def _path_component(value: str) -> str:
 
 
 def schedule_pending_root(runtime_root: Path | str) -> Path:
-    root = _schedule_root(runtime_root) / "pending"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_state_directory(_schedule_root(runtime_root) / "pending")
 
 
 def schedule_processing_root(runtime_root: Path | str) -> Path:
-    root = _schedule_root(runtime_root) / "processing"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_state_directory(_schedule_root(runtime_root) / "processing")
 
 
 def schedule_done_root(runtime_root: Path | str) -> Path:
-    root = _schedule_root(runtime_root) / "done"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_state_directory(_schedule_root(runtime_root) / "done")
 
 
 def schedule_failed_root(runtime_root: Path | str) -> Path:
-    root = _schedule_root(runtime_root) / "failed"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_state_directory(_schedule_root(runtime_root) / "failed")
 
 
 def schedule_definition_root(runtime_root: Path | str) -> Path:
-    root = _schedule_root(runtime_root) / "definitions"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_state_directory(_schedule_root(runtime_root) / "definitions")
 
 
 def schedule_definition_file(runtime_root: Path | str, schedule_id: str) -> Path:
@@ -115,10 +106,7 @@ def scheduled_job_file_name(run_at: int, request_id: str) -> str:
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, payload)
 
 
 def _read_json(path: Path) -> dict | None:

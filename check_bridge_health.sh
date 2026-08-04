@@ -10,9 +10,12 @@ load_bridge_runtime_env "$SCRIPT_DIR" || exit 1
 : "${HEALTH_TIMEOUT_SEC:=10}"
 SCHEDULE_ROOT="${BRIDGE_SHARED_RUNTIME_ROOT:-$SCRIPT_DIR}/.scheduled-messages"
 
-python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "$BRIDGE_BASIC_AUTH" "$BRIDGE_TOKEN" "$SCHEDULE_ROOT" <<'PY'
+BRIDGE_HEALTHCHECK_BASIC_AUTH="${BRIDGE_BASIC_AUTH:-}" \
+BRIDGE_HEALTHCHECK_TOKEN="${BRIDGE_TOKEN:-}" \
+python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "$SCHEDULE_ROOT" <<'PY'
 import base64
 import json
+import os
 import pathlib
 import sys
 import time
@@ -21,9 +24,9 @@ import urllib.request
 host = sys.argv[1]
 port = int(sys.argv[2])
 timeout_sec = int(sys.argv[3])
-basic_auth = sys.argv[4]
-token = sys.argv[5]
-schedule_root = pathlib.Path(sys.argv[6]).expanduser()
+schedule_root = pathlib.Path(sys.argv[4]).expanduser()
+basic_auth = os.environ.get("BRIDGE_HEALTHCHECK_BASIC_AUTH", "")
+token = os.environ.get("BRIDGE_HEALTHCHECK_TOKEN", "")
 
 def api_base():
     base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host

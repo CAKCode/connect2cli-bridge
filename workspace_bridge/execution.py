@@ -1,25 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
 import time
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from dataclasses import replace
+from typing import AsyncIterator, TextIO
 
 from .agent_backends import extract_agent_reply, extract_agent_thread_id
-from .agent_runtime import (
-    apply_claude_runtime_env,
-    normalize_optional_text,
-    prepare_claude_runtime_root,
-    resolve_posix_identity,
-)
+from .atomic_io import atomic_write_text, ensure_state_directory, open_state_lock_file
 from .async_utils import run_blocking
 from .prompting import build_prompt
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
-from .runtime import append_session_record_chat_message, prepare_session_run, update_session_record
+from .runtime import append_session_record_chat_message, prepare_session_run, stable_session_id, update_session_record
 from .schedule import (
     advance_schedule_definition_after_success,
     schedule_done_marker_file,
@@ -35,6 +33,8 @@ from .wecom_upload import require_ack_ok, send_ws_payload_with_ack, ws_send_json
 
 STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_ENTRY_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_ENTRY_LOCK_USERS: dict[str, int] = {}
 PROACTIVE_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("PROACTIVE_SEND_ACK_TIMEOUT_SEC", "10")))
 REPLY_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("REPLY_SEND_ACK_TIMEOUT_SEC", "10")))
 _RESUME_STATE_MISSING_RE = re.compile(
@@ -86,10 +86,7 @@ def _touch_session_failure(runtime_root: Path | str, session_id: str) -> None:
 
 
 def _write_marker_file(path: Path, payload: str = "{}") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, payload)
 
 
 def _resume_fallback_error_text(stderr_text: str, prompt_error: Exception | None = None) -> str:
@@ -136,23 +133,6 @@ def _build_compat_history_prompt(bot_or_runtime, launch, message, prompt: str) -
 
 def _backend_supports_native_resume(backend: str) -> bool:
     return backend in {"codex", "claude"}
-
-
-def _apply_claude_runtime_override(invocation, runtime_root: Path, session_id: str):
-    run_as_user = normalize_optional_text(invocation.run_as_user)
-    if not run_as_user:
-        return invocation
-    run_as_group = normalize_optional_text(invocation.run_as_group)
-    uid, gid = resolve_posix_identity(run_as_user, run_as_group)
-    layout = prepare_claude_runtime_root(
-        runtime_root,
-        session_id=session_id,
-        source_claude_root=Path("/root/.claude"),
-        uid=uid,
-        gid=gid,
-    )
-    env = apply_claude_runtime_env(invocation.env, layout)
-    return replace(invocation, env=env)
 
 
 def _read_backend_reply(backend: str, output_file: Path, stdout_text: str, stderr_text: str) -> str:
@@ -253,6 +233,91 @@ def _release_session_run_lock(session_id: str, lock: asyncio.Lock) -> None:
     current = _SESSION_RUN_LOCKS.get(session_id)
     if current is lock and not lock.locked():
         _SESSION_RUN_LOCKS.pop(session_id, None)
+
+
+def _session_run_id(bot_config, chat_key: str) -> str:
+    return stable_session_id(
+        bot_config.bot_id,
+        chat_key,
+        bot_config.source.source_dir,
+        bot_config.workspace_namespace,
+        bot_config.workspace_mode,
+    )
+
+
+def _session_run_lock_file(runtime_root: Path | str, session_id: str) -> Path:
+    return Path(runtime_root).expanduser().resolve() / "session-run-locks" / f"{session_id}.lock"
+
+
+def _try_acquire_session_run_file_lock(runtime_root: Path | str, session_id: str) -> TextIO | None:
+    lock_path = _session_run_lock_file(runtime_root, session_id)
+    ensure_state_directory(lock_path.parent)
+    handle = open_state_lock_file(lock_path)
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return None
+        return handle
+    except Exception:
+        handle.close()
+        raise
+
+
+def _release_session_run_file_lock(handle: TextIO) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+@asynccontextmanager
+async def _session_run_guard_for_id(bot_config, session_id: str) -> AsyncIterator[str]:
+    entry_lock = _SESSION_ENTRY_LOCKS.get(session_id)
+    if entry_lock is None:
+        entry_lock = asyncio.Lock()
+        _SESSION_ENTRY_LOCKS[session_id] = entry_lock
+    _SESSION_ENTRY_LOCK_USERS[session_id] = _SESSION_ENTRY_LOCK_USERS.get(session_id, 0) + 1
+    try:
+        async with entry_lock:
+            file_lock = None
+            while file_lock is None:
+                file_lock = await run_blocking(
+                    _try_acquire_session_run_file_lock,
+                    bot_config.runtime_root,
+                    session_id,
+                )
+                if file_lock is None:
+                    await asyncio.sleep(0.05)
+            try:
+                yield session_id
+            finally:
+                _release_session_run_file_lock(file_lock)
+    finally:
+        remaining_users = max(0, _SESSION_ENTRY_LOCK_USERS.get(session_id, 1) - 1)
+        if remaining_users:
+            _SESSION_ENTRY_LOCK_USERS[session_id] = remaining_users
+        else:
+            _SESSION_ENTRY_LOCK_USERS.pop(session_id, None)
+        current = _SESSION_ENTRY_LOCKS.get(session_id)
+        if current is entry_lock and remaining_users == 0:
+            _SESSION_ENTRY_LOCKS.pop(session_id, None)
+
+
+@asynccontextmanager
+async def _session_run_guard(bot_config, chat_key: str) -> AsyncIterator[str]:
+    async with _session_run_guard_for_id(bot_config, _session_run_id(bot_config, chat_key)) as session_id:
+        yield session_id
+
+
+@asynccontextmanager
+async def session_run_guards(bot_config, *chat_keys: str) -> AsyncIterator[tuple[str, ...]]:
+    session_ids = tuple(sorted({_session_run_id(bot_config, chat_key) for chat_key in chat_keys}))
+    async with AsyncExitStack() as stack:
+        for session_id in session_ids:
+            await stack.enter_async_context(_session_run_guard_for_id(bot_config, session_id))
+        yield session_ids
 
 
 def _resolve_launch_thread_id(bot_or_runtime, launch, message) -> str | None:
@@ -382,7 +447,7 @@ async def flush_cached_runtime_payloads(runtime) -> None:
         runtime.pending_payload_flush_in_progress = False
 
 
-async def run_text_message_once(config, bot, message, **kwargs):
+async def _run_text_message_once_guarded(config, bot, message, **kwargs):
     launch = await run_blocking(prepare_session_run, bot, message.chat_key)
     launch = _append_launch_session_chat_message(
         bot.runtime_root,
@@ -392,7 +457,7 @@ async def run_text_message_once(config, bot, message, **kwargs):
     backend = _agent_backend(bot)
     prompt = build_prompt(bot, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_directory(output_file.parent)
     session_lock = _get_session_run_lock(launch.session.session_id)
     try:
         async with session_lock:
@@ -417,11 +482,6 @@ async def run_text_message_once(config, bot, message, **kwargs):
                     resume=attempted_resume,
                     resume_thread_id=launch_thread_id if attempted_resume else None,
                 )
-                if backend == "claude":
-                    runtime_root_override = Path(
-                        launch.env.get("WECOM_BRIDGE_AGENT_RUNTIME_ROOT") or (bot.runtime_root / "claude-runtime")
-                    ).expanduser().resolve()
-                    invocation = _apply_claude_runtime_override(invocation, runtime_root_override, launch.session.session_id)
                 result = await run_blocking(run_invocation, invocation)
                 stdout_text = str(result.stdout or "")
                 stderr_text = str(result.stderr or "")
@@ -479,7 +539,12 @@ async def run_text_message_once(config, bot, message, **kwargs):
     return launch.session.session_id, reply
 
 
-async def stream_text_message_once(config, runtime, message, **kwargs):
+async def run_text_message_once(config, bot, message, **kwargs):
+    async with _session_run_guard(bot, message.chat_key):
+        return await _run_text_message_once_guarded(config, bot, message, **kwargs)
+
+
+async def _stream_text_message_once_guarded(config, runtime, message, **kwargs):
     launch = await run_blocking(prepare_session_run, runtime.config, message.chat_key)
     launch = _append_launch_session_chat_message(
         runtime.config.runtime_root,
@@ -489,7 +554,7 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
     backend = _agent_backend(runtime)
     prompt = build_prompt(runtime.config, launch, message.content)
     output_file = Path(config.codex_output_root) / f"{launch.session.session_id}.jsonl"
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_directory(output_file.parent)
     session_lock = _get_session_run_lock(launch.session.session_id)
     try:
         async with session_lock:
@@ -513,11 +578,6 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
                     resume=attempted_resume,
                     resume_thread_id=launch_thread_id if attempted_resume else None,
                 )
-                if backend == "claude":
-                    runtime_root_override = Path(
-                        launch.env.get("WECOM_BRIDGE_AGENT_RUNTIME_ROOT") or (runtime.config.runtime_root / "claude-runtime")
-                    ).expanduser().resolve()
-                    invocation = _apply_claude_runtime_override(invocation, runtime_root_override, launch.session.session_id)
                 process = await asyncio.create_subprocess_exec(
                     *invocation.argv,
                     cwd=invocation.cwd,
@@ -639,6 +699,11 @@ async def stream_text_message_once(config, runtime, message, **kwargs):
         runtime.active_session_ids.discard(launch.session.session_id)
         _release_session_run_lock(launch.session.session_id, session_lock)
     return launch.session.session_id, reply
+
+
+async def stream_text_message_once(config, runtime, message, **kwargs):
+    async with _session_run_guard(runtime.config, message.chat_key):
+        return await _stream_text_message_once_guarded(config, runtime, message, **kwargs)
 
 
 async def execute_and_deliver_message(config, runtime, message, **kwargs):

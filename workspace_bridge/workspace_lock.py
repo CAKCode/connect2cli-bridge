@@ -4,15 +4,14 @@ import fcntl
 from contextlib import contextmanager
 from typing import Iterator
 
+from .atomic_io import ensure_state_directory, open_state_lock_file
 from .models import WorkspaceRef
 
 
 @contextmanager
 def workspace_lock(workspace: WorkspaceRef) -> Iterator[None]:
-    workspace.lock_file.parent.mkdir(parents=True, exist_ok=True)
-    if workspace.lock_file.is_symlink():
-        workspace.lock_file.unlink(missing_ok=True)
-    with open(workspace.lock_file, "a+", encoding="utf-8") as handle:
+    ensure_state_directory(workspace.lock_file.parent)
+    with open_state_lock_file(workspace.lock_file) as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield

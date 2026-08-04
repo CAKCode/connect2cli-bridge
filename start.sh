@@ -8,12 +8,49 @@ cd "$SCRIPT_DIR"
 load_bridge_runtime_env "$SCRIPT_DIR" || exit 1
 export_bridge_runtime_env
 
-PID_FILE="$SCRIPT_DIR/.bridge.pid"
-GUARD_PID_FILE="$SCRIPT_DIR/.bridge.guard.pid"
-LOG_FILE="$SCRIPT_DIR/bridge.log"
-PREV_LOG_FILE="$SCRIPT_DIR/bridge.log.prev"
-SHUTDOWN_REASON_FILE="$SCRIPT_DIR/.bridge.shutdown-reason.json"
+CONTROL_STATE_ROOT="$(prepare_bridge_state_root "$SCRIPT_DIR" "${BRIDGE_CONTROL_ROOT:-}" "BRIDGE_CONTROL_ROOT")" || exit 1
+BRIDGE_CONTROL_ROOT="$CONTROL_STATE_ROOT"
+export BRIDGE_CONTROL_ROOT
+
+# Linux flock locks follow the shared open-file description, so the lock set by
+# this short Python child remains held by this shell's fd 9 until start.sh exits.
+if ! exec 9< "$CONTROL_STATE_ROOT"; then
+  echo "start failed: cannot open BRIDGE_CONTROL_ROOT for locking: $CONTROL_STATE_ROOT" >&2
+  exit 1
+fi
+if ! python3 - 9 <<'PY'
+import fcntl
+import sys
+
+fd = int(sys.argv[1])
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError):
+    raise SystemExit(1)
+PY
+then
+  echo "start failed: another start.sh is already running for BRIDGE_CONTROL_ROOT=$CONTROL_STATE_ROOT" >&2
+  exit 1
+fi
+
+CONTROL_STATE_IS_CUSTOM="false"
+if [ "$CONTROL_STATE_ROOT" != "$SCRIPT_DIR" ]; then
+  CONTROL_STATE_IS_CUSTOM="true"
+fi
+ALLOW_LEGACY_PROCESS_MATCH="false"
+if [ "$CONTROL_STATE_IS_CUSTOM" = "false" ]; then
+  ALLOW_LEGACY_PROCESS_MATCH="true"
+fi
+
+PID_FILE="$CONTROL_STATE_ROOT/.bridge.pid"
+GUARD_PID_FILE="$CONTROL_STATE_ROOT/.bridge.guard.pid"
+LOG_FILE="$CONTROL_STATE_ROOT/bridge.log"
+PREV_LOG_FILE="$CONTROL_STATE_ROOT/bridge.log.prev"
+INSTANCE_STATE_ROOT="$(prepare_bridge_state_root "$SCRIPT_DIR" "${BRIDGE_RUNTIME_ROOT:-}" "BRIDGE_RUNTIME_ROOT")" || exit 1
+SHUTDOWN_REASON_FILE="$INSTANCE_STATE_ROOT/.bridge.shutdown-reason.json"
 STOPPED_PIDS=""
+LAUNCHED_PID=""
+LAUNCHED_KIND=""
 
 : "${BRIDGE_WATCHDOG_ENABLED:=true}"
 
@@ -43,8 +80,8 @@ wait_for_pid_exit() {
 wait_for_started_bridge_pid() {
   tries="${1:-50}"
   while [ "$tries" -gt 0 ]; do
-    target_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
+    target_pid=$(read_bridge_pid_file "$PID_FILE" 2>/dev/null || true)
+    if bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" "$ALLOW_LEGACY_PROCESS_MATCH" bridge "$target_pid"; then
       printf '%s\n' "$target_pid"
       return 0
     fi
@@ -88,13 +125,28 @@ wait_for_port_release() {
 
 stop_pid_from_file() {
   target_file="$1"
-  stop_reason="$2"
+  target_kind="$2"
+  stop_reason="$3"
   if [ ! -f "$target_file" ]; then
     return
   fi
-  target_pid=$(cat "$target_file" 2>/dev/null || true)
-  if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
-    printf '{"reason":"%s","at":%s}\n' "$stop_reason" "$(date +%s%3N)" > "$SHUTDOWN_REASON_FILE"
+  target_pid=$(read_bridge_pid_file "$target_file" 2>/dev/null || true)
+  if [ -z "$target_pid" ]; then
+    echo "ignoring invalid PID file: $target_file" >&2
+    rm -f "$target_file"
+    return
+  fi
+  if kill -0 "$target_pid" 2>/dev/null; then
+    if ! bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" "$ALLOW_LEGACY_PROCESS_MATCH" "$target_kind" "$target_pid"; then
+      echo "refusing to stop unrelated process pid=$target_pid from $target_file" >&2
+      rm -f "$target_file"
+      return
+    fi
+    if [ "$target_kind" = "bridge" ]; then
+      write_bridge_shutdown_reason_file "$SHUTDOWN_REASON_FILE" "$stop_reason" || {
+        echo "failed to write shutdown reason: $SHUTDOWN_REASON_FILE" >&2
+      }
+    fi
     kill "$target_pid" 2>/dev/null || true
     STOPPED_PIDS="$STOPPED_PIDS $target_pid"
   fi
@@ -102,65 +154,41 @@ stop_pid_from_file() {
 }
 
 stop_existing_watchdogs() {
+  if is_truthy "$CONTROL_STATE_IS_CUSTOM"; then
+    return
+  fi
   if ! command -v pgrep >/dev/null 2>&1; then
     return
   fi
   pgrep -f 'bridge_watchdog\.sh' 2>/dev/null | while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" != "$$" ] || continue
-    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
-    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-
-    case "$cmdline" in
-      *"$SCRIPT_DIR/bridge_watchdog.sh"*)
-        kill "$pid" 2>/dev/null || true
-        echo "$pid"
-        continue
-        ;;
-    esac
-
-    if [ "$cwd" = "$SCRIPT_DIR" ]; then
-      case "$cmdline" in
-        *"bridge_watchdog.sh"*)
-          kill "$pid" 2>/dev/null || true
-          echo "$pid"
-          ;;
-      esac
+    if bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" true watchdog "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      echo "$pid"
     fi
   done
 }
 
 stop_existing_bridges() {
+  if is_truthy "$CONTROL_STATE_IS_CUSTOM"; then
+    return
+  fi
   if ! command -v pgrep >/dev/null 2>&1; then
     return
   fi
-  pgrep -f 'python3( .*)?bridge\.py' 2>/dev/null | while IFS= read -r pid; do
+  pgrep -f 'bridge\.py' 2>/dev/null | while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" != "$$" ] || continue
-    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
-    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-
-    case "$cmdline" in
-      *"$SCRIPT_DIR/bridge.py"*)
-        kill "$pid" 2>/dev/null || true
-        echo "$pid"
-        continue
-        ;;
-    esac
-
-    if [ "$cwd" = "$SCRIPT_DIR" ]; then
-      case "$cmdline" in
-        *"python3 bridge.py"*)
-          kill "$pid" 2>/dev/null || true
-          echo "$pid"
-          ;;
-      esac
+    if bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" true bridge "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      echo "$pid"
     fi
   done
 }
 
-stop_pid_from_file "$GUARD_PID_FILE" "start.sh_restart"
-stop_pid_from_file "$PID_FILE" "start.sh_restart"
+stop_pid_from_file "$GUARD_PID_FILE" watchdog "start.sh_restart"
+stop_pid_from_file "$PID_FILE" bridge "start.sh_restart"
 
 MORE_GUARD_PIDS=$(stop_existing_watchdogs)
 STOPPED_PIDS="$STOPPED_PIDS $MORE_GUARD_PIDS"
@@ -172,6 +200,14 @@ for pid in $STOPPED_PIDS; do
   wait_for_pid_exit "$pid" 50 || true
 done
 
+if [ -L "$LOG_FILE" ] || { [ -e "$LOG_FILE" ] && [ ! -f "$LOG_FILE" ]; }; then
+  echo "start failed: bridge log is not a regular file: $LOG_FILE" >&2
+  exit 1
+fi
+if [ -L "$PREV_LOG_FILE" ] || { [ -e "$PREV_LOG_FILE" ] && [ ! -f "$PREV_LOG_FILE" ]; }; then
+  echo "start failed: previous bridge log is not a regular file: $PREV_LOG_FILE" >&2
+  exit 1
+fi
 if [ -f "$LOG_FILE" ]; then
   mv "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || cp "$LOG_FILE" "$PREV_LOG_FILE" 2>/dev/null || true
 fi
@@ -181,33 +217,58 @@ wait_for_port_release 50 || {
   exit 1
 }
 
-: > "$LOG_FILE"
+if ! (umask 077 && : > "$LOG_FILE"); then
+  echo "start failed: cannot create bridge log: $LOG_FILE" >&2
+  exit 1
+fi
+chmod 600 "$LOG_FILE" 2>/dev/null || true
 
 if is_truthy "$BRIDGE_WATCHDOG_ENABLED"; then
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null >> "$LOG_FILE" 2>&1 &
+    nohup setsid sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null 9<&- >> "$LOG_FILE" 2>&1 &
   else
-    nohup sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null >> "$LOG_FILE" 2>&1 &
+    nohup sh "$SCRIPT_DIR/bridge_watchdog.sh" </dev/null 9<&- >> "$LOG_FILE" 2>&1 &
   fi
-  echo $! > "$GUARD_PID_FILE"
+  LAUNCHED_PID=$!
+  LAUNCHED_KIND="watchdog"
+  if ! write_bridge_pid_file "$GUARD_PID_FILE" "$LAUNCHED_PID"; then
+    kill "$LAUNCHED_PID" 2>/dev/null || true
+    wait_for_pid_exit "$LAUNCHED_PID" 50 || true
+    echo "start failed: cannot write watchdog PID file: $GUARD_PID_FILE" >&2
+    exit 1
+  fi
 else
   rm -f "$GUARD_PID_FILE"
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+    nohup setsid "$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py" </dev/null 9<&- > "$LOG_FILE" 2>&1 &
   else
-    nohup python3 "$SCRIPT_DIR/bridge.py" </dev/null > "$LOG_FILE" 2>&1 &
+    nohup "$BRIDGE_PYTHON" "$SCRIPT_DIR/bridge.py" </dev/null 9<&- > "$LOG_FILE" 2>&1 &
   fi
-  echo $! > "$PID_FILE"
+  LAUNCHED_PID=$!
+  LAUNCHED_KIND="bridge"
+  if ! write_bridge_pid_file "$PID_FILE" "$LAUNCHED_PID"; then
+    kill "$LAUNCHED_PID" 2>/dev/null || true
+    wait_for_pid_exit "$LAUNCHED_PID" 50 || true
+    echo "start failed: cannot write bridge PID file: $PID_FILE" >&2
+    exit 1
+  fi
 fi
 
 sleep 2
 PID=$(wait_for_started_bridge_pid 50 || true)
-GUARD_PID=$(cat "$GUARD_PID_FILE" 2>/dev/null || true)
+GUARD_PID=$(read_bridge_pid_file "$GUARD_PID_FILE" 2>/dev/null || true)
 API_BASE=$(python3 "$SCRIPT_DIR/bridge_runtime_config.py" 2>/dev/null || printf 'http://%s:%s' "$HOST" "$PORT")
 
-if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+STARTED_PROCESSES_VALID="false"
+if bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" "$ALLOW_LEGACY_PROCESS_MATCH" bridge "$PID"; then
+  if ! is_truthy "$BRIDGE_WATCHDOG_ENABLED" || bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" "$ALLOW_LEGACY_PROCESS_MATCH" watchdog "$GUARD_PID"; then
+    STARTED_PROCESSES_VALID="true"
+  fi
+fi
+
+if is_truthy "$STARTED_PROCESSES_VALID"; then
   echo "started (PID: $PID)"
-  if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then
+  if is_truthy "$BRIDGE_WATCHDOG_ENABLED"; then
     echo "watchdog: $GUARD_PID"
   fi
   echo "api: ${API_BASE}"
@@ -223,10 +284,16 @@ if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
   tail -5 "$LOG_FILE"
 else
   echo "start failed"
-  if is_truthy "$BRIDGE_WATCHDOG_ENABLED" && [ -n "$GUARD_PID" ] && kill -0 "$GUARD_PID" 2>/dev/null; then
-    kill "$GUARD_PID" 2>/dev/null || true
-    rm -f "$GUARD_PID_FILE"
+  if [ -n "$LAUNCHED_PID" ] && bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" false "$LAUNCHED_KIND" "$LAUNCHED_PID"; then
+    kill "$LAUNCHED_PID" 2>/dev/null || true
+    wait_for_pid_exit "$LAUNCHED_PID" 50 || true
   fi
+  FAILED_BRIDGE_PID=$(read_bridge_pid_file "$PID_FILE" 2>/dev/null || true)
+  if bridge_pid_matches_instance_process "$SCRIPT_DIR" "$CONTROL_STATE_ROOT" false bridge "$FAILED_BRIDGE_PID"; then
+    kill "$FAILED_BRIDGE_PID" 2>/dev/null || true
+    wait_for_pid_exit "$FAILED_BRIDGE_PID" 50 || true
+  fi
+  rm -f "$GUARD_PID_FILE" "$PID_FILE"
   cat "$LOG_FILE"
   exit 1
 fi

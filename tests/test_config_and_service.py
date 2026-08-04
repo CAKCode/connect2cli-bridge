@@ -1,13 +1,15 @@
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 import json
+from types import SimpleNamespace
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 import pytest
 
 from workspace_bridge.config import build_bot_from_app_config, load_app_config, read_env_file
-from workspace_bridge.service import APP_WECOM_RUNTIME_KEY, create_app, load_app
+from workspace_bridge.service import APP_WECOM_RUNTIME_KEY, api_access_middleware, create_app, load_app
 
 
 def write_secret(path: Path, value: str) -> None:
@@ -37,6 +39,71 @@ def test_load_app_config_reads_secret_file_and_paths(tmp_path: Path) -> None:
     assert config.bot_id == "bot-1"
     assert config.bot_secret == "secret-value"
     assert config.source_dir == source_dir.resolve()
+
+
+def test_load_app_config_rejects_non_loopback_bind_without_api_auth(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+
+    with pytest.raises(ValueError, match="non-loopback BRIDGE_BIND requires"):
+        load_app_config(
+            {
+                "BRIDGE_BIND": "0.0.0.0:9499",
+                "WECOM_BOT_ID": "bot-1",
+                "WECOM_BOT_SECRET_FILE": str(secret_file),
+                "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            }
+        )
+
+
+def test_load_app_config_accepts_non_loopback_bind_with_api_auth(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+
+    config = load_app_config(
+        {
+            "BRIDGE_BIND": "0.0.0.0:9499",
+            "BRIDGE_TOKEN": "api-token",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+        }
+    )
+
+    assert config.api_token == "api-token"
+    assert config.api_basic_auth is None
+
+
+async def test_compatibility_service_protects_healthz_but_keeps_livez_public(tmp_path: Path) -> None:
+    secret_file = tmp_path / ".secrets" / "bot.secret"
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    write_secret(secret_file, "secret-value\n")
+    config = load_app_config(
+        {
+            "BRIDGE_TOKEN": "api-token",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+        }
+    )
+    app = create_app(config)
+    expected = object()
+
+    async def handler(_request):
+        return expected
+
+    denied_request = SimpleNamespace(path="/healthz", headers={}, remote="203.0.113.1", app=app)
+    denied = await api_access_middleware(denied_request, handler)
+    livez_request = SimpleNamespace(path="/livez", headers={}, remote="203.0.113.1", app=app)
+    livez = await api_access_middleware(livez_request, handler)
+
+    assert denied.status == 401
+    assert livez is expected
 
 
 def test_load_app_config_rejects_invalid_bind_port_range(tmp_path: Path) -> None:
@@ -274,7 +341,7 @@ def test_load_app_config_rejects_non_file_secret_path(tmp_path: Path) -> None:
         )
 
 
-def test_load_app_config_reads_agent_run_as_settings(tmp_path: Path) -> None:
+def test_load_app_config_ignores_legacy_agent_run_as_settings(tmp_path: Path) -> None:
     secret_file = tmp_path / ".secrets" / "bot.secret"
     source_dir = tmp_path / "repo"
     source_dir.mkdir()
@@ -293,9 +360,9 @@ def test_load_app_config_reads_agent_run_as_settings(tmp_path: Path) -> None:
         }
     )
 
-    assert config.agent_run_as_user == "nobody"
-    assert config.agent_run_as_group == "nogroup"
-    assert config.agent_runtime_root == (tmp_path / "claude-runtime").resolve()
+    assert config.agent_run_as_user is None
+    assert config.agent_run_as_group is None
+    assert config.agent_runtime_root is None
 
 
 def test_load_app_config_treats_null_agent_runtime_root_as_unset(tmp_path: Path) -> None:
@@ -381,7 +448,7 @@ def test_load_app_config_treats_null_agent_backend_as_default_codex(tmp_path: Pa
     assert config.workspace_mode == ""
 
 
-def test_load_app_config_rejects_non_directory_agent_runtime_root(tmp_path: Path) -> None:
+def test_load_app_config_ignores_non_directory_legacy_agent_runtime_root(tmp_path: Path) -> None:
     secret_file = tmp_path / ".secrets" / "bot.secret"
     source_dir = tmp_path / "repo"
     agent_runtime_file = tmp_path / "claude-runtime.txt"
@@ -389,17 +456,18 @@ def test_load_app_config_rejects_non_directory_agent_runtime_root(tmp_path: Path
     agent_runtime_file.write_text("not a dir", encoding="utf-8")
     write_secret(secret_file, "secret-value\n")
 
-    with pytest.raises(ValueError, match=f"agent runtime root is not a directory: {agent_runtime_file.resolve()}"):
-        load_app_config(
-            {
-                "RUNTIME_ROOT": str(tmp_path / "runtime"),
-                "WECOM_BOT_NAME": "default",
-                "WECOM_BOT_ID": "bot-1",
-                "WECOM_BOT_SECRET_FILE": str(secret_file),
-                "WECOM_BOT_SOURCE_DIR": str(source_dir),
-                "WECOM_AGENT_RUNTIME_ROOT": str(agent_runtime_file),
-            }
-        )
+    config = load_app_config(
+        {
+            "RUNTIME_ROOT": str(tmp_path / "runtime"),
+            "WECOM_BOT_NAME": "default",
+            "WECOM_BOT_ID": "bot-1",
+            "WECOM_BOT_SECRET_FILE": str(secret_file),
+            "WECOM_BOT_SOURCE_DIR": str(source_dir),
+            "WECOM_AGENT_RUNTIME_ROOT": str(agent_runtime_file),
+        }
+    )
+
+    assert config.agent_runtime_root is None
 
 
 def test_load_app_config_rejects_file_send_root_that_is_not_directory(tmp_path: Path) -> None:
@@ -668,12 +736,23 @@ async def test_service_prepare_uses_thread_offload_for_prepare_session_run(tmp_p
     app = create_app(config)
     from workspace_bridge import service as service_module
     calls = []
+    guard_events = []
 
     async def fake_run_blocking(func, *args, **kwargs):
         calls.append(func.__name__)
         return func(*args, **kwargs)
 
     monkeypatch.setattr(service_module, "run_blocking", fake_run_blocking)
+
+    @asynccontextmanager
+    async def fake_session_run_guards(bot, *chat_keys):
+        guard_events.append(("enter", bot.bot_id, chat_keys))
+        try:
+            yield ()
+        finally:
+            guard_events.append(("exit", bot.bot_id, chat_keys))
+
+    monkeypatch.setattr(service_module, "session_run_guards", fake_session_run_guards)
 
     class JsonRequest:
         def __init__(self, app):
@@ -686,6 +765,10 @@ async def test_service_prepare_uses_thread_offload_for_prepare_session_run(tmp_p
     await prepare_match.handler(JsonRequest(app))
 
     assert "prepare_session_run" in calls
+    assert guard_events == [
+        ("enter", "bot-1", ("single:alice",)),
+        ("exit", "bot-1", ("single:alice",)),
+    ]
 
 
 async def test_service_prepare_exposes_group_user_workspace_metadata(tmp_path: Path) -> None:

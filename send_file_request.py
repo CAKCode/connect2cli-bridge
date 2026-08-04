@@ -26,11 +26,6 @@ def load_file_send_request_bot(env_file: Path):
         if item.strip()
     )
     max_upload_size = max(1, int(str(values.get("MAX_UPLOAD_SIZE") or str(100 * 1024 * 1024)).strip()))
-    agent_runtime_root = (
-        Path(str(values.get("WECOM_AGENT_RUNTIME_ROOT") or values.get("AGENT_RUNTIME_ROOT") or "")).expanduser().resolve()
-        if str(values.get("WECOM_AGENT_RUNTIME_ROOT") or values.get("AGENT_RUNTIME_ROOT") or "").strip()
-        else None
-    )
     return build_bot_config(
         bot_id=require_env(values, "WECOM_BOT_ID"),
         bot_name=str(values.get("WECOM_BOT_NAME") or "default").strip() or "default",
@@ -49,9 +44,9 @@ def load_file_send_request_bot(env_file: Path):
         codex_exec_mode=(str(values.get("CODEX_EXEC_MODE") or "host").strip().lower() or "host"),
         agent_backend=(str(values.get("WECOM_AGENT_BACKEND") or values.get("AGENT_BACKEND") or "codex").strip() or "codex"),
         agent_command=(str(values.get("WECOM_AGENT_COMMAND") or values.get("AGENT_COMMAND") or "").strip() or None),
-        agent_run_as_user=(str(values.get("WECOM_AGENT_RUN_AS_USER") or values.get("AGENT_RUN_AS_USER") or "").strip() or None),
-        agent_run_as_group=(str(values.get("WECOM_AGENT_RUN_AS_GROUP") or values.get("AGENT_RUN_AS_GROUP") or "").strip() or None),
-        agent_runtime_root=agent_runtime_root,
+        agent_run_as_user=None,
+        agent_run_as_group=None,
+        agent_runtime_root=None,
         file_send_roots=file_send_roots,
         max_upload_size=max_upload_size,
     )

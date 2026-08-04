@@ -9,6 +9,7 @@ from itertools import count
 from pathlib import Path
 from urllib.parse import quote
 
+from workspace_bridge.atomic_io import atomic_write_json
 from workspace_bridge.layout import parse_chat_key
 
 
@@ -206,12 +207,10 @@ def main() -> None:
             "expiresAt": deadline_ms,
         }
 
-        pending_tmp = pending_root / f"{request_id}.json.tmp"
         pending_file = pending_root / f"{request_id}.json"
         result_file = result_root / f"{request_id}.json"
 
-        pending_tmp.write_text(json.dumps(request, ensure_ascii=False, indent=2), "utf-8")
-        pending_tmp.replace(pending_file)
+        atomic_write_json(pending_file, request)
 
         while time.time() < deadline:
             if result_file.exists():

@@ -132,7 +132,8 @@ Behavior:
 - pure room-shared `workspaceMode=team` sessions run with `roomfile` as `cwd`
 - `workspaceMode=personal` runs directly in bot `workDir`
 - temporary directories are redirected to the current session `chatfile`
-- for `claude` backend with private runtime enabled, only Claude config, temp, and `CODEX_HOME` move to `claude-runtime/sessions/<session-id>/`; the real `cwd` still follows `workspaceMode`
+- both Codex and Claude inherit the Bridge process identity and supplementary groups; neither backend uses an additional OS-user permission switch
+- host mode adds Claude's `--permission-mode bypassPermissions` so non-interactive runs have the same unrestricted execution intent as Codex host mode
 
 Namespace and alias notes:
 
@@ -162,6 +163,9 @@ Implemented:
 - `/bridge-interrupt`
 - `/bridge-reset`
 - `/bridge-resume`
+- `/local-resume`
+- `/local-resume <sessionId>`
+- `/local-detach`
 - `/cwd`
 
 Meaning:
@@ -170,7 +174,13 @@ Meaning:
 - `interrupt` stops the current run without resetting the conversation state
 - `reset` clears the active session context and starts fresh
 - `resume` lists resumable sessions visible to the current chat and binds the selected session thread
+- `local-resume` lists or directly binds a local Codex session whose latest rollout matches the current `cwd`
+- `local-detach` releases that binding and restores the previous Bridge context when available
 - `cwd` is available only in `workspaceMode=personal`; it shows or switches the session cwd within `workDir`, and cannot switch while a run is active
+
+Local resume requires `workspaceMode=personal`, `agentBackend=codex`, and an authorized
+`localResumeOwnerUserId`. Shared group sessions are excluded, and one local Codex thread can have only one
+valid WeCom binding at a time.
 
 API equivalents also exist for interrupt and reset.
 
@@ -212,8 +222,9 @@ Implemented:
 
 Authentication behavior:
 
-- if `BRIDGE_TOKEN` or `BRIDGE_BASIC_AUTH` is configured, `/api/*` requires auth
-- otherwise `/api/*` is restricted to localhost callers
+- if `BRIDGE_TOKEN` or `BRIDGE_BASIC_AUTH` is configured, `/healthz` and `/api/*` require auth
+- otherwise `/healthz` and `/api/*` are restricted to localhost callers
+- `/livez` remains public and exposes only process-level liveness
 
 ### 11. Operations and observability
 
@@ -223,6 +234,9 @@ Implemented:
 - `check_restart_noise.sh`
 - `smoke_bridge.sh`
 - `test.sh`
+- `check_quality.sh`
+- separate production and compatibility runtime gates
+- GitHub Actions CI using the same local gates
 - structured status and runtime logs in `bridge.log`
 
 Operationally important persisted state includes:

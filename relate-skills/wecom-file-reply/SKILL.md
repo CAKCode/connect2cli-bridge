@@ -132,11 +132,11 @@ python3 /home/jenkins/.codex/skills/wecom-file-reply/scripts/share_via_cloudflar
 这个脚本会：
 
 - 把目标文件复制到当前会话的可发送目录
-- 在后台启动本地只读 HTTP 服务
+- 把公网文件复制到独立的私有 staging 目录，本地 HTTP 服务只暴露该目录且禁用目录列表
 - 在后台启动 `cloudflared` 临时隧道
 - 复用已有常驻进程，避免链接刚发出去就失效
 - 返回手机可访问的 `trycloudflare.com` 链接
-- 对同一条分享链接设置默认有效期，过期后自动换新隧道
+- 对同一条分享链接设置默认有效期，到期后由独立 reaper 自动关闭 HTTP 服务和隧道
 
 默认会从当前环境自动读取：
 

@@ -12,17 +12,23 @@ load_bridge_runtime_env "$SCRIPT_DIR" || exit 1
 : "${HEALTH_TIMEOUT_SEC:=10}"
 : "${CHECK_TAIL_LINES:=200}"
 
-LOG_FILE="$SCRIPT_DIR/bridge.log"
-PREV_LOG_FILE="$SCRIPT_DIR/bridge.log.prev"
+CONTROL_STATE_ROOT="$(resolve_bridge_root_path "$SCRIPT_DIR" "${BRIDGE_CONTROL_ROOT:-}")" || exit 1
+BRIDGE_CONTROL_ROOT="$CONTROL_STATE_ROOT"
+export BRIDGE_CONTROL_ROOT
+LOG_FILE="$CONTROL_STATE_ROOT/bridge.log"
+PREV_LOG_FILE="$CONTROL_STATE_ROOT/bridge.log.prev"
 NOISE_REGEX='RuntimeError: Event loop is closed|BaseSubprocessTransport.__del__'
 
 echo "[1/3] Restart bridge"
 sh "$SCRIPT_DIR/start.sh" || exit 1
 
 echo "[2/3] Wait for health check"
-python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" "${BRIDGE_BASIC_AUTH:-}" "${BRIDGE_TOKEN:-}" <<'PY'
+BRIDGE_HEALTHCHECK_BASIC_AUTH="${BRIDGE_BASIC_AUTH:-}" \
+BRIDGE_HEALTHCHECK_TOKEN="${BRIDGE_TOKEN:-}" \
+python3 - "$HOST" "$PORT" "$HEALTH_TIMEOUT_SEC" <<'PY'
 import base64
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -30,8 +36,8 @@ import urllib.request
 host = sys.argv[1]
 port = int(sys.argv[2])
 timeout_sec = int(sys.argv[3])
-basic_auth = sys.argv[4]
-token = sys.argv[5]
+basic_auth = os.environ.get("BRIDGE_HEALTHCHECK_BASIC_AUTH", "")
+token = os.environ.get("BRIDGE_HEALTHCHECK_TOKEN", "")
 base_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
 url = f"http://{base_host}:{port}/healthz"
 deadline = time.time() + timeout_sec
