@@ -3407,7 +3407,10 @@ def mark_reply_proactive(sess: SessionState, req_id: Optional[str]) -> None:
 
 
 def build_reply_window_expired_notice() -> str:
-    return "流式回复窗口即将到期，任务仍在后台运行，后续会主动发送新的进展和最终结果。"
+    return (
+        "流式回复窗口即将到期，任务仍在后台运行，"
+        f"后续每 {PROACTIVE_STATUS_INTERVAL_SEC} 秒主动发送运行状态，完成后发送最终结果。"
+    )
 
 
 def build_queued_proactive_notice(position: int) -> str:
@@ -3434,6 +3437,7 @@ async def close_reply_stream_for_proactive(bot: BotState, key: str, sess: Sessio
         except Exception as exc:
             add_log(bot, f"[{key}] stream close notice skipped req_id={req_id}: {exc}")
     mark_reply_proactive(sess, req_id)
+    mark_proactive_status_sent(sess, req_id)
 
 
 async def acquire_session_send_lock(sess: SessionState, timeout_sec: Optional[int] = None) -> bool:
@@ -5210,13 +5214,19 @@ async def run_codex(
                             return
                         if req_id not in sess.reply_proactive_req_ids and reply_age_too_long(sess, req_id):
                             await close_reply_stream_for_proactive(bot, key, sess, req_id)
-                        content = build_status_stream_content(
-                            f"**运行状态：{latest_progress.status}**", latest_progress.summary
-                        )
                         proactive_mode = req_id in sess.reply_proactive_req_ids
-                        if content == last_sent_content and not (
-                            proactive_mode and proactive_status_due(sess, req_id)
-                        ):
+                        if proactive_mode and not proactive_status_due(sess, req_id):
+                            continue
+                        if not proactive_mode and not STATUS_STREAM_PROGRESS_ENABLED:
+                            continue
+                        content = (
+                            build_status_stream_content(
+                                f"**运行状态：{latest_progress.status}**", latest_progress.summary
+                            )
+                            if STATUS_STREAM_PROGRESS_ENABLED
+                            else "**运行状态：后台运行中**\n\n任务仍在运行，完成后会主动发送最终结果。"
+                        )
+                        if not proactive_mode and content == last_sent_content:
                             continue
                         if await send_session_status(bot, key, sess, req_id, content):
                             last_sent_content = content
@@ -5249,7 +5259,7 @@ async def run_codex(
                         stderr_parts.append(text)
                         add_log(bot, f"[{key}] {backend} stderr: {text}")
 
-                ticker_task = asyncio.create_task(ticker()) if STATUS_STREAM_PROGRESS_ENABLED else None
+                ticker_task = asyncio.create_task(ticker())
                 stdout_task = asyncio.create_task(read_stdout())
                 stderr_task = asyncio.create_task(read_stderr())
                 prompt_write_error: Optional[Exception] = None
@@ -5263,12 +5273,11 @@ async def run_codex(
                     await stdout_task
                     await stderr_task
                 finally:
-                    if ticker_task is not None:
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except asyncio.CancelledError:
-                            pass
+                    ticker_task.cancel()
+                    try:
+                        await ticker_task
+                    except asyncio.CancelledError:
+                        pass
                     for stream_task in (stdout_task, stderr_task):
                         if not stream_task.done():
                             stream_task.cancel()

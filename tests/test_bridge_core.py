@@ -17490,7 +17490,7 @@ async def test_expired_stream_status_mentions_group_user_after_max_age(bridge_mo
 
 
 @pytest.mark.asyncio
-async def test_send_session_status_closes_stream_before_proactive_after_max_age(bridge_module, monkeypatch):
+async def test_send_session_status_waits_for_heartbeat_interval_after_closing_stream(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     stream_payloads = []
@@ -17510,12 +17510,11 @@ async def test_send_session_status_closes_stream_before_proactive_after_max_age(
 
     delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "status")
 
-    assert delivered is True
+    assert delivered is False
     assert stream_payloads[0]["cmd"] == "aibot_respond_msg"
     assert stream_payloads[0]["body"]["stream"]["finish"] is True
     assert "后台运行" in stream_payloads[0]["body"]["stream"]["content"]
-    assert proactive_payloads[0]["cmd"] == "aibot_send_msg"
-    assert proactive_payloads[0]["body"]["markdown"]["content"] == "status"
+    assert proactive_payloads == []
 
 
 @pytest.mark.asyncio
@@ -17815,9 +17814,8 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("expire_stream", [False, True])
 @pytest.mark.parametrize("backend", ["codex", "claude"])
-async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypatch, expire_stream, backend):
+async def test_run_codex_refreshes_only_changed_progress_before_stream_expiry(bridge_module, monkeypatch, backend):
     bot = make_bot(bridge_module)
     bot.config["agentBackend"] = backend
     sess = make_session(bridge_module, bot)
@@ -17826,9 +17824,6 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
     finish = asyncio.Event()
     statuses = []
     finals = []
-    stream_closures = []
-    expired = False
-    proactive_started_at = None
     real_sleep = asyncio.sleep
     now = bridge_module.time.monotonic()
 
@@ -17881,36 +17876,19 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
         return process
 
     async def send_status(_bot, _key, _sess, _req, content):
-        nonlocal proactive_started_at
         statuses.append(content)
-        if _req in _sess.reply_proactive_req_ids:
-            proactive_started_at = now
         return True
 
     async def send_final(_bot, _key, _sess, payload, final):
         finals.append(payload)
         return True
 
-    async def close_stream(_bot, _key, _sess, req_id):
-        nonlocal proactive_started_at
-        stream_closures.append(req_id)
-        _sess.reply_proactive_req_ids.add(req_id)
-        proactive_started_at = now
-
-    def proactive_due(_sess, _req_id):
-        return bool(
-            proactive_started_at is not None
-            and now - proactive_started_at >= bridge_module.PROACTIVE_STATUS_INTERVAL_SEC
-        )
-
     monkeypatch.setattr(bridge_module, "time", Clock())
     monkeypatch.setattr(bridge_module.asyncio, "sleep", controlled_sleep)
     monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", create_process)
     monkeypatch.setattr(bridge_module, "send_session_status", send_status)
     monkeypatch.setattr(bridge_module, "send_or_store_session_payload", send_final)
-    monkeypatch.setattr(bridge_module, "reply_age_too_long", lambda *_args: expired)
-    monkeypatch.setattr(bridge_module, "close_reply_stream_for_proactive", close_stream)
-    monkeypatch.setattr(bridge_module, "proactive_status_due", proactive_due)
+    monkeypatch.setattr(bridge_module, "reply_age_too_long", lambda *_args: False)
     run = asyncio.create_task(bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", []))
 
     async def next_tick():
@@ -17923,7 +17901,6 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
             gate.set_result(None)
             gate = await next_tick()
         assert statuses == initial_statuses
-        expired = expire_stream
         summary_event = {
             "type": "item.reasoning.summaryPartAdded",
             "summary": "正在核对配置并整理结果",
@@ -17939,17 +17916,6 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
             gate.set_result(None)
             gate = await next_tick()
         assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 1
-        assert stream_closures == (["req-1"] if expire_stream else [])
-        if expire_stream:
-            heartbeat_ticks = (
-                bridge_module.PROACTIVE_STATUS_INTERVAL_SEC
-                + bridge_module.STATUS_STREAM_INTERVAL_SEC
-                - 1
-            ) // bridge_module.STATUS_STREAM_INTERVAL_SEC
-            for _ in range(max(0, heartbeat_ticks - 3)):
-                gate.set_result(None)
-                gate = await next_tick()
-            assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 2
 
         tool_event = {
             "type": "item.started",
@@ -17989,6 +17955,148 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
 
     assert finals[-1]["body"]["stream"]["content"] == "final answer"
     assert finals[-1]["body"]["stream"]["finish"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+@pytest.mark.parametrize("progress_enabled", [False, True])
+@pytest.mark.parametrize("stop_action", ["complete", "interrupt"])
+async def test_run_codex_sends_fixed_heartbeats_after_stream_expiry(
+    bridge_module, monkeypatch, backend, progress_enabled, stop_action
+):
+    bot = make_bot(bridge_module)
+    bot.config["agentBackend"] = backend
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    ticks = asyncio.Queue()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    sent = []
+    real_sleep = asyncio.sleep
+    now = time.time()
+    reply_started_at = now
+
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def time(self):
+            return now
+
+    async def controlled_sleep(seconds):
+        if seconds != bridge_module.STATUS_STREAM_INTERVAL_SEC:
+            await real_sleep(seconds)
+            return
+        gate = asyncio.get_running_loop().create_future()
+        ticks.put_nowait(gate)
+        await gate
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        def feed(self, text):
+            event = (
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+                if backend == "claude"
+                else {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+            )
+            self.stdout.feed_data((json.dumps(event) + "\n").encode())
+
+        async def wait(self):
+            started.set()
+            await finish.wait()
+            if self.returncode is None:
+                self.feed("final answer")
+                self.returncode = 0
+            self.stdout.feed_eof()
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+            finish.set()
+
+    process = FakeProcess()
+
+    async def create_process(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(bridge_module, "time", Clock())
+    monkeypatch.setattr(bridge_module, "STATUS_STREAM_PROGRESS_ENABLED", progress_enabled)
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", create_process)
+    bot.ws = make_acking_ws(bot, lambda payload: sent.append((now, payload)))
+    bridge_module.register_reply_session(bot, "req-1", sess)
+    run = asyncio.create_task(bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", []))
+
+    async def next_tick():
+        return await asyncio.wait_for(ticks.get(), timeout=3)
+
+    async def tick_at(timestamp):
+        nonlocal now, gate
+        now = timestamp
+        gate.set_result(None)
+        gate = await next_tick()
+
+    def proactive_messages():
+        return [(timestamp, payload) for timestamp, payload in sent if payload["cmd"] == "aibot_send_msg"]
+
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        gate = await next_tick()
+        initial_count = len(sent)
+        process.feed("正在检查日志")
+        await real_sleep(0)
+        await tick_at(reply_started_at + 5)
+        assert len(sent) == initial_count + int(progress_enabled)
+
+        expires_at = reply_started_at + bridge_module.REPLY_MAX_AGE_FALLBACK_SEC
+        await tick_at(expires_at - 5)
+        assert proactive_messages() == []
+        assert not sent[-1][1]["body"]["stream"]["finish"]
+
+        await tick_at(expires_at)
+        assert proactive_messages() == []
+        close_notice = sent[-1][1]["body"]["stream"]
+        assert close_notice["finish"] is True
+        assert "每 120 秒" in close_notice["content"]
+
+        for heartbeat_number in (1, 2):
+            due_at = expires_at + heartbeat_number * 120
+            await tick_at(due_at - 5)
+            assert len(proactive_messages()) == heartbeat_number - 1
+            await tick_at(due_at)
+            assert len(proactive_messages()) == heartbeat_number
+        heartbeats = proactive_messages()
+        assert [timestamp for timestamp, _payload in heartbeats] == [expires_at + 120, expires_at + 240]
+        assert heartbeats[0][1]["body"]["markdown"]["content"] == heartbeats[1][1]["body"]["markdown"]["content"]
+        if progress_enabled:
+            assert "正在检查日志" in heartbeats[0][1]["body"]["markdown"]["content"]
+        else:
+            assert "后台运行中" in heartbeats[0][1]["body"]["markdown"]["content"]
+            assert "正在检查日志" not in heartbeats[0][1]["body"]["markdown"]["content"]
+
+        if stop_action == "interrupt":
+            sess.interrupt_requested = True
+            run.cancel()
+        else:
+            finish.set()
+        await asyncio.wait_for(run, timeout=3)
+        assert sess.running is False
+        assert gate.cancelled()
+        if stop_action == "complete":
+            assert proactive_messages()[-1][1]["body"]["markdown"]["content"] == "final answer"
+        sent_count = len(sent)
+        now += 120
+        await real_sleep(0)
+        assert len(sent) == sent_count
+    finally:
+        finish.set()
+        await asyncio.wait_for(run, timeout=3)
 
 
 @pytest.mark.asyncio
