@@ -1400,9 +1400,9 @@ async def test_send_or_cache_runtime_payload_sends_stream_chunks_in_order(tmp_pa
 
     assert delivered is True
     assert len(sent) == 3
-    assert sent[0]["body"]["stream"]["finish"] is False
-    assert sent[1]["body"]["stream"]["finish"] is False
-    assert sent[2]["body"]["stream"]["finish"] is True
+    assert all(item["body"]["stream"]["finish"] is True for item in sent)
+    visible = {item["body"]["stream"]["id"]: item["body"]["stream"]["content"] for item in sent}
+    assert "".join(visible.values()) == "x" * 8000
     assert "".join(item["body"]["stream"]["content"] for item in sent) == "x" * 8000
 
 
@@ -2416,11 +2416,11 @@ async def test_stream_text_message_once_updates_last_run_at_on_failure(tmp_path:
     assert int(after.last_run_at) >= int(before.updated_at)
 
 
-async def test_bridge_reset_removes_workspace_bridge_chatfile_and_codex_home(tmp_path: Path) -> None:
+async def test_new_session_preserves_previous_chatfile_and_codex_home(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.wecom_protocol import build_text_response_payload
-    from workspace_bridge.runtime import prepare_session_run, session_codex_home_root
+    from workspace_bridge.runtime import current_session_id, prepare_session_run, session_codex_home_root
     from workspace_bridge import wecom_runtime as runtime_module
 
     class FakeWS:
@@ -2445,20 +2445,28 @@ async def test_bridge_reset_removes_workspace_bridge_chatfile_and_codex_home(tmp
         "headers": {"req_id": "req-1"},
         "body": {
             "msgtype": "text",
-            "text": {"content": "/bridge-reset"},
+            "text": {"content": "/new"},
             "from": {"userid": "alice"},
         },
     }
 
     await runtime_module.handle_wecom_payload(config, runtime, runtime.ws, payload, runtime_module._dispatch_message)
 
-    assert not chatfile_dir.exists()
-    assert not codex_home.exists()
-    assert runtime.ws.sent[-1] == build_text_response_payload("req-1", launch.session.session_id, "Session reset.", final=True)
+    new_session_id = current_session_id(bot, "single:alice")
+    assert new_session_id != launch.session.session_id
+    assert (chatfile_dir / "artifact.txt").read_text(encoding="utf-8") == "artifact"
+    assert (codex_home / "state.txt").read_text(encoding="utf-8") == "state"
+    assert runtime.ws.sent[-1] == build_text_response_payload(
+        "req-1",
+        new_session_id,
+        "New session ready. Your next message will start a new thread.",
+        final=True,
+    )
 
 
-async def test_stream_text_message_once_streams_latest_message_during_run(tmp_path: Path) -> None:
+async def test_stream_text_message_once_does_not_refresh_unchanged_status(tmp_path: Path, monkeypatch) -> None:
     config = make_config(tmp_path)
+    real_sleep = asyncio.sleep
     from workspace_bridge.config import build_bot_from_app_config
 
     class FakeWS:
@@ -2493,14 +2501,16 @@ async def test_stream_text_message_once_streams_latest_message_during_run(tmp_pa
             self.returncode = None
 
         async def wait(self) -> int:
-            await asyncio.sleep(0.05)
+            for _ in range(20):
+                await real_sleep(0)
             self.stdout.feed_data(
                 (
                     json.dumps({"type": "item.completed", "item": {"type": "agentmessage", "text": "stream body"}}, ensure_ascii=False)
                     + "\n"
                 ).encode("utf-8")
             )
-            await asyncio.sleep(0.35)
+            for _ in range(20):
+                await real_sleep(0)
             self.returncode = 0
             self.stdout.feed_eof()
             self.stderr.feed_eof()
@@ -2514,7 +2524,6 @@ async def test_stream_text_message_once_streams_latest_message_during_run(tmp_pa
     original_prepare_session_run = execution_module.prepare_session_run
     original_build_prompt = execution_module.build_prompt
     original_create_subprocess_exec = execution_module.asyncio.create_subprocess_exec
-    original_interval = execution_module.STATUS_STREAM_INTERVAL_SEC
     execution_module.prepare_session_run = lambda _bot, _chat_key: SimpleNamespace(
         cwd=bot.source.source_dir,
         env={},
@@ -2524,7 +2533,9 @@ async def test_stream_text_message_once_streams_latest_message_during_run(tmp_pa
     async def fake_create_subprocess_exec(*_args, **_kwargs):
         return FakeProcess()
     execution_module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
-    execution_module.STATUS_STREAM_INTERVAL_SEC = 0.1
+    async def advance_timer(_seconds):
+        await real_sleep(0)
+    monkeypatch.setattr(execution_module.asyncio, "sleep", advance_timer)
     try:
         session_id, reply = await stream_text_message_once(
             config,
@@ -2536,15 +2547,13 @@ async def test_stream_text_message_once_streams_latest_message_during_run(tmp_pa
         execution_module.prepare_session_run = original_prepare_session_run
         execution_module.build_prompt = original_build_prompt
         execution_module.asyncio.create_subprocess_exec = original_create_subprocess_exec
-        execution_module.STATUS_STREAM_INTERVAL_SEC = original_interval
 
     assert session_id == "session-3"
     assert reply == "stream body"
-    assert len(runtime.ws.sent) >= 3
+    assert len(runtime.ws.sent) == 2
     status_payloads = [payload for payload in runtime.ws.sent if "思考中" in payload["body"]["stream"]["content"]]
-    assert len(status_payloads) >= 2
-    assert "已运行 0s" in status_payloads[0]["body"]["stream"]["content"]
-    assert any(payload["body"]["stream"]["content"] != status_payloads[0]["body"]["stream"]["content"] for payload in status_payloads[1:])
+    assert len(status_payloads) == 1
+    assert "已运行" not in status_payloads[0]["body"]["stream"]["content"]
     assert any("stream body" in payload["body"]["stream"]["content"] for payload in runtime.ws.sent[1:])
     assert runtime.ws.sent[-1]["body"]["stream"]["finish"] is True
 

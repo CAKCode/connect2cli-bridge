@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -134,6 +136,15 @@ def session_record_file(runtime_root: Path | str, session_id: str) -> Path:
     return session_registry_root(runtime_root) / f"{session_id}.json"
 
 
+def session_binding_file(runtime_root: Path | str, bot_id: str, chat_key: str) -> Path:
+    root = ensure_state_directory(
+        Path(runtime_root).expanduser().resolve()
+        / "session-bindings"
+        / quote(str(bot_id or "").strip(), safe="._-")
+    )
+    return root / f"{quote(str(chat_key or '').strip(), safe='._-')}.json"
+
+
 def session_codex_home_root(runtime_root: Path | str) -> Path:
     codex_home_root = ensure_state_directory(Path(runtime_root).expanduser().resolve() / ".bridge-codex-home")
     return ensure_state_directory(codex_home_root / "sessions")
@@ -188,6 +199,18 @@ def remove_session_codex_home(runtime_root: Path | str, session_id: str) -> None
 def remove_session_chatfile(chatfile_root: Path | str, session_id: str) -> None:
     root = Path(chatfile_root).expanduser().resolve() / session_id
     _remove_tree_path(root)
+
+
+def copy_session_resume_state(runtime_root: Path | str, source_session_id: str, target_session_id: str) -> None:
+    if source_session_id == target_session_id:
+        return
+    homes_root = session_codex_home_root(runtime_root)
+    source = homes_root / source_session_id / "sessions"
+    if not source.exists() or not source.is_dir():
+        return
+    target = homes_root / target_session_id / "sessions"
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -419,6 +442,39 @@ def list_session_records(runtime_root: Path | str, bot_id: str) -> list[SessionR
     return records
 
 
+def current_session_id(bot: BotConfig, chat_key: str) -> str:
+    fallback = stable_session_id(
+        bot.bot_id,
+        chat_key,
+        bot.source.source_dir,
+        bot.workspace_namespace,
+        bot.workspace_mode,
+    )
+    payload = read_json_file(session_binding_file(bot.runtime_root, bot.bot_id, chat_key))
+    session_id = str((payload or {}).get("sessionId") or "").strip()
+    if not session_id:
+        return fallback
+    record = load_session_record(bot.runtime_root, session_id)
+    if record is None or record.bot_id != bot.bot_id or record.chat_key != chat_key:
+        return fallback
+    return session_id
+
+
+def bind_current_session(bot: BotConfig, chat_key: str, session_id: str) -> None:
+    record = load_session_record(bot.runtime_root, session_id)
+    if record is None or record.bot_id != bot.bot_id or record.chat_key != chat_key:
+        raise ValueError(f"cannot bind invalid session: {session_id}")
+    write_json_atomic(
+        session_binding_file(bot.runtime_root, bot.bot_id, chat_key),
+        {
+            "sessionId": session_id,
+            "botId": bot.bot_id,
+            "chatKey": chat_key,
+            "updatedAt": now_ms(),
+        },
+    )
+
+
 def cleanup_orphan_session_codex_homes(runtime_root: Path | str) -> int:
     homes_root = session_codex_home_root(runtime_root)
     if not homes_root.exists():
@@ -480,14 +536,15 @@ def cleanup_outdated_session_artifacts(bot: BotConfig) -> int:
     chatfile_root = Path(bot.chatfile_root).expanduser().resolve()
     current_records = list_session_records(bot.runtime_root, bot.bot_id)
     for record in current_records:
-        expected_session_id = stable_session_id(
-            bot.bot_id,
-            record.chat_key,
-            bot.source.source_dir,
+        expected_workspace = build_workspace_ref(
+            bot.runtime_root,
             bot.workspace_namespace,
-            bot.workspace_mode,
+            bot.source.source_dir,
+            record.chat_key,
+            workspace_mode=bot.workspace_mode,
+            agent_backend=bot.agent_backend,
         )
-        if record.session_id == expected_session_id:
+        if record.workspace_id == expected_workspace.workspace_id and record.workspace_mode == bot.workspace_mode:
             continue
         remove_session_codex_home(bot.runtime_root, record.session_id)
         remove_session_chatfile(chatfile_root, record.session_id)
@@ -522,7 +579,13 @@ def append_session_record_chat_message(runtime_root: Path | str, session_id: str
     )
 
 
-def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
+def _prepare_session_run_for_id(
+    bot: BotConfig,
+    chat_key: str,
+    session_id: str,
+    *,
+    inherit_from: SessionRecord | None = None,
+) -> CodexLaunchSpec:
     workspace_ref = build_workspace_ref(
         bot.runtime_root,
         bot.workspace_namespace,
@@ -532,19 +595,13 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
         agent_backend=bot.agent_backend,
     )
     with workspace_lock(workspace_ref):
-        session_id = stable_session_id(
-            bot.bot_id,
-            chat_key,
-            bot.source.source_dir,
-            bot.workspace_namespace,
-            bot.workspace_mode,
-        )
         provisioned = provision_workspace(workspace_ref)
         current = load_session_record(bot.runtime_root, session_id)
         resolved_cwd_dir = workspace_ref.cwd_dir
         resolved_skill_dir = workspace_ref.skill_dir
-        if bot.workspace_mode == "personal" and current is not None:
-            resolved_cwd_dir = resolve_personal_session_cwd(bot, current.cwd_dir)
+        cwd_source = current or inherit_from
+        if bot.workspace_mode == "personal" and cwd_source is not None:
+            resolved_cwd_dir = resolve_personal_session_cwd(bot, cwd_source.cwd_dir)
             resolved_skill_dir = resolve_personal_skill_dir(resolved_cwd_dir)
             resolved_skill_dir.mkdir(parents=True, exist_ok=True)
         runtime_context = build_runtime_context(
@@ -598,3 +655,24 @@ def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
             cwd=runtime_context.cwd_dir,
             env=env,
         )
+
+
+def prepare_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
+    return _prepare_session_run_for_id(bot, chat_key, current_session_id(bot, chat_key))
+
+
+def create_new_session_run(bot: BotConfig, chat_key: str) -> CodexLaunchSpec:
+    previous_session_id = current_session_id(bot, chat_key)
+    previous = load_session_record(bot.runtime_root, previous_session_id)
+    session_id = f"session-{uuid.uuid4().hex[:16]}"
+    while session_record_file(bot.runtime_root, session_id).exists():
+        session_id = f"session-{uuid.uuid4().hex[:16]}"
+    launch = _prepare_session_run_for_id(bot, chat_key, session_id, inherit_from=previous)
+    try:
+        bind_current_session(bot, chat_key, session_id)
+    except Exception:
+        session_record_file(bot.runtime_root, session_id).unlink(missing_ok=True)
+        remove_session_codex_home(bot.runtime_root, session_id)
+        remove_session_chatfile(bot.chatfile_root, session_id)
+        raise
+    return launch

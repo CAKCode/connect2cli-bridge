@@ -162,6 +162,7 @@ Implemented:
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/new`
 - `/bridge-resume`
 - `/local-resume`
 - `/local-resume <sessionId>`
@@ -170,9 +171,10 @@ Implemented:
 
 Meaning:
 
-- `status` reports current runtime state and identifiers
+- `status` reports current Bridge runtime state and identifiers, followed by native Codex `/status` model, permissions, token, and context details
 - `interrupt` stops the current run without resetting the conversation state
-- `reset` clears the active session context and starts fresh
+- `reset` waits for the active run to exit, then clears the thread, chat, and Codex state in the current session
+- `new` waits for the active run to exit, preserves the old session, and binds a new session; preserved sessions remain selectable with `resume`
 - `resume` lists resumable sessions visible to the current chat and binds the selected session thread
 - `local-resume` lists or directly binds a local Codex session whose latest rollout matches the current `cwd`
 - `local-detach` releases that binding and restores the previous Bridge context when available
@@ -182,7 +184,7 @@ Local resume requires `workspaceMode=personal`, `agentBackend=codex`, and an aut
 `localResumeOwnerUserId`. Shared group sessions are excluded, and one local Codex thread can have only one
 valid WeCom binding at a time.
 
-API equivalents also exist for interrupt and reset.
+API equivalents also exist for interrupt and new.
 
 ### 9. Scheduling
 
@@ -215,7 +217,7 @@ Implemented:
 - root health endpoint `/`
 - bot management endpoints
 - session chat fetch endpoint
-- session interrupt/reset endpoints
+- session interrupt/new endpoints
 - send-file endpoint
 - schedule management endpoints
 - schedule-message endpoint

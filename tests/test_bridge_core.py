@@ -1174,6 +1174,40 @@ def test_interrupt_session_preserves_foreign_takeover_record(bridge_module):
     assert persisted["activeScheduleId"] == "schedule-1"
 
 
+@pytest.mark.asyncio
+async def test_interrupt_session_finishes_open_reply_stream_before_cleanup(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sent = []
+    bot.ws = make_acking_ws(bot, on_send=sent.append)
+    bridge_module.register_reply_session(bot, "req-running", sess)
+
+    class FakeProcess:
+        returncode = None
+
+        def terminate(self):
+            self.returncode = -15
+
+        async def wait(self):
+            return self.returncode
+
+    sess.running = True
+    sess.run_task = asyncio.create_task(asyncio.sleep(3600))
+    sess.proc = FakeProcess()
+
+    await bridge_module.interrupt_session_and_wait(bot, "single:test-user")
+
+    stream_payloads = [payload for payload in sent if payload.get("cmd") == "aibot_respond_msg"]
+    assert stream_payloads
+    assert stream_payloads[-1]["headers"]["req_id"] == "req-running"
+    assert stream_payloads[-1]["body"]["stream"] == {
+        "id": sess.session_id,
+        "finish": True,
+        "content": "任务已中断。",
+    }
+    assert "req-running" not in bot.reply_sessions
+
+
 def test_owned_session_record_update_skips_after_foreign_takeover(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -7140,6 +7174,32 @@ async def test_bridge_interrupt_command_is_intercepted(bridge_module, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_bridge_reset_command_uses_full_session_reset(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    calls = []
+
+    async def fake_reset_session_command(_bot, key, req_id):
+        calls.append((key, req_id))
+
+    monkeypatch.setattr(bridge_module, "reset_session_command", fake_reset_session_command)
+
+    await bridge_module.handle_wecom_message(
+        bot,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-reset"},
+            "body": {
+                "msgtype": "text",
+                "text": {"content": "/bridge-reset"},
+                "from": {"userid": "test-user"},
+            },
+        },
+    )
+
+    assert calls == [("single:test-user", "req-reset")]
+
+
+@pytest.mark.asyncio
 async def test_cwd_command_rejected_in_team_mode(bridge_module):
     bot = make_bot(bridge_module)
     replies = []
@@ -9311,6 +9371,7 @@ async def test_bridge_status_counts_processing_and_pending_jobs(bridge_module):
 
     assert replies
     assert "scheduled=2" in replies[0][1]
+    assert "Codex /status" in replies[0][1]
 
 
 @pytest.mark.asyncio
@@ -12477,6 +12538,15 @@ def test_api_get_chat_returns_not_found_for_missing_bot(monkeypatch, bridge_modu
     assert body["error"] == "bot not found"
 
 
+def test_build_app_exposes_distinct_new_and_reset_session_apis(bridge_module):
+    app = bridge_module.build_app()
+
+    paths = {route.resource.canonical for route in app.router.routes()}
+
+    assert "/api/bots/{bot_id}/sessions/{chat_key}/new" in paths
+    assert "/api/bots/{bot_id}/sessions/{chat_key}/reset" in paths
+
+
 def test_api_get_chat_returns_not_found_for_missing_session(monkeypatch, bridge_module):
     bot = make_bot(bridge_module, config_id="bot-1")
 
@@ -13159,7 +13229,7 @@ async def test_handle_wecom_template_card_event_updates_card(bridge_module, monk
     assert sent[0]["body"]["template_card"]["card_type"] == "button_interaction"
     assert sent[0]["body"]["template_card"]["main_title"]["title"] == "请确认执行"
     assert sent[0]["body"]["template_card"]["button_list"][0]["text"] == "确认"
-    assert info_messages == [("evt-req-1", "已收到「确认」，正在处理...", False)]
+    assert info_messages == []
     assert enqueued == ["确认"]
 
 
@@ -13256,11 +13326,9 @@ async def test_handle_wecom_template_card_event_allows_repeatable_refresh_progre
         },
     )
 
-    assert len(sent) == 2
-    assert sent[0]["cmd"] == "aibot_respond_msg"
-    assert sent[0]["body"]["stream"]["finish"] is False
-    assert sent[1]["cmd"] == "aibot_respond_update_msg"
-    updated_card = sent[1]["body"]["template_card"]
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_respond_update_msg"
+    updated_card = sent[0]["body"]["template_card"]
     assert updated_card["main_title"]["desc"] == "当前进度: 30%"
     assert "30%" in updated_card["sub_title_text"]
     assert enqueued == []
@@ -13315,7 +13383,7 @@ async def test_handle_wecom_template_card_event_still_enqueues_when_card_update_
     )
 
     assert enqueued == ["确认执行"]
-    assert info_messages == [("evt-req-timeout", "已收到「确认执行」，正在处理...", False)]
+    assert info_messages == []
 
 
 @pytest.mark.asyncio
@@ -14657,6 +14725,8 @@ async def test_upload_and_send_file_routes_group_user_key_to_group_chat(bridge_m
         ack_payloads.append(payload)
         if payload["cmd"] == "aibot_upload_media_init":
             return {"errcode": 0, "body": {"upload_id": "upload-1"}}
+        if payload["cmd"] == "aibot_upload_media_chunk":
+            return {"errcode": 0, "body": {}}
         if payload["cmd"] == "aibot_upload_media_finish":
             return {"errcode": 0, "body": {"media_id": "media-1"}}
         if payload["cmd"] == "aibot_send_msg":
@@ -14688,6 +14758,8 @@ async def test_upload_and_send_file_accepts_string_zero_errcode(bridge_module, m
     async def fake_send_ws_payload_with_ack(_bot, payload, _timeout_sec):
         if payload["cmd"] == "aibot_upload_media_init":
             return {"errcode": "0", "body": {"upload_id": "upload-1"}}
+        if payload["cmd"] == "aibot_upload_media_chunk":
+            return {"errcode": "0", "body": {}}
         if payload["cmd"] == "aibot_upload_media_finish":
             return {"errcode": "0", "body": {"media_id": "media-1"}}
         if payload["cmd"] == "aibot_send_msg":
@@ -15718,13 +15790,13 @@ def test_cancel_pending_file_send_requests_scans_namespaced_pending_queue(bridge
         },
     )
 
-    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "session reset before file send")
+    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "new session before file send")
 
     assert cancelled == 1
     result = json.loads((queue_paths["results"] / f"{request_id}.json").read_text("utf-8"))
     assert result["ok"] is False
     assert result["statusCode"] == 409
-    assert result["error"] == "session reset before file send"
+    assert result["error"] == "new session before file send"
     assert (queue_paths["failed"] / f"{request_id}.json").exists()
 
 
@@ -15759,7 +15831,7 @@ def test_cancel_pending_file_send_requests_writes_namespaced_result_for_queued_j
         }
     )
 
-    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "session reset before file send")
+    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "new session before file send")
 
     assert cancelled == 1
     assert bot.upload_queue.qsize() == 0
@@ -15767,7 +15839,7 @@ def test_cancel_pending_file_send_requests_writes_namespaced_result_for_queued_j
     result = json.loads((queue_paths["results"] / f"{request_id}.json").read_text("utf-8"))
     assert result["ok"] is False
     assert result["statusCode"] == 409
-    assert result["error"] == "session reset before file send"
+    assert result["error"] == "new session before file send"
     assert (queue_paths["failed"] / f"{request_id}.json").exists()
 
 
@@ -15802,7 +15874,7 @@ async def test_cancel_pending_file_send_requests_marks_removed_queue_items_done(
         }
     )
 
-    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "session reset before file send")
+    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "new session before file send")
 
     assert cancelled == 1
     await asyncio.wait_for(bot.upload_queue.join(), 1)
@@ -15855,7 +15927,7 @@ async def test_cancel_pending_file_send_requests_cancels_active_upload_without_o
     try:
         await asyncio.wait_for(started.wait(), 1)
 
-        cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "session reset before file send")
+        cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "new session before file send")
 
         assert cancelled == 1
         await asyncio.wait_for(cancelled_upload.wait(), 1)
@@ -15865,7 +15937,7 @@ async def test_cancel_pending_file_send_requests_cancels_active_upload_without_o
         result = json.loads((queue_paths["results"] / f"{request_id}.json").read_text("utf-8"))
         assert result["ok"] is False
         assert result["statusCode"] == 409
-        assert result["error"] == "session reset before file send"
+        assert result["error"] == "new session before file send"
         assert (queue_paths["failed"] / f"{request_id}.json").exists()
         assert not (queue_paths["done"] / f"{request_id}.json").exists()
         assert request_id not in bot.active_local_file_request_ids
@@ -16080,13 +16152,13 @@ async def test_cancel_pending_file_send_requests_catches_active_job_before_task_
     bot.active_upload_task = None
     bot.active_local_file_request_ids.add(request_id)
 
-    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "session reset before file send")
+    cancelled = bridge_module.cancel_pending_file_send_requests(bot, "single:test-user", sess.session_id, "new session before file send")
 
     assert cancelled == 1
     result = json.loads((queue_paths["results"] / f"{request_id}.json").read_text("utf-8"))
     assert result["ok"] is False
     assert result["statusCode"] == 409
-    assert result["error"] == "session reset before file send"
+    assert result["error"] == "new session before file send"
     assert (queue_paths["failed"] / f"{request_id}.json").exists()
 
 
@@ -16190,6 +16262,54 @@ def test_detect_codex_runtime_status_recognizes_reconnect_patterns(bridge_module
     assert bridge_module.detect_codex_runtime_status("plain stderr line") is None
 
 
+def test_extract_agent_progress_handles_codex_phase_events(bridge_module):
+    started = json.dumps({
+        "type": "item.started",
+        "item": {"type": "command_execution", "command": "pytest tests/test_api.py"},
+    })
+    output = json.dumps({
+        "type": "item.commandExecution.outputDelta",
+        "delta": "1 failed, 4 passed",
+    })
+
+    assert bridge_module.extract_agent_progress("codex", started) == bridge_module.AgentProgress("执行中")
+    assert bridge_module.extract_agent_progress("codex", output) is None
+    assert bridge_module.extract_agent_progress(
+        "codex",
+        json.dumps({
+            "type": "item.updated",
+            "item": {
+                "type": "command_execution",
+                "command": "pytest tests/test_api.py",
+                "aggregated_output": "1 failed, 4 passed",
+            },
+        }),
+    ) == bridge_module.AgentProgress("执行中")
+    assert bridge_module.extract_agent_progress(
+        "codex",
+        json.dumps({
+            "type": "item.reasoning.summaryPartAdded",
+            "summary": "正在核对配置并整理结果",
+        }),
+    ) == bridge_module.AgentProgress("分析中", "正在核对配置并整理结果")
+    assert bridge_module.extract_agent_progress(
+        "codex",
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "正在核对配置并整理结果"},
+        }),
+    ) == bridge_module.AgentProgress("处理中", "正在核对配置并整理结果")
+
+
+def test_extract_agent_progress_handles_claude_tool_events(bridge_module):
+    event = json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Bash"}]},
+    })
+
+    assert bridge_module.extract_agent_progress("claude", event) == bridge_module.AgentProgress("处理中")
+
+
 def test_update_codex_runtime_status_logs_only_on_change(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -16207,17 +16327,6 @@ def test_update_codex_runtime_status_logs_only_on_change(bridge_module):
 def test_build_queue_status_text_includes_queue_position(bridge_module):
     assert bridge_module.build_queue_status_text(3) == "运行状态：排队中，前方还有 2 个任务。"
     assert bridge_module.build_queue_status_text(1) == "运行状态：排队中，即将开始处理。"
-
-
-def test_build_thinking_status_text_includes_optional_detail(bridge_module):
-    assert bridge_module.build_thinking_status_text(7) == "运行状态：思考中，已运行 7s。"
-    assert bridge_module.build_thinking_status_text(7, "正在读取上下文") == "运行状态：思考中，已运行 7s，正在读取上下文。"
-
-
-def test_build_working_status_text_cycles_dots(bridge_module):
-    assert bridge_module.build_working_status_text(0) == "运行状态：整理回复中. 已运行 0s。"
-    assert bridge_module.build_working_status_text(5) == "运行状态：整理回复中.. 已运行 5s。"
-    assert bridge_module.build_working_status_text(10) == "运行状态：整理回复中... 已运行 10s。"
 
 
 def test_build_status_stream_content_keeps_summary_visible(bridge_module):
@@ -16406,6 +16515,258 @@ def test_interrupt_session_with_clear_queue_removes_session_codex_home(bridge_mo
 
 
 @pytest.mark.asyncio
+async def test_reset_session_waits_for_active_run_before_removing_thread_state(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "old-thread"
+    sess.running = True
+    order: list[str] = []
+
+    async def active_run():
+        try:
+            await asyncio.Future()
+        finally:
+            order.append("task-exit")
+
+    class FakeProcess:
+        returncode = None
+
+        def kill(self):
+            order.append("kill")
+            self.returncode = -9
+
+        async def wait(self):
+            order.append("wait")
+            return self.returncode
+
+    process = FakeProcess()
+    task = asyncio.create_task(active_run())
+    await asyncio.sleep(0)
+    sess.run_task = task
+    sess.proc = process
+
+    original_remove = bridge_module.remove_session_codex_home
+
+    def tracked_remove(session_id):
+        order.append("remove")
+        original_remove(session_id)
+
+    monkeypatch.setattr(bridge_module, "remove_session_codex_home", tracked_remove)
+
+    result = await bridge_module.reset_session_context(bot, "single:test-user")
+
+    assert order.index("kill") < order.index("wait") < order.index("task-exit") < order.index("remove")
+    assert result["threadId"] is None
+    assert result["sessionId"] == sess.session_id
+    assert bot.sessions["single:test-user"] is sess
+    assert sess.thread_id is None
+    assert sess.running is False
+
+
+@pytest.mark.asyncio
+async def test_new_session_preserves_previous_context_and_rebinds_chat(bridge_module):
+    bot = make_bot(bridge_module)
+    previous = make_session(bridge_module, bot)
+    previous.thread_id = "old-thread"
+    previous.chat = [{"role": "user", "text": "keep-chat"}]
+    bridge_module.update_owned_session_record(
+        bot,
+        "single:test-user",
+        previous,
+        lambda record: {
+            **record,
+            "threadId": previous.thread_id,
+            "recentChat": list(previous.chat),
+        },
+    )
+    rollout = bridge_module.get_session_codex_home_root(previous.session_id) / "sessions" / "rollout-old.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("old rollout", encoding="utf-8")
+
+    result = await bridge_module.new_session_context(bot, "single:test-user")
+
+    current = bot.sessions["single:test-user"]
+    previous_record = bridge_module.read_session_record_by_id(previous.session_id)
+    current_record = bridge_module.read_session_record_by_key(bot.config["id"], "single:test-user")
+    assert result["previousSessionId"] == previous.session_id
+    assert result["sessionId"] == current.session_id
+    assert current.session_id != previous.session_id
+    assert current.thread_id is None
+    assert current.chat == []
+    assert previous_record["threadId"] == "old-thread"
+    assert previous_record["recentChat"] == [{"role": "user", "text": "keep-chat"}]
+    assert current_record["sessionId"] == current.session_id
+    assert current_record["threadId"] is None
+    assert current_record["recentChat"] == []
+    assert rollout.read_text(encoding="utf-8") == "old rollout"
+
+    candidates = bridge_module.build_resume_candidates(bot, "single:test-user")
+    assert [candidate["sessionId"] for candidate in candidates] == [previous.session_id]
+    bridge_module.bind_resume_candidate_to_session(bot, current, "single:test-user", candidates[0])
+    copied_rollout = bridge_module.get_session_codex_home_root(current.session_id) / "sessions" / rollout.name
+    assert current.thread_id == "old-thread"
+    assert current.chat == [{"role": "user", "text": "keep-chat"}]
+    assert copied_rollout.read_text(encoding="utf-8") == "old rollout"
+
+
+@pytest.mark.asyncio
+async def test_new_session_rejects_foreign_lease_without_clearing_context(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "keep-thread"
+    sess.chat.append({"role": "user", "text": "keep-chat"})
+    session_home = bridge_module.get_session_codex_home_root(sess.session_id)
+    session_home.mkdir(parents=True)
+    marker = session_home / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    expires_at = bridge_module.now_ms() + 60_000
+    foreign_lease = {
+        "instanceId": "foreign-instance",
+        "pid": 12345,
+        "botId": bot.config["id"],
+        "chatKey": "single:test-user",
+        "updatedAt": bridge_module.now_ms(),
+        "expiresAt": expires_at,
+    }
+    bridge_module.write_lease(sess.lock_file, foreign_lease)
+    bridge_module.update_session_record(
+        sess.session_id,
+        lambda record: {
+            **record,
+            "ownerInstance": foreign_lease["instanceId"],
+            "ownerPid": foreign_lease["pid"],
+            "leaseExpiresAt": foreign_lease["expiresAt"],
+            "threadId": sess.thread_id,
+            "recentChat": list(sess.chat),
+        },
+    )
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.new_session_context(bot, "single:test-user")
+
+    assert exc_info.value.status_code == 409
+    assert sess.thread_id == "keep-thread"
+    assert sess.chat == [{"role": "user", "text": "keep-chat"}]
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert bot.sessions["single:test-user"] is sess
+    assert bridge_module.read_session_record_by_key(bot.config["id"], "single:test-user")["sessionId"] == sess.session_id
+
+
+@pytest.mark.asyncio
+async def test_new_session_keeps_context_when_process_exit_times_out(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "keep-thread"
+    sess.chat.append({"role": "user", "text": "keep-chat"})
+    session_home = bridge_module.get_session_codex_home_root(sess.session_id)
+    session_home.mkdir(parents=True)
+    marker = session_home / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    class StuckProcess:
+        returncode = None
+
+        def kill(self):
+            return None
+
+        async def wait(self):
+            await asyncio.Future()
+
+    sess.proc = StuckProcess()
+    sess.running = True
+    monkeypatch.setattr(bridge_module, "SESSION_CONTROL_EXIT_TIMEOUT_SEC", 0.01)
+
+    with pytest.raises(bridge_module.BridgeError) as exc_info:
+        await bridge_module.new_session_context(bot, "single:test-user")
+
+    assert exc_info.value.status_code == 409
+    assert sess.thread_id == "keep-thread"
+    assert sess.chat == [{"role": "user", "text": "keep-chat"}]
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert bot.sessions["single:test-user"] is sess
+    assert bridge_module.read_session_record_by_key(bot.config["id"], "single:test-user")["sessionId"] == sess.session_id
+
+
+@pytest.mark.asyncio
+async def test_api_new_session_clears_resume_selection(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.resume_candidates = [{"sessionId": "old-session", "threadId": "old-thread"}]
+    sess.resume_selection_expires_at = bridge_module.now_ms() + 60_000
+
+    response = await bridge_module.api_new_session(
+        SimpleNamespace(match_info={"bot_id": bot.config["id"], "chat_key": "single:test-user"})
+    )
+    payload = json.loads(response.text)
+
+    assert response.status == 200
+    assert payload["action"] == "new"
+    assert payload["previousSessionId"] == sess.session_id
+    assert payload["sessionId"] != sess.session_id
+    assert bot.sessions["single:test-user"].session_id == payload["sessionId"]
+    assert sess.resume_candidates == []
+    assert sess.resume_selection_expires_at == 0
+
+
+@pytest.mark.asyncio
+async def test_api_reset_session_clears_current_context_without_rebinding(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "old-thread"
+    sess.chat = [{"role": "user", "text": "clear-chat"}]
+    session_home = bridge_module.get_session_codex_home_root(sess.session_id)
+    session_home.mkdir(parents=True)
+
+    response = await bridge_module.api_reset_session(
+        SimpleNamespace(match_info={"bot_id": bot.config["id"], "chat_key": "single:test-user"})
+    )
+    payload = json.loads(response.text)
+
+    assert response.status == 200
+    assert payload["action"] == "reset"
+    assert payload["sessionId"] == sess.session_id
+    assert bot.sessions["single:test-user"] is sess
+    assert sess.thread_id is None
+    assert sess.chat == []
+    assert session_home.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_new_session_waits_for_message_registration_lock(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sess.thread_id = "old-thread"
+    registration_started = asyncio.Event()
+    finish_registration = asyncio.Event()
+
+    async def blocked_registration(*_args, **_kwargs):
+        registration_started.set()
+        await finish_registration.wait()
+        return True
+
+    monkeypatch.setattr(bridge_module, "enqueue_message_for_session", blocked_registration)
+    enqueue_task = asyncio.create_task(
+        bridge_module.enqueue_message(bot, "single:test-user", "hello", "req-message")
+    )
+    await asyncio.wait_for(registration_started.wait(), timeout=1)
+
+    new_task = asyncio.create_task(bridge_module.new_session_context(bot, "single:test-user"))
+    await asyncio.sleep(0)
+
+    assert new_task.done() is False
+    assert sess.thread_id == "old-thread"
+
+    finish_registration.set()
+    assert await enqueue_task is True
+    result = await new_task
+
+    assert result["threadId"] is None
+    assert result["sessionId"] != sess.session_id
+    assert sess.thread_id == "old-thread"
+    assert bot.sessions["single:test-user"].thread_id is None
+
+
+@pytest.mark.asyncio
 async def test_respond_info_keeps_intermediate_reply_open(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -16433,8 +16794,28 @@ async def test_respond_info_sends_long_messages_in_chunks(bridge_module):
     await bridge_module.respond_info(bot, "req-1", message)
 
     assert len(sent) == 3
-    assert [payload["body"]["stream"]["finish"] for payload in sent] == [False, False, True]
+    assert all(payload["body"]["stream"]["finish"] is True for payload in sent)
+    visible = {payload["body"]["stream"]["id"]: payload["body"]["stream"]["content"] for payload in sent}
+    assert "".join(visible.values()) == message
     assert "".join(payload["body"]["stream"]["content"] for payload in sent) == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [3000, 8000])
+async def test_long_proactive_fallback_preserves_the_complete_final_reply(bridge_module, length):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    sent = []
+    bot.ws = make_acking_ws(bot, sent.append)
+    bridge_module.register_reply_session(bot, "req-1", sess)
+    sess.reply_proactive_req_ids.add("req-1")
+    message = "x" * length
+
+    await bridge_module.respond_info(bot, "req-1", message)
+
+    assert all(payload["cmd"] == "aibot_send_msg" for payload in sent)
+    assert "".join(payload["body"]["markdown"]["content"] for payload in sent) == message
+    assert len({payload["headers"]["req_id"] for payload in sent}) == len(sent)
 
 
 def test_split_text_chunks_preserves_internal_whitespace(bridge_module):
@@ -16586,7 +16967,7 @@ async def test_send_session_status_times_out_when_send_lock_is_busy(bridge_modul
 
 
 @pytest.mark.asyncio
-async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
+async def test_send_session_status_keeps_one_updatable_preview(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     sent_payloads = []
@@ -16595,27 +16976,29 @@ async def test_send_session_status_sends_long_text_in_chunks(bridge_module):
     delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "x" * 8000)
 
     assert delivered is True
-    assert len(sent_payloads) == 3
-    assert sent_payloads[0]["body"]["stream"]["finish"] is False
-    assert sent_payloads[1]["body"]["stream"]["finish"] is False
-    assert sent_payloads[2]["body"]["stream"]["finish"] is False
-    assert "".join(item["body"]["stream"]["content"] for item in sent_payloads) == "x" * 8000
+    assert len(sent_payloads) == 1
+    stream = sent_payloads[0]["body"]["stream"]
+    assert stream["finish"] is False
+    assert stream["id"] == sess.session_id
+    assert len(stream["content"]) <= bridge_module.STREAM_TEXT_MAX_CHARS
+    assert stream["content"].startswith("x")
+    assert "完整内容将在最终回复中显示" in stream["content"]
 
 
 @pytest.mark.asyncio
-async def test_send_session_status_preserves_only_unsent_tail_after_partial_failure(bridge_module):
+async def test_final_reply_preserves_only_unsent_tail_after_partial_failure(bridge_module):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     sent_payloads = []
-    expected = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, False)
+    expected = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * 8000, True)
     bot.ws = make_flaky_acking_ws(bot, fail_on_send_number=2, on_send=sent_payloads.append)
 
-    delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "x" * 8000)
+    delivered = await bridge_module.send_or_store_session_payloads(bot, "single:test-user", sess, expected, True)
 
     assert delivered is False
     assert sent_payloads == [expected[0]]
-    assert sess.pending_stream_payloads == expected[1:]
-    assert sess.pending_stream_payload == expected[-1]
+    assert sess.pending_final_payloads == expected[1:]
+    assert sess.pending_final_payload == expected[-1]
 
 
 @pytest.mark.asyncio
@@ -17209,6 +17592,22 @@ async def test_interrupt_command_resumes_preserved_queue_after_reply(bridge_modu
 
 
 @pytest.mark.asyncio
+async def test_interrupt_stream_close_is_cached_when_websocket_is_unavailable(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bridge_module.register_reply_session(bot, "req-running", sess)
+
+    await bridge_module.finish_interrupted_reply_streams(
+        bot, "single:test-user", sess, ["req-running"]
+    )
+
+    assert sess.pending_final_payload is not None
+    assert sess.pending_final_payload["body"]["stream"] == {
+        "id": sess.session_id, "finish": True, "content": "任务已中断。"
+    }
+
+
+@pytest.mark.asyncio
 async def test_interrupt_command_discards_provisional_thread_from_fresh_run(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
@@ -17229,7 +17628,9 @@ async def test_interrupt_command_discards_provisional_thread_from_fresh_run(brid
 
         async def wait(self):
             process_started.set()
-            await asyncio.Future()
+            while self.returncode is None:
+                await asyncio.sleep(0)
+            return self.returncode
 
         def kill(self):
             self.returncode = -9
@@ -17390,8 +17791,8 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
     await bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", [])
 
     assert payloads[-1] == (True, "final answer")
-    assert payloads[0] == (False, "运行状态：正在启动处理。")
-    assert payloads[1] == (False, "运行状态：思考中，已运行 0s。")
+    assert payloads[0] == (False, "**运行状态：启动中**")
+    assert payloads[1] == (False, "**运行状态：分析中**")
     assert str(captured["cwd"]) == str(bridge_module.get_workfile_dir(bot.config["id"], "test-user"))
     assert captured["args"][-1] == "-"
     assert bytes(captured["stdin"].buffer).decode("utf-8") == "prompt"
@@ -17411,6 +17812,160 @@ async def test_run_codex_sends_running_status_before_final(bridge_module, monkey
     assert captured["env"]["TMPDIR"] == chatfile_dir
     assert captured["env"]["TMP"] == chatfile_dir
     assert captured["env"]["TEMP"] == chatfile_dir
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expire_stream", [False, True])
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypatch, expire_stream, backend):
+    bot = make_bot(bridge_module)
+    bot.config["agentBackend"] = backend
+    sess = make_session(bridge_module, bot)
+    sess.running = True
+    ticks = asyncio.Queue()
+    finish = asyncio.Event()
+    statuses = []
+    finals = []
+    stream_closures = []
+    expired = False
+    real_sleep = asyncio.sleep
+    now = bridge_module.time.monotonic()
+
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self):
+            return now
+
+    async def controlled_sleep(seconds):
+        nonlocal now
+        if seconds != bridge_module.STATUS_STREAM_INTERVAL_SEC:
+            await real_sleep(seconds)
+            return
+        gate = asyncio.get_running_loop().create_future()
+        ticks.put_nowait(gate)
+        await gate
+        now += seconds
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        def feed(self, text):
+            event = (
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+                if backend == "claude"
+                else {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+            )
+            self.stdout.feed_data((json.dumps(event) + "\n").encode())
+
+        def feed_event(self, event):
+            self.stdout.feed_data((json.dumps(event) + "\n").encode())
+
+        async def wait(self):
+            await finish.wait()
+            self.feed("final answer")
+            self.stdout.feed_eof()
+            self.returncode = 0
+            return 0
+
+    process = FakeProcess()
+
+    async def create_process(*args, **kwargs):
+        return process
+
+    async def send_status(_bot, _key, _sess, _req, content):
+        statuses.append(content)
+        return True
+
+    async def send_final(_bot, _key, _sess, payload, final):
+        finals.append(payload)
+        return True
+
+    async def close_stream(_bot, _key, _sess, req_id):
+        stream_closures.append(req_id)
+        _sess.reply_proactive_req_ids.add(req_id)
+
+    monkeypatch.setattr(bridge_module, "time", Clock())
+    monkeypatch.setattr(bridge_module.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(bridge_module, "send_session_status", send_status)
+    monkeypatch.setattr(bridge_module, "send_or_store_session_payload", send_final)
+    monkeypatch.setattr(bridge_module, "reply_age_too_long", lambda *_args: expired)
+    monkeypatch.setattr(bridge_module, "close_reply_stream_for_proactive", close_stream)
+    run = asyncio.create_task(bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", []))
+
+    async def next_tick():
+        return await asyncio.wait_for(ticks.get(), timeout=3)
+
+    try:
+        gate = await next_tick()
+        initial_statuses = list(statuses)
+        for _ in range(3):
+            gate.set_result(None)
+            gate = await next_tick()
+        assert statuses == initial_statuses
+        expired = expire_stream
+        summary_event = {
+            "type": "item.reasoning.summaryPartAdded",
+            "summary": "正在核对配置并整理结果",
+        } if backend == "codex" else {
+            "type": "assistant", "message": {"content": [{"type": "text", "text": "正在核对配置并整理结果"}]},
+        }
+        process.feed_event(summary_event)
+        gate.set_result(None)
+        gate = await next_tick()
+        stage = "分析中" if backend == "codex" else "整理中"
+        assert statuses[-1] == f"**运行状态：{stage}**\n\n正在核对配置并整理结果"
+        for _ in range(3):
+            gate.set_result(None)
+            gate = await next_tick()
+        assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 1
+        assert stream_closures == (["req-1"] if expire_stream else [])
+
+        tool_event = {
+            "type": "item.started",
+            "item": {"type": "command_execution", "command": "pytest tests/test_api.py", "aggregated_output": "private output"},
+        } if backend == "codex" else {
+            "type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "pytest tests/test_api.py"}}]},
+        }
+        process.feed_event(tool_event)
+        gate.set_result(None)
+        gate = await next_tick()
+        stage = "执行中" if backend == "codex" else "处理中"
+        assert statuses[-1] == f"**运行状态：{stage}**\n\n正在核对配置并整理结果"
+        for _ in range(2):
+            process.feed_event(tool_event)
+            gate.set_result(None)
+            gate = await next_tick()
+        assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 1
+
+        updates = (
+            ("checking logs", "checking logs"),
+            ("checking logs", "checking logs"),
+            ("checking logs  \n", "checking logs"),
+            ("collecting results", "collecting results"),
+            ("long summary " + "x" * 4000, "long summary"),
+            ("long summary " + "x" * 4000 + "new hidden tail", "long summary"),
+        )
+        for text, visible_text in updates:
+            process.feed(text)
+            gate.set_result(None)
+            gate = await next_tick()
+            assert sum(visible_text in status for status in statuses) == 1
+        assert not any("已运行" in status for status in statuses)
+        assert not any("分析：" in status or "Process requested" in status or "pytest tests/test_api.py" in status or "private output" in status for status in statuses)
+    finally:
+        finish.set()
+        await asyncio.wait_for(run, timeout=3)
+
+    assert finals[-1]["body"]["stream"]["content"] == "final answer"
+    assert finals[-1]["body"]["stream"]["finish"] is True
 
 
 @pytest.mark.asyncio
@@ -18232,7 +18787,7 @@ async def test_run_codex_retries_fresh_exec_when_resume_thread_not_found_but_exi
 
 
 @pytest.mark.asyncio
-async def test_reset_then_image_then_text_uses_fresh_exec_with_image_and_stdin_prompt(bridge_module, monkeypatch):
+async def test_new_then_image_then_text_uses_fresh_exec_with_image_and_stdin_prompt(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     sess.thread_id = "old-thread"
@@ -18294,8 +18849,12 @@ async def test_reset_then_image_then_text_uses_fresh_exec_with_image_and_stdin_p
     monkeypatch.setattr(bridge_module, "download_incoming_media", fake_download_incoming_media)
     monkeypatch.setattr(bridge_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    await bridge_module.reset_session_command(bot, "single:test-user", None)
+    await bridge_module.new_session_command(bot, "single:test-user", None)
+    previous = sess
+    sess = bot.sessions["single:test-user"]
     assert sess.thread_id is None
+    assert sess.session_id != previous.session_id
+    assert previous.thread_id == "old-thread"
 
     await bridge_module.enqueue_media_message(
         bot,
@@ -18401,3 +18960,267 @@ async def test_run_codex_ignores_legacy_claude_run_as_configuration(bridge_modul
     assert captured["env"]["WECOM_BRIDGE_WORKFILE_DIR"] == str(
         bridge_module.get_workfile_dir(bot.config["id"], "test-user").resolve()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [3000, 8000])
+async def test_quiet_five_minute_run_finishes_existing_stream(bridge_module, monkeypatch, length):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    bot.ws = SimpleNamespace(closed=False)
+    bridge_module.register_reply_session(bot, "req-1", sess)
+    sess.reply_started_at["req-1"] = time.time() - 300
+    sess.reply_last_sent_at["req-1"] = time.time() - 300
+    sent = []
+
+    async def send_with_ack(_bot, payload, _timeout_sec, **kwargs):
+        sent.append(payload)
+        return {"errcode": 0, "body": {}}
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", send_with_ack)
+    payloads = bridge_module.build_session_text_payloads("single:test-user", sess, "req-1", "x" * length, True)
+    delivered = await bridge_module.send_or_store_session_payloads(bot, "single:test-user", sess, payloads, True)
+
+    assert delivered is True
+    assert all(payload["cmd"] == "aibot_respond_msg" for payload in sent)
+    assert all(payload["body"]["stream"]["finish"] is True for payload in sent)
+    assert "".join(payload["body"]["stream"]["content"] for payload in sent) == "x" * length
+
+
+@pytest.mark.asyncio
+async def test_wecom_voice_and_quote_are_business_context_not_control(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    received = []
+
+    async def enqueue(_bot, key, content, req_id, **kwargs):
+        received.append((key, content, req_id))
+        return True
+
+    monkeypatch.setattr(bridge_module, "enqueue_message", enqueue)
+    await bridge_module.handle_wecom_message(bot, {
+        "cmd": "aibot_msg_callback", "headers": {"req_id": "voice-1"},
+        "body": {"msgtype": "voice", "chattype": "single", "from": {"userid": "alice"},
+                 "voice": {"content": "重跑这个"}, "quote": {"msgtype": "text", "text": {"content": "/bridge-reset"}}},
+    })
+    assert len(received) == 1
+    assert received[0][0] == "single:alice"
+    assert "用户请求：\n重跑这个" in received[0][1]
+    assert "引用消息：\n/bridge-reset" in received[0][1]
+    assert received[0][2] == "voice-1"
+
+
+@pytest.mark.asyncio
+async def test_wecom_voice_transcription_alias_reaches_business_session(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    received = []
+
+    async def enqueue(_bot, key, content, req_id, **kwargs):
+        received.append((key, content, req_id))
+        return True
+
+    monkeypatch.setattr(bridge_module, "enqueue_message", enqueue)
+    await bridge_module.handle_wecom_message(bot, {
+        "cmd": "aibot_msg_callback", "headers": {"req_id": "voice-alias-1"},
+        "body": {"msgtype": "voice", "chattype": "single", "from": {"userid": "alice"},
+                 "voice": {"recognition": "哈喽"}},
+    })
+
+    assert received == [("single:alice", "哈喽", "voice-alias-1")]
+
+
+@pytest.mark.asyncio
+async def test_assistant_parts_invoke_business_once_after_all_inputs(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    calls = []
+
+    async def dispatch(_bot, frames):
+        calls.append(frames)
+
+    monkeypatch.setattr(bridge_module, "dispatch_assistant_call", dispatch)
+    def frame(part):
+        return {"cmd": "aibot_msg_callback", "headers": {"req_id": f"part-{part}"},
+                "body": {"msgid": f"message-{part}", "msgtype": "text", "chattype": "group", "chatid": "assistant-room",
+                         "from": {"userid": "alice"}, "text": {"content": f"part {part}"},
+                         "compat_info": {"source": "ai_assistant", "from_ai_assistant": {"task_id": "assistant-call", "sub_id": part, "total_sub_count": 2}}}}
+    await bridge_module.handle_wecom_message(bot, frame(2))
+    assert calls == []
+    await bridge_module.handle_wecom_message(bot, frame(1))
+    await bridge_module.handle_wecom_message(bot, frame(2))
+    assert len(calls) == 1
+    assert [item["headers"]["req_id"] for item in calls[0]] == ["part-1", "part-2"]
+
+
+@pytest.mark.asyncio
+async def test_assistant_long_result_finishes_on_last_message_only(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot, "group-user:assistant-room:alice")
+    bot.callback_contexts["req-ai"] = {"assistant_task_id": "call-1", "source": "ai_assistant", "received_at": time.monotonic(), "streams": {}, "target": (2, "assistant-room")}
+    bridge_module.register_reply_session(bot, "req-ai", sess)
+    payloads = bridge_module.build_session_text_payloads("group-user:assistant-room:alice", sess, "req-ai", "x" * 8000, True)
+    assert len(payloads) >= 3
+    assert all(payload["body"]["to_ai_assistant"]["reply_status"] == "waiting" for payload in payloads[:-1])
+    assert payloads[-1]["body"]["to_ai_assistant"]["reply_status"] == "finished"
+    assert bridge_module.reply_payload_finished(payloads[0]) is False
+    assert bridge_module.reply_payload_finished(payloads[-1]) is True
+
+
+@pytest.mark.asyncio
+async def test_feedback_is_recorded_without_sending_an_event_reply(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append(args)
+
+    monkeypatch.setattr(bridge_module, "send_ws_payload_with_ack", send)
+    def frame(verdict):
+        return {"cmd": "aibot_event_callback", "headers": {"req_id": f"feedback-{verdict}"},
+                "body": {"msgtype": "event", "from": {"userid": "alice"},
+                         "event": {"eventtype": "feedback_event", "feedback_event": {"id": "reply-1", "type": verdict}}}}
+    await bridge_module.handle_wecom_message(bot, frame(2))
+    await bridge_module.handle_wecom_message(bot, frame(3))
+    assert sent == []
+    assert bot.feedback_records["reply-1"]["type"] == 3
+    bot.feedback_records.clear()
+    assert bridge_module.load_wecom_feedback(bot)["reply-1"]["type"] == 3
+
+
+@pytest.mark.asyncio
+async def test_ws_reader_receives_card_ack_before_starting_business(bridge_module, monkeypatch):
+    bot = make_bot(bridge_module)
+    messages = asyncio.Queue()
+    finished = asyncio.Event()
+    order = []
+    bot.template_card_payloads["card-1"] = {"card_type": "button_interaction", "task_id": "card-1", "main_title": {"title": "执行"},
+                                          "button_list": [{"text": "开始", "key": "go", "style": 1}]}
+    bot.template_card_button_texts["card-1"] = {"go": "开始"}
+
+    class Socket:
+        closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await messages.get()
+
+        async def send_json(self, payload):
+            order.append(payload["cmd"])
+            response = {"headers": {"req_id": payload["headers"]["req_id"]}, "errcode": 0}
+            await messages.put(SimpleNamespace(type=bridge_module.WSMsgType.TEXT, data=json.dumps(response)))
+
+    async def enqueue(*args, **kwargs):
+        order.append("business")
+        finished.set()
+        return True
+
+    monkeypatch.setattr(bridge_module, "enqueue_message", enqueue)
+    bot.ws = Socket()
+    frame = {"cmd": "aibot_event_callback", "headers": {"req_id": "click-1"},
+             "body": {"msgtype": "event", "from": {"userid": "alice"}, "event": {"eventtype": "template_card_event",
+                      "template_card_event": {"card_type": "button_interaction", "task_id": "card-1", "event_key": "go"}}}}
+    await messages.put(SimpleNamespace(type=bridge_module.WSMsgType.TEXT, data=json.dumps(frame)))
+    reader = asyncio.create_task(bridge_module.ws_reader_loop(bot, bot.ws))
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=1)
+    finally:
+        reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+        if bot.callback_tasks:
+            await asyncio.gather(*bot.callback_tasks, return_exceptions=True)
+    assert order == ["aibot_respond_update_msg", "business"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,mention", [("robot", "@robot"), ("Leo C", "@Leo C"), ("robot", "@实际显示名")])
+@pytest.mark.parametrize("mode", ["per-user", "shared"])
+@pytest.mark.parametrize("command,confirmation", [
+    ("/new", "New session ready. Your next message will start a new thread."),
+    ("/bridge-reset", "Session reset. Your next message will start a new thread."),
+    ("/bridge-interrupt", "Current task interrupted."),
+])
+async def test_group_session_commands_control_only_the_addressed_session(
+    bridge_module, monkeypatch, name, mention, mode, command, confirmation,
+):
+    bot = make_bot(bridge_module, name=name)
+    bot.config["groupSessionMode"] = mode
+    key = "group-user:room-1:alice" if mode == "per-user" else "group:room-1"
+    other_key = "group-user:room-1:bob" if mode == "per-user" else "group:room-2"
+    previous = make_session(bridge_module, bot, key)
+    other = make_session(bridge_module, bot, other_key)
+    for session_key, sess in [(key, previous), (other_key, other)]:
+        sess.thread_id = f"thread-{session_key}"
+        sess.chat = [{"role": "user", "text": session_key}]
+        bridge_module.update_owned_session_record(
+            bot, session_key, sess,
+            lambda record: {**record, "threadId": sess.thread_id, "recentChat": list(sess.chat)},
+        )
+    previous_record = bridge_module.read_session_record_by_id(previous.session_id)
+    other_record = bridge_module.read_session_record_by_id(other.session_id)
+    sent = []
+
+    bot.ws = make_acking_ws(bot, sent.append)
+
+    async def reject_enqueue(*args, **kwargs):
+        raise AssertionError("session commands must not be sent to the agent")
+
+    monkeypatch.setattr(bridge_module, "enqueue_message", reject_enqueue)
+    await bridge_module.handle_wecom_message(bot, {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-group-command"},
+        "body": {
+            "msgtype": "text", "chattype": "group", "chatid": "room-1",
+            "from": {"userid": "alice"}, "text": {"content": f"{mention} {command}"},
+        },
+    })
+
+    current = bot.sessions[key]
+    assert bot.sessions[other_key] is other
+    assert bridge_module.read_session_record_by_id(other.session_id) == other_record
+    assert other.thread_id == f"thread-{other_key}"
+    assert other.chat == [{"role": "user", "text": other_key}]
+    assert bridge_module.read_session_record_by_key(bot.config["id"], key)["sessionId"] == current.session_id
+    if command == "/new":
+        assert current.session_id != previous.session_id
+        assert current.thread_id is None
+        assert current.chat == []
+        stored = bridge_module.read_session_record_by_id(previous.session_id)
+        assert stored["threadId"] == previous_record["threadId"]
+        assert stored["recentChat"] == previous_record["recentChat"]
+    elif command == "/bridge-reset":
+        assert current is previous
+        assert current.thread_id is None
+        assert current.chat == []
+    else:
+        assert current is previous
+        assert current.thread_id == previous_record["threadId"]
+        assert current.chat == previous_record["recentChat"]
+    assert len(sent) == 1
+    assert sent[0]["cmd"] == "aibot_respond_msg"
+    assert sent[0]["headers"]["req_id"] == "req-group-command"
+    assert sent[0]["body"]["stream"]["content"] == confirmation
+    assert sent[0]["body"]["stream"]["finish"] is True
+    assert bot.callback_contexts["req-group-command"]["target"] == (2, "room-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["解释 /new", "`/new`", "/newton", "/new extra", "> /new"])
+async def test_group_ordinary_text_is_not_a_session_command(bridge_module, monkeypatch, content):
+    bot = make_bot(bridge_module, name="robot")
+    captured = []
+
+    async def capture_message(_bot, key, text, req_id, **kwargs):
+        captured.append((key, text, req_id))
+
+    monkeypatch.setattr(bridge_module, "enqueue_message", capture_message)
+    await bridge_module.handle_wecom_message(bot, {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-group-text"},
+        "body": {
+            "msgtype": "text", "chattype": "group", "chatid": "room-1",
+            "from": {"userid": "alice"}, "text": {"content": f"@robot {content}"},
+        },
+    })
+    assert captured == [("group-user:room-1:alice", content, "req-group-text")]
+    assert bot.sessions == {}

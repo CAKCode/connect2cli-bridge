@@ -145,7 +145,7 @@ def load_app_config(environ: dict[str, str] | None = None, *, env_file: Path | N
     for root in file_send_roots:
         if root.exists() and not root.is_dir():
             raise ValueError(f"file send root is not a directory: {root}")
-    max_upload_size = max(1, int(str(values.get("MAX_UPLOAD_SIZE") or str(100 * 1024 * 1024)).strip()))
+    max_upload_size = max(1, int(str(values.get("MAX_UPLOAD_SIZE") or str(20 * 1024 * 1024)).strip()))
     bot_secret_file = Path(require_env(values, "WECOM_BOT_SECRET_FILE")).expanduser().resolve()
     bot_secret = read_secret_file(bot_secret_file)
     workspace_mode = (str(values.get("WECOM_BOT_WORKSPACE_MODE") or values.get("WECOM_WORKSPACE_MODE") or "").strip().lower() or "")

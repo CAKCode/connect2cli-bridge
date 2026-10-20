@@ -19,7 +19,7 @@ English overview: [README.en.md](README.en.md)
 - 为会话启动可选 agent backend（`codex` / `claude`），并在当前运行态可恢复时尝试原生 resume
 - 为组内多人协作提供隔离 workspace，保证每人文件和代码操作互不影响
 - 提供全局共享 skill 与个人私有 skill 的分层注入和隔离
-- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/bridge-resume`、`/local-resume`、`/local-detach`、`/cwd`
+- 提供会话控制命令 `/bridge-status`、`/bridge-interrupt`、`/bridge-reset`、`/new`、`/bridge-resume`、`/local-resume`、`/local-detach`、`/cwd`
 - 下载企微图片/文件到本地 workspace
 - 对外暴露运行状态和最新摘要，便于前端轮询刷新
 - 对超长运行会话支持企微 10 分钟后的分段回复与后续续传
@@ -350,6 +350,7 @@ curl -s http://127.0.0.1:9299/api/bots \
 - `DELETE /api/bots/{bot_id}`
 - `GET /api/bots/{bot_id}/sessions/{chat_key}/chat`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/interrupt`
+- `POST /api/bots/{bot_id}/sessions/{chat_key}/new`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/reset`
 - `POST /api/send-file`
 - `GET /api/schedules`
@@ -445,20 +446,26 @@ python3 ./schedule_message.py \
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/new`
 - `/bridge-resume`
 - `/local-resume`
 - `/local-resume <sessionId>`
 - `/local-detach`
 - `/cwd`
 
+群聊中先 @机器人再输入命令，例如 `@机器人 /new` 或 `@机器人 /bridge-interrupt`。
+`groupSessionMode=per-user` 时只控制发送者在当前群的会话；`shared` 时控制当前群的共享会话。命令确认回复发送到原群聊。
+
 语义：
 
 - `/bridge-status`
-  查看当前会话状态、排队数、定时任务数、`sessionId`、`threadId`
+  查看当前 Bridge 会话状态、排队数、定时任务数、`sessionId`、`threadId`，并附加 Codex 原生 `/status` 的模型、权限、token/context 等信息
 - `/bridge-interrupt`
   中断当前任务，但保留当前 thread 和聊天上下文
 - `/bridge-reset`
-  中断当前任务，并清空当前会话上下文
+  等待当前任务退出，在当前 `sessionId` 内清除 thread、聊天记录、队列、附件上下文和该 session 的 Codex 状态；下一条消息绑定新 thread
+- `/new`
+  等待当前任务退出，保留旧 session 的 thread、聊天记录和 Codex 状态，创建并绑定新的 `sessionId`；旧会话仍可通过 `/bridge-resume` 选择
 - `/bridge-resume`
   列出当前用户在当前运行态内可恢复的会话；回复编号可选择，或直接发送 `/bridge-resume <sessionId>`
 - `/local-resume`
@@ -478,11 +485,11 @@ shared 群会话不支持该能力，且同一个本地 Codex 会话同一时间
 
 ## 长时运行回复策略
 
-企业微信单次会话回包存在时效限制。对运行时间很长的任务，Bridge 会在原始响应窗口内尽量持续更新；超过窗口后，会切换到主动消息续传模式。
+企业微信单次会话回包存在时效限制。对运行时间很长的任务，Bridge 会在原始响应窗口内仅在进展变化时更新；超过窗口后，会切换到主动消息续传模式。
 
 这意味着：
 
-- 运行早期优先走同一条回复流，便于用户看到连续状态
+- 运行早期走同一条回复流，只在正文或阶段变化时更新；等待时使用企微原生流式指示，不刷新运行秒数或动画点
 - 超过较长时长后，会转为分段主动回复，而不是整段结果丢失
 - 在群 `per-user` 会话里，主动续传消息会继续 `@` 原触发成员，避免消息混淆
 - 前端或调用方可根据运行状态和最近摘要判断是否仍在继续输出
@@ -490,6 +497,7 @@ shared 群会话不支持该能力，且同一个本地 Codex 会话同一时间
 同样的控制能力也可通过 session API 完成：
 
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/interrupt`
+- `POST /api/bots/{bot_id}/sessions/{chat_key}/new`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/reset`
 
 ## 常用环境变量
@@ -512,6 +520,8 @@ shared 群会话不支持该能力，且同一个本地 Codex 会话同一时间
   全局默认 `claude` 可执行命令
 - `MAX_CONCURRENT_CODEX_RUNS`
   并发 `codex exec` 上限
+- `SESSION_TTL`
+  Session Codex Home 的空闲保留时长，单位为秒，默认 30 天，最短 30 分钟
 - `WECOM_BOT_AGENT_BACKEND`
   单 Bot backend，默认 `codex`
 - `WECOM_BOT_AGENT_COMMAND`
@@ -619,6 +629,8 @@ sh ./check_compatibility_runtime.sh
 `check_multi_user_readiness.sh` 会依次执行后两套门禁。GitHub Actions 使用相同命令，避免 CI 与本地验收标准分叉。
 
 ## 相关文档
+
+- [企业微信消息能力对齐](docs/wecom-protocol-alignment.md)：智能助理输入聚合、回复状态、限流、原生媒体和反馈查询。
 
 - [README.en.md](README.en.md)
   英文版入口文档

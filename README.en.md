@@ -16,7 +16,7 @@ Chinese docs:
 - Manages multiple bot configurations and persistence
 - Starts `codex exec` per session and attempts `codex exec resume` only when a runtime thread is still available
 - Supports built-in session control commands:
-  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`, `/bridge-resume`, `/local-resume`, `/local-detach`, `/cwd`
+  `/bridge-status`, `/bridge-interrupt`, `/bridge-reset`, `/new`, `/bridge-resume`, `/local-resume`, `/local-detach`, `/cwd`
 - Downloads inbound WeCom images and files into local workspaces
 - Sends local files back to WeCom through a local command or JSON API
 - Supports one-shot scheduled messages and cron-based recurring schedules
@@ -237,6 +237,7 @@ Main endpoints:
 - `DELETE /api/bots/{bot_id}`
 - `GET /api/bots/{bot_id}/sessions/{chat_key}/chat`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/interrupt`
+- `POST /api/bots/{bot_id}/sessions/{chat_key}/new`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/reset`
 - `POST /api/send-file`
 - `GET /api/schedules`
@@ -324,20 +325,26 @@ These commands are intercepted by the bridge and are not forwarded to Codex:
 - `/bridge-status`
 - `/bridge-interrupt`
 - `/bridge-reset`
+- `/new`
 - `/bridge-resume`
 - `/local-resume`
 - `/local-resume <sessionId>`
 - `/local-detach`
 - `/cwd`
 
+In group chats, mention the bot before the command, for example `@Bot /new` or `@Bot /bridge-interrupt`.
+With `groupSessionMode=per-user`, commands affect the sender's session in that group; with `shared`, they affect the group's shared session. Confirmations are sent to the original group chat.
+
 Meaning:
 
 - `/bridge-status`
-  show session state, queue size, scheduled count, `sessionId`, and `threadId`
+  show Bridge session state, queue size, scheduled count, `sessionId`, and `threadId`, followed by native Codex `/status` model, permissions, token, and context details
 - `/bridge-interrupt`
   stop the current run but keep thread and chat context
 - `/bridge-reset`
-  stop the current run and clear session context
+  wait for the current run to exit, then clear the thread, chat, queue, attachments, and Codex state in the current `sessionId`
+- `/new`
+  wait for the current run to exit, preserve the old session and its Codex state, then create and bind a new `sessionId`; select an older session later with `/bridge-resume`
 - `/bridge-resume`
   list resumable sessions visible to the current chat; reply with the index or send `/bridge-resume <sessionId>`
 - `/local-resume`
@@ -358,6 +365,7 @@ at a time. The current session must have no running, queued, or pending-delivery
 The same controls are also exposed by API:
 
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/interrupt`
+- `POST /api/bots/{bot_id}/sessions/{chat_key}/new`
 - `POST /api/bots/{bot_id}/sessions/{chat_key}/reset`
 
 ## Feature Guide

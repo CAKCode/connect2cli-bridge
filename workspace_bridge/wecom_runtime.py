@@ -8,11 +8,17 @@ from pathlib import Path
 import aiohttp
 from aiohttp import WSMsgType
 
+from . import context as runtime_context
 from .async_utils import run_blocking
+from .codex_status import collect_codex_status, format_codex_status
 from .execution import flush_cached_runtime_payloads, send_or_cache_runtime_payload, session_run_guards, stream_text_message_once
 from .layout import build_workspace_ref
+from .process_control import terminate_process_tree
 from .reply_state import cleanup_reply_state
 from .runtime import (
+    copy_session_resume_state,
+    create_new_session_run,
+    current_session_id,
     list_session_records,
     load_session_record,
     path_within_root,
@@ -21,7 +27,6 @@ from .runtime import (
     remove_session_codex_home,
     resolve_personal_session_cwd,
     resolve_personal_skill_dir,
-    stable_session_id,
     update_session_record,
 )
 from .schedule import advance_schedule_definition_after_success, schedule_processing_root
@@ -40,9 +45,15 @@ from .wecom_protocol import (
     strip_text_mentions,
 )
 from .wecom_upload import reject_pending_requests, resolve_pending_request, ws_send_json
+from .wecom_context import callback_context, feedback_event, message_source, message_text, quoted_media, text_with_quote
+from .inbound_media import download_callback_media
+from .atomic_io import atomic_write_json
+from .models import WeComTextMessage
+from .wecom_protocol import chat_key_to_send_target
 
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 RESUME_SELECTION_TTL_MS = 5 * 60 * 1000
+SESSION_CONTROL_EXIT_TIMEOUT_SEC = 5.0
 
 
 def _set_wecom_state(runtime, status: str | None, error: str | None = None) -> None:
@@ -55,16 +66,70 @@ def _interrupt_error_suppressed(exc: Exception) -> bool:
     return "terminated" in text or "cancelled" in text or "canceled" in text
 
 
-async def _wait_for_process_exit(process, timeout_sec: float = 1.0) -> None:
-    wait_method = getattr(process, "wait", None)
-    if not callable(wait_method):
+def _session_lifecycle_lock(runtime, chat_key: str) -> asyncio.Lock:
+    lock = runtime.session_lifecycle_locks.get(chat_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        runtime.session_lifecycle_locks[chat_key] = lock
+    return lock
+
+
+def _request_process_termination(process) -> None:
+    if process is None or getattr(process, "returncode", None) is not None:
         return
-    with __import__("contextlib").suppress(asyncio.TimeoutError, Exception):
-        await asyncio.wait_for(wait_method(), timeout=timeout_sec)
+    terminate = getattr(process, "terminate", None)
+    if callable(terminate):
+        try:
+            terminate()
+        except ProcessLookupError:
+            pass
+
+
+async def _confirm_process_exit(process, timeout_sec: float = SESSION_CONTROL_EXIT_TIMEOUT_SEC) -> None:
+    if await terminate_process_tree(process, timeout_sec=timeout_sec):
+        return
+    raise RuntimeError("agent process did not exit; session context was not cleared")
+
+
+async def _confirm_task_exit(task, timeout_sec: float = SESSION_CONTROL_EXIT_TIMEOUT_SEC) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
+    except asyncio.CancelledError:
+        return
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("agent task did not exit; session context was not cleared") from exc
+    except Exception:
+        return
+
+
+def _runtime_status_session_values(runtime, chat_key: str, session_id: str | None):
+    session_record = load_session_record(runtime.config.runtime_root, session_id) if session_id else None
+    thread_id = str(
+        runtime.session_threads.get(chat_key)
+        or (session_record.thread_id if session_record is not None else "")
+        or ""
+    ).strip() or None
+    session_cwd = session_record.cwd_dir if session_record is not None else None
+    if session_cwd is not None:
+        current_cwd = Path(session_cwd)
+    else:
+        current_cwd = build_workspace_ref(
+            runtime.config.runtime_root,
+            runtime.config.workspace_namespace,
+            runtime.config.source.source_dir,
+            chat_key,
+            workspace_mode=runtime.config.workspace_mode,
+            agent_backend=runtime.config.agent_backend,
+        ).cwd_dir
+    return session_record, thread_id, current_cwd
 
 
 def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None = None) -> str:
-    session_record = load_session_record(runtime.config.runtime_root, session_id) if session_id else None
+    _session_record, thread_id, current_cwd = _runtime_status_session_values(runtime, chat_key, session_id)
     active_task = runtime.active_message_tasks.get(chat_key)
     active_schedule_task = runtime.active_schedule_tasks.get(chat_key)
     active = (
@@ -73,7 +138,6 @@ def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None 
         or (active_schedule_task is not None and not active_schedule_task.done())
         or chat_key in runtime.active_schedule_runs
     )
-    thread_id = str(runtime.session_threads.get(chat_key) or (session_record.thread_id if session_record is not None else "") or "").strip() or "-"
     pending_stream_count = 0
     for req_id, payloads in (runtime.pending_streams or {}).items():
         state = runtime.reply_states.get(req_id)
@@ -84,25 +148,11 @@ def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None 
         state = runtime.reply_states.get(req_id)
         if state is not None and state.chat_key == chat_key:
             pending_final_count += 1
-    session_cwd = session_record.cwd_dir if session_record is not None else None
-    if session_cwd is not None:
-        current_cwd = str(session_cwd)
-    else:
-        current_cwd = str(
-            build_workspace_ref(
-                runtime.config.runtime_root,
-                runtime.config.workspace_namespace,
-                runtime.config.source.source_dir,
-                chat_key,
-                workspace_mode=runtime.config.workspace_mode,
-                agent_backend=runtime.config.agent_backend,
-            ).cwd_dir
-        )
     return "\n".join(
         [
             f"chatKey: {chat_key}",
             f"sessionId: {session_id or '-'}",
-            f"threadId: {thread_id}",
+            f"threadId: {thread_id or '-'}",
             f"cwd: {current_cwd}",
             f"connected: {'yes' if runtime.connected else 'no'}",
             f"running: {'yes' if active else 'no'}",
@@ -110,6 +160,20 @@ def build_runtime_status_text(runtime, chat_key: str, *, session_id: str | None 
             f"pendingFinals: {pending_final_count}",
         ]
     )
+
+
+def build_runtime_codex_status_text(runtime, chat_key: str, *, session_id: str) -> str:
+    _session_record, thread_id, current_cwd = _runtime_status_session_values(runtime, chat_key, session_id)
+    session_home = Path(runtime.config.runtime_root) / ".bridge-codex-home" / "sessions" / session_id
+    snapshot = collect_codex_status(
+        default_codex_home=runtime_context.DEFAULT_CODEX_HOME,
+        session_codex_home=session_home,
+        directory=current_cwd,
+        thread_id=thread_id,
+        exec_mode=runtime.config.codex_exec_mode,
+        agent_backend=runtime.config.agent_backend,
+    )
+    return format_codex_status(snapshot)
 
 
 async def _handle_cwd_command(runtime, parsed, command_session_id: str, command_text: str) -> bool:
@@ -200,21 +264,29 @@ def _handle_message_task(chat_key: str, task, runtime) -> None:
 
 async def _interrupt_active_schedule_run_for_chat(runtime, chat_key: str) -> None:
     active = runtime.active_schedule_runs.get(chat_key)
+    schedule_task = runtime.active_schedule_tasks.get(chat_key)
+    if active is None and schedule_task is None:
+        return
     schedule_id = str(active[0]).strip() if active is not None and len(active) > 0 else ""
     request_id = str(active[1]).strip() if active is not None and len(active) > 1 else ""
     if request_id:
         runtime.suppressed_schedule_cancels.add((chat_key, request_id))
         runtime.terminal_schedule_cancels.add((chat_key, request_id))
-    schedule_task = runtime.active_schedule_tasks.pop(chat_key, None)
     process = runtime.active_processes.get(chat_key)
-    if schedule_task is not None:
-        with __import__("contextlib").suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            schedule_task.cancel()
-            await asyncio.wait_for(schedule_task, timeout=1.0)
-    if process is not None:
-        process.terminate()
-        await _wait_for_process_exit(process)
+    _request_process_termination(process)
+    try:
+        if process is not None:
+            await _confirm_process_exit(process)
+        await _confirm_task_exit(schedule_task)
+    except Exception:
+        if request_id:
+            runtime.suppressed_schedule_cancels.discard((chat_key, request_id))
+            runtime.terminal_schedule_cancels.discard((chat_key, request_id))
+        raise
+    if runtime.active_processes.get(chat_key) is process:
         runtime.active_processes.pop(chat_key, None)
+    if runtime.active_schedule_tasks.get(chat_key) is schedule_task:
+        runtime.active_schedule_tasks.pop(chat_key, None)
     runtime.active_schedule_runs.pop(chat_key, None)
     processing_root = schedule_processing_root(runtime.config.runtime_root)
     for path in processing_root.glob("*.json"):
@@ -241,6 +313,77 @@ async def _interrupt_active_schedule_run_for_chat(runtime, chat_key: str) -> Non
         cleanup_reply_state(runtime, cache_key)
         runtime.suppressed_schedule_cancels.discard((chat_key, request_id))
         runtime.terminal_schedule_cancels.discard((chat_key, request_id))
+
+
+async def _quiesce_session_for_context_change(runtime, chat_key: str) -> None:
+    await _interrupt_active_schedule_run_for_chat(runtime, chat_key)
+    process = runtime.active_processes.get(chat_key)
+    active_task = runtime.active_message_tasks.get(chat_key)
+    _request_process_termination(process)
+    await _confirm_process_exit(process)
+    if active_task is not None:
+        runtime.suppressed_failure_tasks.add(active_task)
+    await _confirm_task_exit(active_task)
+    if runtime.active_processes.get(chat_key) is process:
+        runtime.active_processes.pop(chat_key, None)
+    if runtime.active_message_tasks.get(chat_key) is active_task:
+        runtime.active_message_tasks.pop(chat_key, None)
+
+
+def _clear_session_reply_state(runtime, chat_key: str) -> None:
+    req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == chat_key]
+    for req_id in req_ids:
+        cleanup_reply_state(runtime, req_id)
+        if runtime.pending_streams is not None:
+            runtime.pending_streams.pop(req_id, None)
+        if runtime.pending_finals is not None:
+            runtime.pending_finals.pop(req_id, None)
+    _clear_resume_selection(runtime, chat_key)
+
+
+async def _start_new_session(runtime, chat_key: str) -> str:
+    async with _session_lifecycle_lock(runtime, chat_key):
+        await _quiesce_session_for_context_change(runtime, chat_key)
+
+        async with session_run_guards(runtime.config, chat_key):
+            previous_session_id = current_session_id(runtime.config, chat_key)
+            runtime.session_threads.pop(chat_key, None)
+            update_session_record(
+                runtime.config.runtime_root,
+                previous_session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(__import__("time").time() * 1000),
+                    last_run_at=int(__import__("time").time() * 1000),
+                ),
+            )
+            launch = await run_blocking(create_new_session_run, runtime.config, chat_key)
+            _clear_session_reply_state(runtime, chat_key)
+        return launch.session.session_id
+
+
+async def _reset_session(runtime, chat_key: str) -> str:
+    async with _session_lifecycle_lock(runtime, chat_key):
+        await _quiesce_session_for_context_change(runtime, chat_key)
+
+        async with session_run_guards(runtime.config, chat_key):
+            session_id = current_session_id(runtime.config, chat_key)
+            runtime.session_threads.pop(chat_key, None)
+            await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
+            await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
+            update_session_record(
+                runtime.config.runtime_root,
+                session_id,
+                lambda current: replace(
+                    current,
+                    updated_at=int(__import__("time").time() * 1000),
+                    last_run_at=int(__import__("time").time() * 1000),
+                    thread_id=None,
+                    recent_chat=(),
+                ),
+            )
+            _clear_session_reply_state(runtime, chat_key)
+        return session_id
 
 
 def _chat_key_to_room_id(chat_key: str) -> str | None:
@@ -342,6 +485,12 @@ async def _bind_resume_candidate(runtime, chat_key: str, candidate: dict[str, st
         if not thread_id:
             raise RuntimeError("selected session is no longer resumable")
         launch = await run_blocking(prepare_session_run, runtime.config, chat_key)
+        await run_blocking(
+            copy_session_resume_state,
+            runtime.config.runtime_root,
+            record.session_id,
+            launch.session.session_id,
+        )
         runtime.session_threads[chat_key] = thread_id
         update_session_record(
             runtime.config.runtime_root,
@@ -367,13 +516,7 @@ async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
         current_task = asyncio.current_task()
         if (current_task is not None and current_task in runtime.suppressed_failure_tasks) or _interrupt_error_suppressed(exc):
             return
-        session_id = stable_session_id(
-            runtime.config.bot_id,
-            parsed.chat_key,
-            runtime.config.source.source_dir,
-            runtime.config.workspace_namespace,
-            runtime.config.workspace_mode,
-        )
+        session_id = current_session_id(runtime.config, parsed.chat_key)
         runtime.last_status = "message_failed"
         runtime.last_error = str(exc)
         async with session_run_guards(runtime.config, parsed.chat_key):
@@ -399,24 +542,29 @@ async def _run_message_task(config, runtime, parsed, *, ws=None) -> None:
 
 
 async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
-    active_task = runtime.active_message_tasks.get(parsed.chat_key)
-    active_schedule_task = runtime.active_schedule_tasks.get(parsed.chat_key)
-    if (
-        (active_task is not None and not active_task.done())
-        or (active_schedule_task is not None and not active_schedule_task.done())
-        or parsed.chat_key in runtime.active_schedule_runs
-    ):
-        busy_session_id = stable_session_id(
-            runtime.config.bot_id,
-            parsed.chat_key,
-            runtime.config.source.source_dir,
-            runtime.config.workspace_namespace,
-            runtime.config.workspace_mode,
-        )
-        if runtime.ws is None and ws is not None:
-            original_ws = runtime.ws
-            runtime.ws = ws
-            try:
+    async with _session_lifecycle_lock(runtime, parsed.chat_key):
+        active_task = runtime.active_message_tasks.get(parsed.chat_key)
+        active_schedule_task = runtime.active_schedule_tasks.get(parsed.chat_key)
+        if (
+            (active_task is not None and not active_task.done())
+            or (active_schedule_task is not None and not active_schedule_task.done())
+            or parsed.chat_key in runtime.active_schedule_runs
+        ):
+            busy_session_id = current_session_id(runtime.config, parsed.chat_key)
+            if runtime.ws is None and ws is not None:
+                original_ws = runtime.ws
+                runtime.ws = ws
+                try:
+                    await send_or_cache_runtime_payload(
+                        runtime,
+                        parsed,
+                        busy_session_id,
+                        "已有任务在运行，请稍后再试或使用 /bridge-interrupt。",
+                        final=True,
+                    )
+                finally:
+                    runtime.ws = original_ws
+            else:
                 await send_or_cache_runtime_payload(
                     runtime,
                     parsed,
@@ -424,21 +572,11 @@ async def _dispatch_message(config, runtime, parsed, *, ws=None) -> None:
                     "已有任务在运行，请稍后再试或使用 /bridge-interrupt。",
                     final=True,
                 )
-            finally:
-                runtime.ws = original_ws
-        else:
-            await send_or_cache_runtime_payload(
-                runtime,
-                parsed,
-                busy_session_id,
-                "已有任务在运行，请稍后再试或使用 /bridge-interrupt。",
-                final=True,
-            )
-        return
-    task = asyncio.create_task(_run_message_task(config, runtime, parsed, ws=ws))
-    runtime.message_tasks.add(task)
-    runtime.active_message_tasks[parsed.chat_key] = task
-    task.add_done_callback(lambda completed, chat_key=parsed.chat_key: _handle_message_task(chat_key, completed, runtime))
+            return
+        task = asyncio.create_task(_run_message_task(config, runtime, parsed, ws=ws))
+        runtime.message_tasks.add(task)
+        runtime.active_message_tasks[parsed.chat_key] = task
+        task.add_done_callback(lambda completed, chat_key=parsed.chat_key: _handle_message_task(chat_key, completed, runtime))
 
 
 def _runtime_has_pending_payloads(runtime) -> bool:
@@ -454,7 +592,22 @@ async def _flush_pending_runtime_payloads_from_inbound(runtime, source: str) -> 
         runtime.last_error = str(exc)
 
 
-async def handle_wecom_payload(config, runtime, ws, payload, handler):
+async def _runtime_download_attachments(config, runtime, frame, media):
+    chat_key = chat_key_from_message(frame)
+    launch = await run_blocking(prepare_session_run, runtime.config, chat_key)
+    notes = []
+    for kind, value in media:
+        maximum = 30 * 1024 * 1024 if kind == "image" else 100 * 1024 * 1024
+        try:
+            path = await download_callback_media(launch.runtime_context.chatfile_dir, kind, value, max_bytes=maximum)
+            notes.append(f"附件（{kind}）已保存到本地：{path}。需要分析时读取该文件。")
+        except Exception as exc:
+            runtime.last_error = f"attachment receive failed: {type(exc).__name__}"
+            notes.append("附件接收失败，请说明需要重新发送；不能声称已读取成功。")
+    return notes
+
+
+async def handle_wecom_payload(config, runtime, ws, payload, handler, *, received_at=None):
     if not isinstance(payload, dict):
         return
     if resolve_pending_request(runtime, payload):
@@ -462,6 +615,16 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         return
     headers = payload.get("headers")
     req_id = str(headers.get("req_id") or "").strip() if isinstance(headers, dict) else ""
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    if req_id and payload.get("cmd") in {"aibot_msg_callback", "aibot_event_callback"} and (body.get("event") or {}).get("eventtype") != "disconnected_event":
+        try:
+            chat_key = chat_key_from_message(payload)
+            now = runtime.rate_limiter.clock()
+            runtime.callback_contexts = {key: value for key, value in runtime.callback_contexts.items() if now - value["received_at"] < 86400}
+            runtime.callback_contexts[req_id] = callback_context(payload, chat_key, chat_key_to_send_target(chat_key), received_at=received_at if received_at is not None else now)
+        except ValueError as exc:
+            runtime.last_error = str(exc)
+            return
     response_url = extract_response_url(payload)
     if req_id and response_url:
         try:
@@ -476,6 +639,57 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
                 "consumed": False,
             }
             store_reply_url_state(runtime.config.runtime_root, runtime.config.bot_id, runtime.reply_urls)
+    if payload.get("cmd") == "aibot_event_callback":
+        try:
+            record = feedback_event(body)
+        except ValueError as exc:
+            runtime.last_error = str(exc)
+            return
+        if record is not None:
+            record = {**record, "user_id": str((body.get("from") or {}).get("userid") or ""), "received_at": int(__import__("time").time() * 1000)}
+            runtime.feedback_records[record["id"]] = record
+            path = runtime.config.runtime_root / ".wecom-feedback" / "feedback.json"
+            atomic_write_json(path, {"records": list(runtime.feedback_records.values())[-1000:]})
+            return
+    if payload.get("cmd") == "aibot_msg_callback" and message_source(body) == "ai_assistant":
+        try:
+            frames = runtime.assistant_calls.add(payload)
+        except ValueError as exc:
+            runtime.last_error = str(exc)
+            return
+        if frames is None:
+            return
+        first = frames[0]
+        chat_key = chat_key_from_message(first)
+        context = "\n\n".join(text_with_quote(message_text(frame["body"]), frame["body"]) for frame in frames if frame["body"]["msgtype"] == "text")
+        media = [(frame["body"]["msgtype"], frame["body"][frame["body"]["msgtype"]]) for frame in frames if frame["body"]["msgtype"] in {"image", "file"}]
+        media.extend(item for frame in frames for item in quoted_media(frame["body"]))
+        notes = await _runtime_download_attachments(config, runtime, first, media)
+        if not context.strip():
+            context = "本次调用只包含附件，未提供文字指令；请询问需要执行的处理目标。"
+        content = "\n\n".join([context, *notes])
+        parsed = WeComTextMessage(req_id=first["headers"]["req_id"], chat_key=chat_key, content=content, raw_payload=first)
+        await handler(config, runtime, parsed, ws=ws)
+        return
+    if payload.get("cmd") == "aibot_msg_callback" and body.get("msgtype") in {"image", "file", "video", "mixed"}:
+        chat_key = chat_key_from_message(payload)
+        kind = body["msgtype"]
+        if kind == "mixed":
+            items = (body.get("mixed") or {}).get("msg_item") or []
+            media = [("image", item["image"]) for item in items if isinstance(item, dict) and item.get("msgtype") == "image" and isinstance(item.get("image"), dict)]
+        else:
+            media = [(kind, body.get(kind) or {})]
+        notes = await _runtime_download_attachments(config, runtime, payload, media)
+        raw_text = message_text(body) if kind == "mixed" else ""
+        if raw_text:
+            content = "\n\n".join([text_with_quote(raw_text, body), *runtime.pending_attachments.pop(chat_key, []), *notes])
+            await handler(config, runtime, WeComTextMessage(req_id=req_id, chat_key=chat_key, content=content, raw_payload=payload), ws=ws)
+        else:
+            runtime.pending_attachments.setdefault(chat_key, []).extend(notes)
+            receipt = "附件接收失败，请重新发送。" if any("接收失败" in note for note in notes) else "附件已接收，可以继续提问。"
+            notification = WeComTextMessage(req_id=req_id, chat_key=chat_key, content="", raw_payload=payload)
+            await send_or_cache_runtime_payload(runtime, notification, current_session_id(runtime.config, chat_key), receipt, final=True)
+        return
     if str(payload.get("cmd") or "").strip() == "aibot_event_callback":
         body = payload.get("body")
         body_dict = body if isinstance(body, dict) else {}
@@ -508,24 +722,25 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
     text = strip_text_mentions(parsed.content, runtime.config.bot_name)
     command_text = normalize_bridge_command_text(parsed.content, runtime.config.bot_name)
     parsed = type(parsed)(req_id=parsed.req_id, chat_key=parsed.chat_key, content=text, raw_payload=parsed.raw_payload)
-    command_session_id = stable_session_id(
-        runtime.config.bot_id,
-        parsed.chat_key,
-        runtime.config.source.source_dir,
-        runtime.config.workspace_namespace,
-        runtime.config.workspace_mode,
-    )
+    command_session_id = current_session_id(runtime.config, parsed.chat_key)
     if command_text == "/bridge-status":
+        bridge_status = build_runtime_status_text(
+            runtime,
+            parsed.chat_key,
+            session_id=command_session_id,
+        )
+        native_status = await run_blocking(
+            build_runtime_codex_status_text,
+            runtime,
+            parsed.chat_key,
+            session_id=command_session_id,
+        )
         await ws_send_json(
             runtime,
             build_text_response_payload(
                 parsed.req_id,
                 command_session_id,
-                build_runtime_status_text(
-                    runtime,
-                    parsed.chat_key,
-                    session_id=command_session_id,
-                ),
+                f"{bridge_status}\n\n{native_status}",
                 final=True,
             ),
         )
@@ -562,64 +777,70 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         )
         cleanup_reply_state(runtime, parsed.req_id)
         return
-    if command_text == "/bridge-reset":
-        _clear_resume_selection(runtime, parsed.chat_key)
-        await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
-        process = runtime.active_processes.pop(parsed.chat_key, None)
-        active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
-        if active_task is not None:
-            runtime.suppressed_failure_tasks.add(active_task)
-        if process is not None:
-            process.terminate()
-        if active_task is not None:
-            active_task.cancel()
-            with __import__("contextlib").suppress(asyncio.CancelledError, Exception):
-                await active_task
-        if process is not None:
-            await _wait_for_process_exit(process)
-        async with session_run_guards(runtime.config, parsed.chat_key):
-            runtime.session_threads.pop(parsed.chat_key, None)
-            session_id = stable_session_id(
-                runtime.config.bot_id,
-                parsed.chat_key,
-                runtime.config.source.source_dir,
-                runtime.config.workspace_namespace,
-                runtime.config.workspace_mode,
+    if command_text in {"/new", "/bridge-reset"}:
+        is_reset = command_text == "/bridge-reset"
+        try:
+            response_session_id = (
+                await _reset_session(runtime, parsed.chat_key)
+                if is_reset
+                else await _start_new_session(runtime, parsed.chat_key)
             )
-            await run_blocking(remove_session_codex_home, runtime.config.runtime_root, session_id)
-            await run_blocking(remove_session_chatfile, runtime.config.chatfile_root, session_id)
-            update_session_record(
-                runtime.config.runtime_root,
-                session_id,
-                lambda current: replace(
-                    current,
-                    updated_at=int(__import__("time").time() * 1000),
-                    last_run_at=int(__import__("time").time() * 1000),
-                    thread_id=None,
-                    recent_chat=(),
+        except Exception as exc:
+            failure_prefix = "Failed to reset session" if is_reset else "Failed to start a new session"
+            await ws_send_json(
+                runtime,
+                build_text_response_payload(
+                    parsed.req_id,
+                    command_session_id,
+                    f"{failure_prefix}: {exc}",
+                    final=True,
                 ),
             )
-            req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
-            for req_id in req_ids:
-                cleanup_reply_state(runtime, req_id)
-                if runtime.pending_streams is not None:
-                    runtime.pending_streams.pop(req_id, None)
-                if runtime.pending_finals is not None:
-                    runtime.pending_finals.pop(req_id, None)
-        await ws_send_json(runtime, build_text_response_payload(parsed.req_id, command_session_id, "Session reset.", final=True))
+            cleanup_reply_state(runtime, parsed.req_id)
+            return
+        await ws_send_json(
+            runtime,
+            build_text_response_payload(
+                parsed.req_id,
+                response_session_id,
+                (
+                    "Session reset. Your next message will start a new thread."
+                    if is_reset
+                    else "New session ready. Your next message will start a new thread."
+                ),
+                final=True,
+            ),
+        )
         cleanup_reply_state(runtime, parsed.req_id)
         return
     if command_text == "/bridge-interrupt":
         _clear_resume_selection(runtime, parsed.chat_key)
-        await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
-        process = runtime.active_processes.get(parsed.chat_key)
-        active_task = runtime.active_message_tasks.pop(parsed.chat_key, None)
-        if active_task is not None:
-            runtime.suppressed_failure_tasks.add(active_task)
-        if process is not None:
-            process.terminate()
-        if active_task is not None:
-            active_task.cancel()
+        try:
+            async with _session_lifecycle_lock(runtime, parsed.chat_key):
+                await _interrupt_active_schedule_run_for_chat(runtime, parsed.chat_key)
+                process = runtime.active_processes.get(parsed.chat_key)
+                active_task = runtime.active_message_tasks.get(parsed.chat_key)
+                _request_process_termination(process)
+                if active_task is not None:
+                    runtime.suppressed_failure_tasks.add(active_task)
+                await _confirm_process_exit(process)
+                await _confirm_task_exit(active_task)
+                if runtime.active_processes.get(parsed.chat_key) is process:
+                    runtime.active_processes.pop(parsed.chat_key, None)
+                if runtime.active_message_tasks.get(parsed.chat_key) is active_task:
+                    runtime.active_message_tasks.pop(parsed.chat_key, None)
+        except Exception as exc:
+            await ws_send_json(
+                runtime,
+                build_text_response_payload(
+                    parsed.req_id,
+                    command_session_id,
+                    f"Failed to interrupt current task: {exc}",
+                    final=True,
+                ),
+            )
+            cleanup_reply_state(runtime, parsed.req_id)
+            return
         req_ids = [req_id for req_id, state in runtime.reply_states.items() if state.chat_key == parsed.chat_key]
         for req_id in req_ids:
             cleanup_reply_state(runtime, req_id)
@@ -651,7 +872,50 @@ async def handle_wecom_payload(config, runtime, ws, payload, handler):
         )
         cleanup_reply_state(runtime, parsed.req_id)
         return
+    notes = runtime.pending_attachments.pop(parsed.chat_key, [])
+    if quoted_media(body):
+        notes.extend(await _runtime_download_attachments(config, runtime, payload, quoted_media(body)))
+    content = "\n\n".join([text_with_quote(parsed.content, body), *notes])
+    parsed = replace(parsed, content=content)
     await handler(config, runtime, parsed, ws=ws)
+
+
+async def _handle_runtime_frame(config, runtime, ws, payload, received_at=None):
+    try:
+        await handle_wecom_payload(config, runtime, ws, payload, _dispatch_message, received_at=received_at)
+    except Exception as exc:
+        runtime.last_error = str(exc)
+
+
+def _start_runtime_frame(config, runtime, ws, payload):
+    task = asyncio.create_task(_handle_runtime_frame(config, runtime, ws, payload, runtime.rate_limiter.clock()))
+    runtime.callback_tasks.add(task)
+    task.add_done_callback(runtime.callback_tasks.discard)
+
+
+async def _receive_runtime_frames(config, runtime, ws):
+    while True:
+        msg = await ws.receive()
+        if msg.type == WSMsgType.TEXT:
+            payload = json.loads(msg.data)
+            body = payload.get("body") if isinstance(payload, dict) and isinstance(payload.get("body"), dict) else {}
+            event = body.get("event") if isinstance(body.get("event"), dict) else {}
+            if event.get("eventtype") == "disconnected_event":
+                await handle_wecom_payload(config, runtime, ws, payload, _dispatch_message)
+                return
+            _start_runtime_frame(config, runtime, ws, payload)
+            await asyncio.sleep(0)
+            continue
+        if msg.type in {WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.CLOSING}:
+            runtime.connected = False
+            _set_wecom_state(runtime, "websocket_closed", "bot websocket closed")
+            reject_pending_requests(runtime, runtime.wecom_last_error or "bot websocket closed")
+            return
+        if msg.type == WSMsgType.ERROR:
+            runtime.connected = False
+            _set_wecom_state(runtime, "websocket_error", str(ws.exception() or "bot websocket error"))
+            reject_pending_requests(runtime, runtime.wecom_last_error or "bot websocket error")
+            raise RuntimeError(runtime.wecom_last_error or "bot websocket error")
 
 
 async def run_wecom_runtime_once(config, runtime) -> None:
@@ -679,24 +943,10 @@ async def run_wecom_runtime_once(config, runtime) -> None:
                 raise RuntimeError(runtime.wecom_last_error or "subscribe failed")
             runtime.connected = True
             _set_wecom_state(runtime, "subscribe_ok", None)
+            receiver = asyncio.create_task(_receive_runtime_frames(config, runtime, ws))
             try:
                 await flush_cached_runtime_payloads(runtime)
-                while True:
-                    msg = await ws.receive()
-                    if msg.type == WSMsgType.TEXT:
-                        payload = json.loads(msg.data)
-                        await handle_wecom_payload(config, runtime, ws, payload, _dispatch_message)
-                        continue
-                    if msg.type in {WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.CLOSING}:
-                        runtime.connected = False
-                        _set_wecom_state(runtime, "websocket_closed", "bot websocket closed")
-                        reject_pending_requests(runtime, runtime.wecom_last_error or "bot websocket closed")
-                        return
-                    if msg.type == WSMsgType.ERROR:
-                        runtime.connected = False
-                        _set_wecom_state(runtime, "websocket_error", str(ws.exception() or "bot websocket error"))
-                        reject_pending_requests(runtime, runtime.wecom_last_error or "bot websocket error")
-                        raise RuntimeError(runtime.wecom_last_error or "bot websocket error")
+                await receiver
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -704,6 +954,8 @@ async def run_wecom_runtime_once(config, runtime) -> None:
                     _set_wecom_state(runtime, "websocket_error", str(exc) or "bot websocket error")
                 raise
             finally:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
                 runtime.connected = False
                 runtime.ws = None
                 reject_pending_requests(runtime, runtime.wecom_last_error or "bot websocket closed")

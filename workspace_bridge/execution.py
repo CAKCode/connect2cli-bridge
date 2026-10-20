@@ -15,6 +15,7 @@ from .agent_backends import extract_agent_reply, extract_agent_thread_id
 from .atomic_io import atomic_write_text, ensure_state_directory, open_state_lock_file
 from .async_utils import run_blocking
 from .prompting import build_prompt
+from .process_control import isolated_subprocess_kwargs, remember_isolated_process
 from .reply_state import cache_reply_payload, cleanup_reply_state, get_or_create_reply_state, mark_reply_sent
 from .runner import build_runner_invocation, run_invocation
 from .runtime import append_session_record_chat_message, prepare_session_run, stable_session_id, update_session_record
@@ -30,8 +31,9 @@ from .messaging import get_messaging_provider
 from .models import OutboundMessage
 from .wecom_protocol import build_text_response_payloads
 from .wecom_upload import require_ack_ok, send_ws_payload_with_ack, ws_send_json
+from .wecom_context import decorate_context_replies
+from .wecom_limits import WeComRateLimitError
 
-STATUS_STREAM_INTERVAL_SEC = 2
 _SESSION_RUN_LOCKS: dict[str, asyncio.Lock] = {}
 _SESSION_ENTRY_LOCKS: dict[str, asyncio.Lock] = {}
 _SESSION_ENTRY_LOCK_USERS: dict[str, int] = {}
@@ -371,6 +373,7 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
         if final and not message.req_id
         else build_text_response_payloads(message.req_id, session_id, content, final=final)
     )
+    payloads = decorate_context_replies(payloads, runtime.callback_contexts.get(message.req_id), final=final)
     payload = payloads[-1]
     cache_key = _message_cache_key(message, payload)
     state = get_or_create_reply_state(runtime, cache_key, session_id, message.chat_key) if cache_key else None
@@ -384,6 +387,8 @@ async def send_or_cache_runtime_payload(runtime, message, session_id: str, conte
             failed_index = index
             await _send_runtime_payload(runtime, item)
     except Exception as exc:
+        if isinstance(exc, WeComRateLimitError) and not final:
+            return False
         runtime.last_error = str(exc)
         _store_cached_runtime_payloads(runtime, state, cache_key, sequence[failed_index:], final=final)
         return False
@@ -585,26 +590,13 @@ async def _stream_text_message_once_guarded(config, runtime, message, **kwargs):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **isolated_subprocess_kwargs(),
                 )
+                remember_isolated_process(process)
                 runtime.active_processes[message.chat_key] = process
                 if emit_status_updates:
-                    await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中，已运行 0s。", final=False)
+                    await send_or_cache_runtime_payload(runtime, message, launch.session.session_id, "运行状态：思考中。", final=False)
 
-                async def ticker() -> None:
-                    elapsed = 0
-                    while True:
-                        await asyncio.sleep(STATUS_STREAM_INTERVAL_SEC)
-                        elapsed += STATUS_STREAM_INTERVAL_SEC
-                        elapsed_display = max(1, int(elapsed))
-                        await send_or_cache_runtime_payload(
-                            runtime,
-                            message,
-                            launch.session.session_id,
-                            f"运行状态：思考中，已运行 {elapsed_display}s。",
-                            final=False,
-                        )
-
-                ticker_task = asyncio.create_task(ticker()) if emit_status_updates else None
                 prompt_write_error: Exception | None = None
                 stderr_data = b""
                 try:
@@ -632,12 +624,6 @@ async def _stream_text_message_once_guarded(config, runtime, message, **kwargs):
                             with __import__("contextlib").suppress(Exception):
                                 await wait_method()
                     runtime.active_processes.pop(message.chat_key, None)
-                    if ticker_task is not None and not ticker_task.done():
-                        ticker_task.cancel()
-                        try:
-                            await ticker_task
-                        except asyncio.CancelledError:
-                            pass
                 text = (stdout_data or b"").decode("utf-8", "ignore").strip()
                 stderr_text = (stderr_data or b"").decode("utf-8", "ignore").strip()
                 if attempted_resume and allow_fresh_fallback and resume_state_missing(

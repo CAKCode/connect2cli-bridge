@@ -241,7 +241,9 @@ python3 schedule_message.py \
 - `/bridge-interrupt`
   说明：中断当前执行，但不删除 schedule definition
 - `/bridge-reset`
-  说明：清空当前 session 上下文；未开始执行的 scheduled 实例会回退到 pending
+  说明：等待当前执行退出并清空当前 session 的 thread 与上下文；未开始执行的 scheduled 实例会回退到 pending
+- `/new`
+  说明：等待当前执行退出，保留旧 session 并切换到新 session；未开始执行的 scheduled 实例会回退到 pending 并绑定新 session
 
 ## 后续可扩展方向
 

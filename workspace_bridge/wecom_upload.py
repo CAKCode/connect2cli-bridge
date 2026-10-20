@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
+import time
 from pathlib import Path
 
 from .models import FileSendRequest, WeComBotRuntime
 from .wecom_protocol import uid, chat_key_to_send_target
+from .wecom_limits import wait_for_send_slot
+from .wecom_context import normalize_assistant_reply
+from .wecom_media import native_media_body, upload_media
 
 
 def build_send_file_payload(chat_key: str, media_id: str) -> dict:
@@ -62,8 +64,22 @@ async def ws_send_json(bot: WeComBotRuntime, payload: dict) -> None:
         raise RuntimeError("bot websocket not connected")
     if bot.ws_send_lock is None:
         bot.ws_send_lock = asyncio.Lock()
+    context = bot.callback_contexts.get(str((payload.get("headers") or {}).get("req_id") or ""), {})
+    target = context.get("target")
+    if target is None:
+        state = bot.reply_states.get(str((payload.get("headers") or {}).get("req_id") or ""))
+        if state:
+            target = chat_key_to_send_target(state.chat_key)
+    await wait_for_send_slot(bot.rate_limiter, payload, callback_target=target, received_at=context.get("received_at"))
     async with bot.ws_send_lock:
-        await bot.ws.send_json(payload)
+        deadline = context.get("received_at", time.monotonic()) + 5 if payload.get("cmd") in {"aibot_respond_update_msg", "aibot_respond_welcome_msg"} else None
+        if deadline is None:
+            await bot.ws.send_json(payload)
+        else:
+            await asyncio.wait_for(bot.ws.send_json(payload), max(0, deadline - bot.rate_limiter.clock()))
+        stream_id = ((payload.get("body") or {}).get("stream") or {}).get("id")
+        if context and stream_id:
+            context["streams"].setdefault(stream_id, bot.rate_limiter.clock())
 
 
 async def send_ws_payload_with_ack(bot: WeComBotRuntime, payload: dict, timeout_sec: int) -> dict:
@@ -78,6 +94,11 @@ async def send_ws_payload_with_ack(bot: WeComBotRuntime, payload: dict, timeout_
         if not future.done():
             future.cancel()
         raise
+    finally:
+        if bot.pending_requests is not None and bot.pending_requests.get(req_id) is future:
+            bot.pending_requests.pop(req_id, None)
+        if not future.done():
+            future.cancel()
 
 
 def require_ack_ok(payload: dict, stage: str, *, required_body_key: str | None = None) -> dict:
@@ -98,52 +119,21 @@ def require_ack_ok(payload: dict, stage: str, *, required_body_key: str | None =
 
 
 async def upload_and_send_file(bot: WeComBotRuntime, request: FileSendRequest) -> dict:
-    file_bytes = Path(request.file_path).read_bytes()
-    file_name = request.file_name
-    file_size = len(file_bytes)
-    chunk_size = 400 * 1024
-    total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
-    md5 = hashlib.md5(file_bytes).hexdigest()
-
-    init_response = await send_ws_payload_with_ack(
-        bot,
-        {
-            "cmd": "aibot_upload_media_init",
-            "headers": {"req_id": uid()},
-            "body": {
-                "type": "file",
-                "filename": file_name,
-                "total_size": file_size,
-                "total_chunks": total_chunks,
-                "md5": md5,
-            },
-        },
-        30,
+    assistant = normalize_assistant_reply(request.to_ai_assistant, proactive=True)
+    if assistant and request.media_type == "voice":
+        raise ValueError("assistant replies do not support voice")
+    media_id = await upload_media(
+        Path(request.file_path), filename=request.file_name, media_type=request.media_type,
+        owner=bot.config.bot_id, destination=request.chat_key,
+        cache_root=bot.config.runtime_root / ".wecom-uploads",
+        send=lambda payload, timeout: send_ws_payload_with_ack(bot, payload, timeout), uid=uid,
+        max_bytes=bot.config.max_upload_size,
     )
-    upload_id = require_ack_ok(init_response, "upload init", required_body_key="upload_id")["upload_id"]
-    for idx in range(total_chunks):
-        chunk = file_bytes[idx * chunk_size : (idx + 1) * chunk_size]
-        require_ack_ok(
-            await send_ws_payload_with_ack(
-                bot,
-                {
-                    "cmd": "aibot_upload_media_chunk",
-                    "headers": {"req_id": uid()},
-                    "body": {"upload_id": upload_id, "chunk_index": idx, "base64_data": base64.b64encode(chunk).decode("ascii")},
-                },
-                30,
-            ),
-            f"upload chunk {idx}",
-        )
-    finish_response = await send_ws_payload_with_ack(
-        bot,
-        {
-            "cmd": "aibot_upload_media_finish",
-            "headers": {"req_id": uid()},
-            "body": {"upload_id": upload_id},
-        },
-        60,
-    )
-    media_id = require_ack_ok(finish_response, "upload finish", required_body_key="media_id")["media_id"]
-    require_ack_ok(await send_ws_payload_with_ack(bot, build_send_file_payload(request.chat_key, media_id), 30), "send file")
+    chat_type, chat_id = chat_key_to_send_target(request.chat_key)
+    body = {"chatid": chat_id, "chat_type": chat_type,
+            **native_media_body(request.media_type, media_id, title=request.title, description=request.description)}
+    if assistant:
+        body["to_ai_assistant"] = assistant
+    payload = {"cmd": "aibot_send_msg", "headers": {"req_id": uid()}, "body": body}
+    require_ack_ok(await send_ws_payload_with_ack(bot, payload, 30), "send file")
     return {"ok": True, "mediaId": media_id}

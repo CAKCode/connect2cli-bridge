@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from workspace_bridge.models import BotConfig, SourceConfig
 from workspace_bridge.wecom_protocol import (
     build_proactive_message_payload,
@@ -98,6 +100,25 @@ def test_parse_text_callback_keeps_raw_content_for_later_strip(tmp_path: Path) -
     assert message.content == "@robot, hello"
 
 
+@pytest.mark.parametrize("voice_body", [
+    {"content": "哈喽"},
+    {"recognition": "哈喽"},
+    {"transcript": "哈喽"},
+    {"text": "哈喽"},
+])
+def test_parse_voice_callback_accepts_wecom_transcription_aliases(voice_body: dict) -> None:
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "voice-1"},
+        "body": {"msgtype": "voice", "voice": voice_body, "from": {"userid": "alice"}},
+    }
+
+    message = parse_text_callback(payload)
+
+    assert message is not None
+    assert message.content == "哈喽"
+
+
 def test_build_text_response_payload_uses_stream_format() -> None:
     payload = build_text_response_payload("req-1", "session-1", "done", final=True)
 
@@ -171,17 +192,52 @@ def test_build_proactive_text_payload_truncates_long_content() -> None:
 def test_split_text_chunks_prefers_word_boundaries() -> None:
     chunks = split_text_chunks("alpha beta gamma delta", max_chars=10)
 
-    assert chunks == ["alpha beta", "gamma", "delta"]
+    assert [chunk.strip() for chunk in chunks] == ["alpha beta", "gamma", "delta"]
+    assert "".join(chunks) == "alpha beta gamma delta"
 
 
 def test_build_text_response_payloads_splits_long_content() -> None:
     payloads = build_text_response_payloads("req-1", "session-1", "x" * 8000, final=True)
 
     assert len(payloads) == 3
-    assert payloads[0]["body"]["stream"]["finish"] is False
-    assert payloads[1]["body"]["stream"]["finish"] is False
-    assert payloads[2]["body"]["stream"]["finish"] is True
+    assert all(item["body"]["stream"]["finish"] is True for item in payloads)
     assert "".join(item["body"]["stream"]["content"] for item in payloads) == "x" * 8000
+
+
+def test_long_reply_remains_complete_after_client_stream_replacements() -> None:
+    content = "第一段结果。\n\n" * 1500
+    payloads = build_text_response_payloads("req-1", "session-1", content, final=True)
+    visible_messages = {}
+    for payload in payloads:
+        stream = payload["body"]["stream"]
+        visible_messages[stream["id"]] = stream["content"]
+
+    assert "".join(visible_messages.values()) == content.strip()
+    assert all(item["headers"]["req_id"] == "req-1" for item in payloads)
+
+
+def test_long_progress_uses_one_updatable_stream_until_final_reply() -> None:
+    progress = "进度详情\n" * 2000
+    initial = build_text_response_payloads("req-1", "session-1", progress, final=False)
+    final = build_text_response_payloads("req-1", "session-1", progress, final=True)
+
+    assert len(initial) == 1
+    assert initial[0]["body"]["stream"]["finish"] is False
+    assert initial[0]["body"]["stream"]["id"] == final[0]["body"]["stream"]["id"]
+    assert all(item["body"]["stream"]["finish"] is True for item in final)
+
+
+def test_proactive_chunks_respect_utf8_budget_including_group_mention(monkeypatch) -> None:
+    from workspace_bridge import wecom_protocol
+
+    monkeypatch.setattr(wecom_protocol, "PROACTIVE_TEXT_MAX_CHARS", 50000)
+    payloads = build_proactive_text_payloads("group-user:room-1:alice", "结果😀" * 7000)
+
+    assert len(payloads) > 1
+    for payload in payloads:
+        content = payload["body"]["markdown"]["content"]
+        assert content.startswith("<@alice>\n")
+        assert len(content.encode("utf-8")) <= 20480
 
 
 def test_build_proactive_text_payloads_split_long_content() -> None:
@@ -592,6 +648,17 @@ def test_normalize_bridge_command_text_allows_leading_mention_fallback_for_bridg
     assert normalize_bridge_command_text("@robot, /bridge-status", "robot") == "/bridge-status"
     assert normalize_bridge_command_text("@robot, /cwd ../repo", "robot") == "/cwd ../repo"
     assert normalize_bridge_command_text("@someone hello", "robot") == "@someone hello"
+
+
+@pytest.mark.parametrize("bot_name,mention", [("robot", "@robot"), ("Leo C", "@Leo C"), ("robot", "@实际显示名")])
+@pytest.mark.parametrize("command", ["/new", "/bridge-reset", "/bridge-interrupt", "/bridge-status", "/bridge-resume session-1", "/cwd ../repo"])
+def test_normalize_group_session_commands(bot_name: str, mention: str, command: str) -> None:
+    assert normalize_bridge_command_text(f"{mention} {command}", bot_name) == command
+
+
+@pytest.mark.parametrize("content", ["@robot 解释 /new", "@robot `/new`", "@robot /newton", "@robot /new extra", "@robot > /new"])
+def test_normalize_command_text_preserves_ordinary_messages(content: str) -> None:
+    assert normalize_bridge_command_text(content, "robot") == content
 
 
 def test_is_subscribe_ok_accepts_success_payload() -> None:

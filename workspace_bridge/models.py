@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from .wecom_context import AssistantCallAssembler
+from .wecom_limits import WeComRateLimiter
 from typing import Literal
 
 from .agent_backends import AgentBackend
@@ -36,7 +38,7 @@ class BotConfig:
     agent_run_as_group: str | None = None
     agent_runtime_root: Path | None = None
     file_send_roots: tuple[Path, ...] = ()
-    max_upload_size: int = 100 * 1024 * 1024
+    max_upload_size: int = 20 * 1024 * 1024
     platform: str = "wecom"
 
 
@@ -55,6 +57,7 @@ class WeComBotRuntime:
     session_threads: dict[str, str] = field(default_factory=dict)
     message_tasks: set[object] = field(default_factory=set)
     active_message_tasks: dict[str, object] = field(default_factory=dict)
+    session_lifecycle_locks: dict[str, object] = field(default_factory=dict)
     active_schedule_tasks: dict[str, object] = field(default_factory=dict)
     active_schedule_runs: dict[str, tuple[str, str]] = field(default_factory=dict)
     suppressed_schedule_cancels: set[tuple[str, str]] = field(default_factory=set)
@@ -72,6 +75,12 @@ class WeComBotRuntime:
     template_card_delivery_meta: dict[str, dict] = field(default_factory=dict)
     consumed_template_card_actions: set[str] = field(default_factory=set)
     reply_urls: dict[str, dict[str, str | int | bool]] = field(default_factory=dict)
+    callback_contexts: dict[str, dict] = field(default_factory=dict)
+    callback_tasks: set[object] = field(default_factory=set)
+    assistant_calls: AssistantCallAssembler = field(default_factory=AssistantCallAssembler)
+    rate_limiter: WeComRateLimiter = field(default_factory=WeComRateLimiter)
+    feedback_records: dict[str, dict] = field(default_factory=dict)
+    pending_attachments: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -198,6 +207,7 @@ class OutboundMessage:
     media_id: str | None = None
     mention_user_id: str | None = None
     feedback_id: str | None = None
+    to_ai_assistant: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +240,10 @@ class FileSendRequest:
     workspace_id: str
     file_path: Path
     file_name: str
+    media_type: str = "file"
+    title: str = ""
+    description: str = ""
+    to_ai_assistant: dict | None = None
 
 
 @dataclass

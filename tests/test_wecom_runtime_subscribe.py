@@ -226,6 +226,8 @@ async def test_bridge_status_command_returns_runtime_status(tmp_path) -> None:
     assert "running: yes" in content
     assert "pendingStreams: 1" in content
     assert "pendingFinals: 1" in content
+    assert "Codex /status" in content
+    assert "Model:" in content
     assert "prepare_session_run" not in calls
 
 
@@ -486,16 +488,24 @@ async def test_bridge_status_command_reports_running_for_active_schedule_task_wi
     assert "running: yes" in content
 
 
-async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
+async def test_new_session_command_clears_reply_state(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
-    from workspace_bridge.runtime import load_session_record, prepare_session_run, session_codex_home_root, update_session_record
+    from workspace_bridge.runtime import (
+        current_session_id,
+        load_session_record,
+        prepare_session_run,
+        session_codex_home_root,
+        update_session_record,
+    )
 
     class FakeProcess:
         def __init__(self) -> None:
+            self.returncode = None
             self.terminated = False
 
         def terminate(self) -> None:
             self.terminated = True
+            self.returncode = -15
 
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
@@ -530,19 +540,29 @@ async def test_bridge_reset_command_clears_reply_state(tmp_path) -> None:
         {
             "cmd": "aibot_msg_callback",
             "headers": {"req_id": "req-2"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
         },
         fake_handler,
     )
 
     assert bot.reply_states == {}
     assert process.terminated is True
-    assert ws.sent[0]["body"]["stream"]["content"] == "Session reset."
-    assert session_home.exists() is False
-    stored = load_session_record(bot.config.runtime_root, launch.session.session_id)
-    assert stored is not None
-    assert stored.thread_id is None
-    assert stored.recent_chat == ()
+    assert ws.sent[0]["body"]["stream"]["content"] == "New session ready. Your next message will start a new thread."
+    new_session_id = current_session_id(bot.config, "single:alice")
+    assert new_session_id != launch.session.session_id
+    assert ws.sent[0]["body"]["stream"]["id"] == new_session_id
+    assert session_home.exists() is True
+    previous = load_session_record(bot.config.runtime_root, launch.session.session_id)
+    current = load_session_record(bot.config.runtime_root, new_session_id)
+    assert previous is not None
+    assert previous.thread_id == "thread-old"
+    assert previous.recent_chat == (
+        {"role": "user", "text": "older user turn"},
+        {"role": "bot", "text": "older bot turn"},
+    )
+    assert current is not None
+    assert current.thread_id is None
+    assert current.recent_chat == ()
 
 
 async def test_template_card_event_is_not_dispatched_to_text_handler(tmp_path) -> None:
@@ -730,11 +750,14 @@ async def test_text_callback_with_missing_sender_does_not_save_response_url(tmp_
     assert "req-missing-user" not in bot.reply_urls
 
 
-async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> None:
+async def test_new_session_command_only_clears_current_chat_state(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
 
     class FakeProcess:
+        returncode = None
+
         def terminate(self) -> None:
+            self.returncode = -15
             return None
 
     config = make_config(tmp_path)
@@ -757,7 +780,7 @@ async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> 
         {
             "cmd": "aibot_msg_callback",
             "headers": {"req_id": "req-reset"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
         },
         fake_handler,
     )
@@ -768,7 +791,70 @@ async def test_bridge_reset_command_only_clears_current_chat_state(tmp_path) -> 
     assert "req-bob" in bot.pending_streams
 
 
-async def test_bridge_reset_command_cancels_active_message_task(tmp_path) -> None:
+@pytest.mark.parametrize("bot_name,mention", [("default", "@default"), ("Leo C", "@Leo C"), ("default", "@实际显示名")])
+@pytest.mark.parametrize("command", ["/new", "/bridge-reset", "/bridge-interrupt"])
+async def test_group_session_command_keeps_other_members_context(tmp_path, bot_name, mention, command) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import current_session_id, load_session_record, update_session_record
+
+    config = make_config(tmp_path)
+    bot_config = replace(build_bot_from_app_config(config), bot_name=bot_name)
+    bot = WeComBotRuntime(config=bot_config, pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    bot.ws = ws
+    alice_key, bob_key = "group-user:room-1:alice", "group-user:room-1:bob"
+    alice = prepare_session_run(bot.config, alice_key)
+    bob = prepare_session_run(bot.config, bob_key)
+    for key, launch in [(alice_key, alice), (bob_key, bob)]:
+        update_session_record(
+            bot.config.runtime_root, launch.session.session_id,
+            lambda current: replace(current, thread_id=f"thread-{key}", recent_chat=({"role": "user", "text": key},)),
+        )
+        get_or_create_reply_state(bot, f"req-{key}", launch.session.session_id, key)
+        bot.pending_streams[f"req-{key}"] = {"headers": {"req_id": f"req-{key}"}}
+    other_record = load_session_record(bot.config.runtime_root, bob.session.session_id)
+
+    async def reject_handler(*args, **kwargs):
+        raise AssertionError("session commands must not be sent to the agent")
+
+    await handle_wecom_payload(config, bot, ws, {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-group-command"},
+        "body": {
+            "msgtype": "text", "chattype": "group", "chatid": "room-1",
+            "from": {"userid": "alice"}, "text": {"content": f"{mention} {command}"},
+        },
+    }, reject_handler)
+
+    current_id = current_session_id(bot.config, alice_key)
+    current = load_session_record(bot.config.runtime_root, current_id)
+    assert current_session_id(bot.config, bob_key) == bob.session.session_id
+    assert load_session_record(bot.config.runtime_root, bob.session.session_id) == other_record
+    assert f"req-{alice_key}" not in bot.reply_states
+    assert f"req-{alice_key}" not in bot.pending_streams
+    assert f"req-{bob_key}" in bot.reply_states
+    assert f"req-{bob_key}" in bot.pending_streams
+    if command == "/new":
+        assert current_id != alice.session.session_id
+        assert current.thread_id is None
+        assert current.recent_chat == ()
+        old = load_session_record(bot.config.runtime_root, alice.session.session_id)
+        assert old.thread_id == f"thread-{alice_key}"
+        assert old.recent_chat == ({"role": "user", "text": alice_key},)
+    elif command == "/bridge-reset":
+        assert current_id == alice.session.session_id
+        assert current.thread_id is None
+        assert current.recent_chat == ()
+    else:
+        assert current_id == alice.session.session_id
+        assert current.thread_id == f"thread-{alice_key}"
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["cmd"] == "aibot_respond_msg"
+    assert ws.sent[0]["headers"]["req_id"] == "req-group-command"
+    assert ws.sent[0]["body"]["stream"]["finish"] is True
+
+
+async def test_new_session_command_cancels_active_message_task(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
 
     config = make_config(tmp_path)
@@ -788,19 +874,22 @@ async def test_bridge_reset_command_cancels_active_message_task(tmp_path) -> Non
         {
             "cmd": "aibot_msg_callback",
             "headers": {"req_id": "req-reset"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
         },
         fake_handler,
     )
 
 
-async def test_bridge_reset_command_uses_thread_offload_for_remove_without_prepare(tmp_path) -> None:
+async def test_new_session_command_uses_thread_offload_for_session_creation(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge import wecom_runtime as runtime_module
-    from workspace_bridge.runtime import stable_session_id
+    from workspace_bridge.runtime import current_session_id
 
     class FakeProcess:
+        returncode = None
+
         def terminate(self) -> None:
+            self.returncode = -15
             return None
 
     config = make_config(tmp_path)
@@ -827,72 +916,32 @@ async def test_bridge_reset_command_uses_thread_offload_for_remove_without_prepa
             {
                 "cmd": "aibot_msg_callback",
                 "headers": {"req_id": "req-reset"},
-                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
             },
             fake_handler,
         )
     finally:
         runtime_module.run_blocking = original_run_blocking
 
-    assert "remove_session_codex_home" in calls
-    assert stable_session_id(bot.config.bot_id, "single:alice", bot.config.source.source_dir).startswith("session-")
+    assert "create_new_session_run" in calls
+    assert current_session_id(bot.config, "single:alice").startswith("session-")
 
 
-async def test_bridge_reset_command_terminates_before_removing_session_home(tmp_path) -> None:
+async def test_new_session_command_terminates_before_creating_session(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge import wecom_runtime as runtime_module
 
     order: list[str] = []
 
     class FakeProcess:
-        def terminate(self) -> None:
-            order.append("terminate")
+        returncode = None
 
-    config = make_config(tmp_path)
-    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
-    ws = FakeWS([])
-    bot.ws = ws
-    bot.active_processes["single:alice"] = FakeProcess()
-
-    async def fake_run_blocking(func, *args, **kwargs):
-        order.append(func.__name__)
-        return func(*args, **kwargs)
-
-    async def fake_handler(*_args, **_kwargs):
-        raise AssertionError("handler should not be called for bridge command")
-
-    original_run_blocking = runtime_module.run_blocking
-    runtime_module.run_blocking = fake_run_blocking
-    try:
-        await handle_wecom_payload(
-            config,
-            bot,
-            ws,
-            {
-                "cmd": "aibot_msg_callback",
-                "headers": {"req_id": "req-reset"},
-                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
-            },
-            fake_handler,
-        )
-    finally:
-        runtime_module.run_blocking = original_run_blocking
-
-    assert order.index("terminate") < order.index("remove_session_codex_home")
-
-
-async def test_bridge_reset_command_waits_for_process_exit_before_removing_session_home(tmp_path) -> None:
-    from workspace_bridge.config import build_bot_from_app_config
-    from workspace_bridge import wecom_runtime as runtime_module
-
-    order: list[str] = []
-
-    class FakeProcess:
         def terminate(self) -> None:
             order.append("terminate")
 
         async def wait(self) -> None:
             order.append("wait")
+            self.returncode = -15
 
     config = make_config(tmp_path)
     bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
@@ -917,14 +966,129 @@ async def test_bridge_reset_command_waits_for_process_exit_before_removing_sessi
             {
                 "cmd": "aibot_msg_callback",
                 "headers": {"req_id": "req-reset"},
-                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
             },
             fake_handler,
         )
     finally:
         runtime_module.run_blocking = original_run_blocking
 
-    assert order.index("terminate") < order.index("wait") < order.index("remove_session_codex_home")
+    assert order.index("terminate") < order.index("wait") < order.index("create_new_session_run")
+
+
+async def test_new_session_command_waits_for_process_exit_before_switching_binding(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge import wecom_runtime as runtime_module
+
+    order: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def terminate(self) -> None:
+            order.append("terminate")
+
+        async def wait(self) -> None:
+            order.append("wait")
+            self.returncode = -15
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    bot.ws = ws
+    bot.active_processes["single:alice"] = FakeProcess()
+
+    async def fake_run_blocking(func, *args, **kwargs):
+        order.append(func.__name__)
+        return func(*args, **kwargs)
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for bridge command")
+
+    original_run_blocking = runtime_module.run_blocking
+    runtime_module.run_blocking = fake_run_blocking
+    try:
+        await handle_wecom_payload(
+            config,
+            bot,
+            ws,
+            {
+                "cmd": "aibot_msg_callback",
+                "headers": {"req_id": "req-reset"},
+                "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
+            },
+            fake_handler,
+        )
+    finally:
+        runtime_module.run_blocking = original_run_blocking
+
+    assert order.index("terminate") < order.index("wait") < order.index("create_new_session_run")
+
+
+async def test_new_session_keeps_context_when_process_does_not_exit(tmp_path, monkeypatch) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge import wecom_runtime as runtime_module
+    from workspace_bridge.runtime import prepare_session_run, session_codex_home_root, update_session_record
+
+    class StuckProcess:
+        returncode = None
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> None:
+            await asyncio.Future()
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    bot.ws = ws
+    launch = prepare_session_run(bot.config, "single:alice")
+    update_session_record(
+        bot.config.runtime_root,
+        launch.session.session_id,
+        lambda current: replace(current, thread_id="keep-thread", recent_chat=({"role": "user", "text": "keep-chat"},)),
+    )
+    bot.session_threads["single:alice"] = "keep-thread"
+    session_home = session_codex_home_root(bot.config.runtime_root) / launch.session.session_id
+    session_home.mkdir(parents=True, exist_ok=True)
+    marker = session_home / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    process = StuckProcess()
+    bot.active_processes["single:alice"] = process
+
+    original_confirm = runtime_module._confirm_process_exit
+
+    async def confirm_quickly(target, timeout_sec=0.01):
+        await original_confirm(target, timeout_sec=timeout_sec)
+
+    monkeypatch.setattr(runtime_module, "_confirm_process_exit", confirm_quickly)
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for bridge command")
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-new"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
+        },
+        fake_handler,
+    )
+
+    stored = runtime_module.load_session_record(bot.config.runtime_root, launch.session.session_id)
+    assert stored.thread_id == "keep-thread"
+    assert stored.recent_chat == ({"role": "user", "text": "keep-chat"},)
+    assert bot.session_threads["single:alice"] == "keep-thread"
+    assert bot.active_processes["single:alice"] is process
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert "did not exit" in ws.sent[-1]["body"]["stream"]["content"]
 
 
 async def test_ws_send_json_initializes_runtime_send_lock(tmp_path) -> None:
@@ -1193,7 +1357,7 @@ async def test_bridge_interrupt_command_tolerates_non_object_processing_payload(
     assert ws.sent[-1]["body"]["stream"]["content"] == "Current task interrupted."
 
 
-async def test_bridge_reset_command_cancels_active_schedule_run(tmp_path) -> None:
+async def test_new_session_command_cancels_active_schedule_run(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
     from workspace_bridge.schedule import ScheduledJob, create_one_shot_schedule, read_schedule_definition, schedule_processing_root, write_scheduled_job
 
@@ -1235,7 +1399,7 @@ async def test_bridge_reset_command_cancels_active_schedule_run(tmp_path) -> Non
         {
             "cmd": "aibot_msg_callback",
             "headers": {"req_id": "req-reset-schedule"},
-            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/new"}},
         },
         fake_handler,
     )
@@ -1251,7 +1415,7 @@ async def test_bridge_reset_command_cancels_active_schedule_run(tmp_path) -> Non
     assert definition is not None
     assert definition.enabled is False
     assert definition.run_count == 1
-    assert ws.sent[-1]["body"]["stream"]["content"] == "Session reset."
+    assert ws.sent[-1]["body"]["stream"]["content"] == "New session ready. Your next message will start a new thread."
 
 
 async def test_resume_command_lists_candidates(tmp_path) -> None:
@@ -1352,7 +1516,7 @@ async def test_resume_command_lists_candidates_from_persisted_thread_ids(tmp_pat
 
 async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     from workspace_bridge.config import build_bot_from_app_config
-    from workspace_bridge.runtime import load_session_record, prepare_session_run
+    from workspace_bridge.runtime import load_session_record, prepare_session_run, session_codex_home_root
     from workspace_bridge import wecom_runtime as runtime_module
 
     config = make_config(tmp_path)
@@ -1362,6 +1526,14 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     current = prepare_session_run(runtime.config, "single:alice")
     target = prepare_session_run(runtime.config, "group-user:room-1:alice")
     runtime.session_threads["group-user:room-1:alice"] = "thread-target"
+    source_rollout = (
+        session_codex_home_root(runtime.config.runtime_root)
+        / target.session.session_id
+        / "sessions"
+        / "rollout-target.jsonl"
+    )
+    source_rollout.parent.mkdir(parents=True, exist_ok=True)
+    source_rollout.write_text("target rollout", encoding="utf-8")
     calls = []
 
     async def fake_run_blocking(func, *args, **kwargs):
@@ -1403,6 +1575,13 @@ async def test_resume_selection_binds_selected_thread(tmp_path) -> None:
     updated = load_session_record(runtime.config.runtime_root, current.session.session_id)
     assert updated is not None
     assert updated.thread_id == "thread-target"
+    copied_rollout = (
+        session_codex_home_root(runtime.config.runtime_root)
+        / current.session.session_id
+        / "sessions"
+        / source_rollout.name
+    )
+    assert copied_rollout.read_text(encoding="utf-8") == "target rollout"
     assert runtime.session_threads["single:alice"] == "thread-target"
     assert runtime.resume_candidates == {}
     assert "list_session_records" in calls
@@ -2365,6 +2544,7 @@ async def test_interrupt_suppression_does_not_hide_next_real_failure(tmp_path, m
         runtime_module._dispatch_message,
     )
     await started.wait()
+    release_old.set()
     await handle_wecom_payload(
         config,
         runtime,
@@ -2388,7 +2568,6 @@ async def test_interrupt_suppression_does_not_hide_next_real_failure(tmp_path, m
         runtime_module._dispatch_message,
     )
     await asyncio.sleep(0)
-    release_old.set()
     for _ in range(100):
         if any("执行失败: real boom" in item["body"]["stream"]["content"] for item in ws.sent if item["body"]["stream"]["finish"]):
             break
@@ -2512,3 +2691,46 @@ async def test_dispatch_message_allows_concurrent_different_chats(tmp_path, monk
 
     assert sorted(calls) == ["single:alice", "single:bob"]
     assert ws.sent == []
+
+
+async def test_bridge_reset_command_clears_thread_and_chat_context(tmp_path) -> None:
+    from workspace_bridge.config import build_bot_from_app_config
+    from workspace_bridge.runtime import load_session_record, prepare_session_run, update_session_record
+
+    config = make_config(tmp_path)
+    bot = WeComBotRuntime(config=build_bot_from_app_config(config), pending_requests={}, pending_streams={}, pending_finals={})
+    ws = FakeWS([])
+    bot.ws = ws
+    launch = prepare_session_run(bot.config, "single:alice")
+    update_session_record(
+        bot.config.runtime_root,
+        launch.session.session_id,
+        lambda current: replace(
+            current,
+            thread_id="reset-thread",
+            recent_chat=({"role": "user", "text": "clear me"},),
+        ),
+    )
+    bot.session_threads["single:alice"] = "keep-thread"
+
+    async def fake_handler(*_args, **_kwargs):
+        raise AssertionError("handler should not be called for bridge command")
+
+    await handle_wecom_payload(
+        config,
+        bot,
+        ws,
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-old-reset"},
+            "body": {"msgtype": "text", "from": {"userid": "alice"}, "text": {"content": "/bridge-reset"}},
+        },
+        fake_handler,
+    )
+
+    assert "single:alice" not in bot.session_threads
+    stored = load_session_record(bot.config.runtime_root, launch.session.session_id)
+    assert stored is not None
+    assert stored.thread_id is None
+    assert stored.recent_chat == ()
+    assert ws.sent[-1]["body"]["stream"]["content"] == "Session reset. Your next message will start a new thread."

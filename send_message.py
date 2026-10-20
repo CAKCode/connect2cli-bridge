@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from workspace_bridge.atomic_io import atomic_write_json
 from workspace_bridge.layout import parse_chat_key
+from workspace_bridge.wecom_context import normalize_assistant_reply
 from workspace_bridge.template_card_validation import validate_feedback_id, validate_template_card_payload
 
 
@@ -66,6 +67,8 @@ EXPECTED_ARG_KEYS = {
     "feedback_id",
     "template-card-file",
     "template_card_file",
+    "media-id", "media_id", "title", "description",
+    "assistant-task-id", "assistant_task_id", "reply-status", "reply_status",
 }
 DASH_PREFIX_VALUE_KEYS = {"content", "template-card-file", "template_card_file"}
 
@@ -227,8 +230,25 @@ def main() -> int:
                 request["feedbackId"] = validate_feedback_id(feedback_id)
             except ValueError as exc:
                 fail(str(exc), 2)
+    elif msgtype in {"file", "image", "voice", "video"}:
+        media_id = str(args.get("media-id") or args.get("media_id") or "").strip()
+        if not media_id:
+            fail("media-id required", 2)
+        request["mediaId"] = media_id
+        request["title"] = args.get("title") or ""
+        request["description"] = args.get("description") or ""
     else:
         fail(f"unsupported msgtype: {msgtype}", 2)
+
+    task_id = args.get("assistant-task-id") or args.get("assistant_task_id") or os.environ.get("WECOM_BRIDGE_ASSISTANT_TASK_ID", "")
+    if task_id:
+        if msgtype not in {"markdown", "image", "file", "video"}:
+            fail("assistant replies do not support this message type", 2)
+        try:
+            request["toAiAssistant"] = normalize_assistant_reply({"task_id": task_id,
+                "reply_status": args.get("reply-status") or args.get("reply_status") or "waiting"}, proactive=True)
+        except ValueError as exc:
+            fail(str(exc), 2)
 
     ensure_dir(pending_root)
     ensure_dir(result_root)

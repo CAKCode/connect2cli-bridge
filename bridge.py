@@ -35,9 +35,11 @@ if str(BASE_DIR) not in sys.path:
 
 from bridge_runtime_config import build_bridge_api_base, resolve_host_port
 from workspace_bridge.agent_backends import (
+    AgentProgress,
     build_agent_argv,
     extract_agent_reply,
     extract_agent_thread_id,
+    extract_agent_progress,
     normalize_agent_backend,
 )
 from workspace_bridge.agent_runtime import normalize_optional_text
@@ -58,6 +60,30 @@ from workspace_bridge.atomic_io import (
 )
 from workspace_bridge.async_utils import run_blocking
 from workspace_bridge import codex_runtime
+from workspace_bridge.codex_status import collect_codex_status, format_codex_status
+from workspace_bridge.wecom_context import (
+    AssistantCallAssembler, callback_context, decorate_context_replies,
+    feedback_event, message_source, message_text, normalize_assistant_reply, quoted_media, text_with_quote,
+)
+from workspace_bridge.wecom_media import MediaUploadRejected, native_media_body, upload_media
+from workspace_bridge.wecom_limits import (
+    WeComRateLimitError, WeComRateLimiter, validate_media_upload, wait_for_send_slot,
+)
+from workspace_bridge.wecom_protocol import (
+    build_text_response_payloads as build_wecom_text_response_payloads,
+    stream_text_preview,
+)
+from workspace_bridge.wecom_text import (
+    WECOM_CONTENT_MAX_BYTES,
+    split_markdown_chunks,
+    split_text_chunks as split_wecom_text_chunks,
+    truncate_markdown,
+)
+from workspace_bridge.process_control import (
+    isolated_subprocess_kwargs,
+    remember_isolated_process,
+    terminate_process_tree,
+)
 from workspace_bridge.template_card_validation import (
     enrich_template_card_for_delivery,
     extract_template_card_owner_user_id,
@@ -141,7 +167,7 @@ CODEX_EXEC_MODE = "host" if _RAW_CODEX_EXEC_MODE in {"", "null", "none"} else _R
 WECOM_WS = "wss://openws.work.weixin.qq.com"
 
 MAX_JSON_BODY = int(os.environ.get("MAX_JSON_BODY", 1024 * 1024))
-MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", 100 * 1024 * 1024))
+MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", 20 * 1024 * 1024))
 MAX_INBOUND_IMAGE_SIZE = int(os.environ.get("MAX_INBOUND_IMAGE_SIZE", 30 * 1024 * 1024))
 MAX_INBOUND_FILE_SIZE = int(os.environ.get("MAX_INBOUND_FILE_SIZE", 100 * 1024 * 1024))
 MEDIA_CONNECT_TIMEOUT = int(os.environ.get("MEDIA_CONNECT_TIMEOUT", 8000))
@@ -154,13 +180,21 @@ PROACTIVE_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("PROACTIVE_SEND_ACK_T
 REPLY_SEND_ACK_TIMEOUT_SEC = max(1, int(os.environ.get("REPLY_SEND_ACK_TIMEOUT_SEC", 10)))
 UNCERTAIN_DELIVERY_RETRY_SEC = max(1, int(os.environ.get("UNCERTAIN_DELIVERY_RETRY_SEC", 90)))
 WEBSOCKET_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("WEBSOCKET_SEND_TIMEOUT_SEC", 5)))
-STATUS_STREAM_INTERVAL_SEC = max(1, int(os.environ.get("STATUS_STREAM_INTERVAL_SEC", 2)))
+STATUS_STREAM_INTERVAL_SEC = max(5, int(os.environ.get("STATUS_STREAM_INTERVAL_SEC", 5)))
+STATUS_STREAM_PROGRESS_ENABLED = str(os.environ.get("STATUS_STREAM_PROGRESS_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+CALLBACK_CONCURRENCY = max(1, int(os.environ.get("CALLBACK_CONCURRENCY", 16)))
+ASSISTANT_CALL_TIMEOUT_SEC = max(30, int(os.environ.get("ASSISTANT_CALL_TIMEOUT_SEC", 300)))
 STATUS_SEND_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_TIMEOUT_SEC", 1)))
 STATUS_SEND_LOCK_TIMEOUT_SEC = max(1, int(os.environ.get("STATUS_SEND_LOCK_TIMEOUT_SEC", 1)))
 PROACTIVE_TEXT_MAX_CHARS = max(256, int(os.environ.get("PROACTIVE_TEXT_MAX_CHARS", 1800)))
 STREAM_TEXT_MAX_CHARS = max(256, int(os.environ.get("STREAM_TEXT_MAX_CHARS", 3500)))
-REPLY_IDLE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_IDLE_FALLBACK_SEC", 240)))
 REPLY_MAX_AGE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_MAX_AGE_FALLBACK_SEC", 540)))
+REPLY_IDLE_FALLBACK_SEC = max(60, int(os.environ.get("REPLY_IDLE_FALLBACK_SEC", REPLY_MAX_AGE_FALLBACK_SEC)))
 PROACTIVE_STATUS_INTERVAL_SEC = max(30, int(os.environ.get("PROACTIVE_STATUS_INTERVAL_SEC", 120)))
 SCHEDULE_PROCESSING_RETRY_MS = max(1000, int(os.environ.get("SCHEDULE_PROCESSING_RETRY_MS", 30000)))
 SCHEDULE_ORPHAN_TTL_MS = max(60000, int(os.environ.get("SCHEDULE_ORPHAN_TTL_MS", 86400000)))
@@ -171,9 +205,15 @@ WECOM_RAW_INBOUND_LOG_ENABLED = str(os.environ.get("WECOM_RAW_INBOUND_LOG_ENABLE
 WECOM_REPLY_URL_TTL_MS = 60 * 60 * 1000
 REPEATABLE_TEMPLATE_CARD_EVENT_KEYS = {"refresh_progress"}
 
-SESSION_TTL = 30 * 60
+MIN_SESSION_TTL_SECONDS = 30 * 60
+DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+SESSION_TTL = max(
+    MIN_SESSION_TTL_SECONDS,
+    int(os.environ.get("SESSION_TTL", DEFAULT_SESSION_TTL_SECONDS)),
+)
 SESSION_LEASE_TTL_MS = int(os.environ.get("SESSION_LEASE_TTL", 30000))
 SESSION_LEASE_RENEW_MS = max(3000, SESSION_LEASE_TTL_MS // 3)
+SESSION_CONTROL_EXIT_TIMEOUT_SEC = 5.0
 RECENT_EVENT_TTL = 10 * 60
 MAX_STREAM_CONTENT = 8000
 MAX_SESSION_CHAT_ITEMS = 200
@@ -329,7 +369,10 @@ class SessionState:
     active_scheduled_job_file: Optional[str] = None
     active_schedule_request_id: Optional[str] = None
     interrupt_requested: bool = False
+    interrupt_queue_resume_deferred: bool = False
     active_schedule_id: Optional[str] = None
+    active_message_context: dict[str, Any] = field(default_factory=dict)
+    reply_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     resume_candidates: list[dict[str, Any]] = field(default_factory=list)
     resume_selection_expires_at: int = 0
     use_global_codex_sessions: bool = False
@@ -342,6 +385,7 @@ class BotState:
     started_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=200))
     sessions: dict[str, SessionState] = field(default_factory=dict)
+    session_lifecycle_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     ws: Optional[aiohttp.ClientWebSocketResponse] = None
     runner_task: Optional[asyncio.Task] = None
     heartbeat_task: Optional[asyncio.Task] = None
@@ -367,10 +411,25 @@ class BotState:
     last_heartbeat_ack_at_ms: Optional[int] = None
     task_restart_counts: dict[str, int] = field(default_factory=dict)
     pending_payload_flush_in_progress: bool = False
+    callback_contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    callback_tasks: set[asyncio.Task] = field(default_factory=set)
+    callback_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(CALLBACK_CONCURRENCY))
+    assistant_calls: AssistantCallAssembler = field(default_factory=AssistantCallAssembler)
+    assistant_call_timeout_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    rate_limiter: WeComRateLimiter = field(default_factory=WeComRateLimiter)
+    feedback_records: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def uid() -> str:
     return f"{int(time.time() * 1000):x}{random.randint(0, 0xFFFFFF):06x}"
+
+
+def get_session_lifecycle_lock(bot: BotState, key: str) -> asyncio.Lock:
+    lock = bot.session_lifecycle_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        bot.session_lifecycle_locks[key] = lock
+    return lock
 
 
 def now_ms() -> int:
@@ -2632,6 +2691,50 @@ def create_session_record(bot: BotState, key: str) -> dict[str, Any]:
         return write_session_record(record)
 
 
+def create_fresh_session_record(
+    bot: BotState,
+    key: str,
+    *,
+    expected_session_id: str,
+    cwd_dir: Path,
+) -> dict[str, Any]:
+    bot_id = str(bot.config["id"])
+    key_file = get_registry_key_file(bot_id, key)
+    ensure_dir_for(key_file)
+    with session_key_lock(bot_id, key):
+        current = repair_session_record_by_key_unlocked(bot_id, key)
+        if current is None or str(current["sessionId"]) != expected_session_id:
+            raise BridgeError(409, f"session binding changed while starting a new session: {key}")
+
+        session_id = uid()
+        while get_registry_session_file(session_id).exists():
+            session_id = uid()
+        record = normalize_session_record(
+            {
+                "sessionId": session_id,
+                "botId": bot_id,
+                "chatKey": key,
+                "lockFile": str(get_managed_session_lock_file(bot_id, session_id)),
+                "cwdDir": str(cwd_dir.expanduser().resolve()),
+                "createdAt": now_ms(),
+                "updatedAt": now_ms(),
+                "status": "idle",
+                "useGlobalCodexSessions": False,
+                "recentChat": [],
+            }
+        )
+        if record is None:
+            raise BridgeError(500, "failed to create session record")
+
+        stored = write_session_record(record)
+        try:
+            write_json_atomic(key_file, build_session_key_entry(stored))
+        except Exception:
+            remove_path_if_exists(get_registry_session_file(session_id))
+            raise
+        return stored
+
+
 def get_or_create_session_record(bot: BotState, key: str) -> dict[str, Any]:
     return read_session_record_by_key(bot.config["id"], key) or create_session_record(bot, key)
 
@@ -2880,27 +2983,12 @@ def build_queue_status_text(position: int) -> str:
     return build_session_status_text("排队中", "即将开始处理")
 
 
-def build_thinking_status_text(elapsed_sec: int, detail: Optional[str] = None) -> str:
-    suffix = f"已运行 {max(0, int(elapsed_sec))}s"
-    if detail:
-        suffix = f"{suffix}，{detail}"
-    return build_session_status_text("思考中", suffix)
-
-
-def build_working_status_text(elapsed_sec: int, detail: Optional[str] = None) -> str:
-    elapsed = max(0, int(elapsed_sec))
-    dots = "." * ((elapsed // 5) % 3 + 1)
-    text = f"运行状态：整理回复中{dots} 已运行 {elapsed}s"
-    if detail:
-        text = f"{text}，{detail}"
-    return f"{text}。"
-
-
 def build_status_stream_content(status_text: str, summary: Optional[str] = None) -> str:
     cleaned_summary = str(summary or "").strip()
     if not cleaned_summary:
         return status_text
-    return limit_stream_content(f"{status_text}\n\n{cleaned_summary}")
+    content = limit_stream_content(f"{status_text}\n\n{cleaned_summary}")
+    return stream_text_preview(content, max_chars=STREAM_TEXT_MAX_CHARS)
 
 
 def acquire_bot_runtime_lock(bot: BotState) -> bool:
@@ -2966,10 +3054,10 @@ def strip_text_mentions(content: str, bot_name: Optional[str] = None) -> str:
 
 def normalize_bridge_command_text(content: str, bot_name: Optional[str] = None) -> str:
     text = strip_text_mentions(content, bot_name)
-    if text.startswith("/bridge-") or text.startswith("/cwd") or text.startswith("/local-"):
+    if text == "/new" or text.startswith(("/bridge-", "/cwd", "/local-")):
         return text
     fallback = LEADING_MENTION_RE.sub("", content or "", count=1).strip()
-    if fallback.startswith("/bridge-") or fallback.startswith("/cwd") or fallback.startswith("/local-"):
+    if fallback == "/new" or fallback.startswith(("/bridge-", "/cwd", "/local-")):
         return fallback
     return (content or "").strip()
 
@@ -2977,13 +3065,15 @@ def normalize_bridge_command_text(content: str, bot_name: Optional[str] = None) 
 def dedupe_content_fingerprint(message: dict[str, Any]) -> str:
     body = _as_dict(message.get("body"))
     msg_type = str(body.get("msgtype") or "").strip()
-    if msg_type == "text":
-        return str((_as_dict(body.get("text")).get("content") or "")).strip()
+    if msg_type in {"text", "voice"}:
+        return message_text(body)
     if msg_type == "image":
         return str((_as_dict(body.get("image")).get("url") or "")).strip()
     if msg_type == "file":
         file_body = _as_dict(body.get("file"))
         return str(file_body.get("file_id") or file_body.get("fileId") or file_body.get("filename") or "").strip()
+    if msg_type == "video":
+        return str(_as_dict(body.get("video")).get("url") or "").strip()
     if msg_type == "mixed":
         return json.dumps(_as_dict(body.get("mixed")), ensure_ascii=False, sort_keys=True)
     return ""
@@ -3050,6 +3140,10 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
             f"userId: {user_id}",
             f"roomId: {room_id}",
             f"sessionId: {sess.session_id}",
+            f"messageSource: {sess.active_message_context.get('source') or 'user'}",
+            f"assistantTaskId: {sess.active_message_context.get('assistant_task_id') or '-'}",
+            "nativeMediaTypes: file,image,voice,video (assistant calls: file,image,video)",
+            "nativeMediaLimits: file=20MB,image=10MB,voice=2MB(amr),video=10MB(mp4)",
             f"agentBackend: {agent_backend}",
             f"agentCommand: {agent_command}",
             f"workspaceMode: {bot_workspace_mode(bot.config)}",
@@ -3091,6 +3185,8 @@ def build_bridge_context(bot: BotState, sess: SessionState, key: str) -> str:
                 if agent_backend != "codex"
                 else "Native Codex resume is enabled when a live bridge thread is available."
             ),
+            "For native media previews, append --media-type image, video or voice to localSendFileCommand; file is the default.",
+            "Assistant calls support text, images and files, not voice, video or template cards; file/message commands keep additions waiting until the final response.",
             "[/BridgeContext]",
         ]
     )
@@ -3128,10 +3224,51 @@ def restore_session_active_media(sess: SessionState) -> None:
         sess.active_run_media_notes = []
 
 
+async def prepare_wecom_send(bot: BotState, payload: dict[str, Any], send_budget: Optional[float] = None) -> float:
+    context = bot.callback_contexts.get(str(_as_dict(payload.get("headers")).get("req_id") or ""), {})
+    target = context.get("target")
+    if not target:
+        sess = bot.reply_sessions.get(str(_as_dict(payload.get("headers")).get("req_id") or ""))
+        if sess:
+            key = key_for_session(bot, sess)
+            if key:
+                target = chat_key_to_send_target(key)
+    now = bot.rate_limiter.clock()
+    deadline = now + send_budget if send_budget is not None else None
+    cmd = payload.get("cmd")
+    if cmd in {"aibot_respond_update_msg", "aibot_respond_welcome_msg"} and context:
+        callback_deadline = context["received_at"] + 5
+        deadline = min(deadline, callback_deadline) if deadline is not None else callback_deadline
+    stream_id = str(_as_dict(_as_dict(payload.get("body")).get("stream")).get("id") or "")
+    started = context.get("streams", {}).get(stream_id)
+    if started is not None:
+        stream_deadline = started + 600
+        deadline = min(deadline, stream_deadline) if deadline is not None else stream_deadline
+    try:
+        await wait_for_send_slot(bot.rate_limiter, payload, callback_target=target, received_at=context.get("received_at"), deadline=deadline)
+    except WeComRateLimitError as exc:
+        raise BridgeError(429, str(exc)) from exc
+    timeout = WEBSOCKET_SEND_TIMEOUT_SEC
+    if deadline is not None:
+        timeout = min(timeout, deadline - bot.rate_limiter.clock())
+        if timeout <= 0:
+            raise BridgeError(429, "callback reply deadline exceeded")
+    return timeout
+
+
+def note_wecom_send(bot: BotState, payload: dict[str, Any]) -> None:
+    context = bot.callback_contexts.get(str(_as_dict(payload.get("headers")).get("req_id") or ""))
+    stream_id = str(_as_dict(_as_dict(payload.get("body")).get("stream")).get("id") or "")
+    if context is not None and stream_id:
+        context["streams"].setdefault(stream_id, bot.rate_limiter.clock())
+
+
 async def send_ws_payload(bot: BotState, payload: dict[str, Any]) -> None:
     if not bot.ws or bot.ws.closed:
         return
-    await asyncio.wait_for(bot.ws.send_json(payload), WEBSOCKET_SEND_TIMEOUT_SEC)
+    timeout = await prepare_wecom_send(bot, payload)
+    await asyncio.wait_for(bot.ws.send_json(payload), timeout)
+    note_wecom_send(bot, payload)
 
 
 def payload_req_id(payload: dict[str, Any]) -> str:
@@ -3151,6 +3288,9 @@ def is_reply_payload(payload: dict[str, Any]) -> bool:
 def reply_payload_finished(payload: dict[str, Any]) -> bool:
     if not is_reply_payload(payload):
         return False
+    assistant = _as_dict(_as_dict(payload.get("body")).get("to_ai_assistant"))
+    if assistant.get("reply_status") == "waiting":
+        return False
     stream = ((payload.get("body") or {}).get("stream") or {})
     return bool(stream.get("finish"))
 
@@ -3164,6 +3304,8 @@ def register_reply_session(bot: BotState, req_id: Optional[str], sess: SessionSt
     if not req_id:
         return
     bot.reply_sessions[req_id] = sess
+    if req_id in bot.callback_contexts:
+        sess.reply_contexts[req_id] = bot.callback_contexts[req_id]
     sess.reply_started_at.setdefault(req_id, time.time())
 
 
@@ -3187,6 +3329,39 @@ def cleanup_session_reply_contexts(bot: BotState, sess: SessionState) -> None:
     for req_id, context in list(bot.reply_sessions.items()):
         if context is sess:
             cleanup_reply_session(bot, req_id, sess)
+
+
+def active_reply_request_ids(bot: BotState, sess: SessionState) -> list[str]:
+    """Return reply streams that must be closed before a session is interrupted."""
+    request_ids = set(sess.reply_started_at)
+    request_ids.update(req_id for req_id, context in bot.reply_sessions.items() if context is sess)
+    for payload in (sess.pending_stream_payload, sess.pending_final_payload):
+        if payload_req_id(payload or {}):
+            request_ids.add(payload_req_id(payload))
+    return sorted(request_id for request_id in request_ids if str(request_id).strip())
+
+
+async def finish_interrupted_reply_streams(
+    bot: BotState,
+    key: str,
+    sess: SessionState,
+    request_ids: list[str],
+) -> None:
+    """Finish WeCom streams left open when a running task is cancelled."""
+    if not request_ids:
+        return
+    for req_id in request_ids:
+        if req_id in sess.reply_proactive_req_ids:
+            continue
+        payload = build_session_text_payload(key, sess, req_id, "任务已中断。", True)
+        if payload is None:
+            continue
+        try:
+            # Cache a failed close and retry it after reconnect/next inbound ACK;
+            # dropping it leaves the client stream permanently loading.
+            await send_or_store_session_payload(bot, key, sess, payload, True)
+        except Exception as exc:
+            add_log(bot, f"[{key}] interrupted reply stream close skipped req_id={req_id}: {exc}")
 
 
 def key_for_session(bot: BotState, sess: SessionState) -> str:
@@ -3232,7 +3407,7 @@ def mark_reply_proactive(sess: SessionState, req_id: Optional[str]) -> None:
 
 
 def build_reply_window_expired_notice() -> str:
-    return f"流式回复窗口即将到期，任务仍在后台运行，后续会约每 {PROACTIVE_STATUS_INTERVAL_SEC}s 主动发送阶段摘要和最终结果。"
+    return "流式回复窗口即将到期，任务仍在后台运行，后续会主动发送新的进展和最终结果。"
 
 
 def build_queued_proactive_notice(position: int) -> str:
@@ -3253,6 +3428,7 @@ async def close_reply_stream_for_proactive(bot: BotState, key: str, sess: Sessio
         return
     notice_payload = build_session_text_payload(key, sess, req_id, build_reply_window_expired_notice(), True)
     if notice_payload:
+        notice_payload = decorate_context_replies([notice_payload], sess.reply_contexts.get(req_id), final=False)[0]
         try:
             await send_session_payload(bot, sess, notice_payload)
         except Exception as exc:
@@ -3286,7 +3462,9 @@ async def send_session_ws_payload(
         if not bot.ws or bot.ws.closed:
             raise BridgeError(503, "bot websocket closed")
         try:
-            await asyncio.wait_for(bot.ws.send_json(payload), send_timeout_sec or WEBSOCKET_SEND_TIMEOUT_SEC)
+            timeout = await prepare_wecom_send(bot, payload, send_timeout_sec)
+            await asyncio.wait_for(bot.ws.send_json(payload), timeout)
+            note_wecom_send(bot, payload)
         except asyncio.TimeoutError as exc:
             raise BridgeError(504, "websocket send timeout") from exc
         mark_session_reply_sent(bot, sess, payload)
@@ -3427,35 +3605,11 @@ def chat_key_to_send_target(key: str) -> tuple[int, str]:
 
 
 def limit_proactive_text(content: str) -> str:
-    text = content.strip()
-    if len(text) <= PROACTIVE_TEXT_MAX_CHARS:
-        return text
-    suffix = "...(truncated)"
-    return text[: max(0, PROACTIVE_TEXT_MAX_CHARS - len(suffix))].rstrip() + suffix
+    return truncate_markdown(content, max_chars=PROACTIVE_TEXT_MAX_CHARS, suffix="...(truncated)")
 
 
 def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
-    text = str(content or "").strip()
-    if not text:
-        return [""]
-    chunks: list[str] = []
-    remaining = text
-    limit = max(1, int(max_chars))
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit + 1)
-        if split_at <= 0:
-            split_at = remaining.rfind(" ", 0, limit + 1)
-        if split_at <= 0:
-            split_at = limit
-        chunk = remaining[:split_at]
-        if not chunk:
-            chunk = remaining[:limit]
-            split_at = len(chunk)
-        chunks.append(chunk)
-        remaining = remaining[split_at:]
-    if remaining:
-        chunks.append(remaining)
-    return chunks
+    return split_wecom_text_chunks(content, max_chars=max_chars)
 
 
 def format_group_user_mention(user_id: Optional[str]) -> str:
@@ -3519,6 +3673,20 @@ def build_proactive_chat_payload(key: str, content: str, mention_user_id: Option
     }
 
 
+def build_proactive_chat_payloads(
+    key: str, content: str, mention_user_id: Optional[str] = None
+) -> list[dict[str, Any]]:
+    resolved_mention = proactive_chat_mention_user_id(key, mention_user_id)
+    mention = format_group_user_mention(resolved_mention)
+    prefix = mention + "\n" if mention else ""
+    chunks = split_markdown_chunks(
+        content,
+        max_chars=PROACTIVE_TEXT_MAX_CHARS - len(prefix),
+        max_bytes=WECOM_CONTENT_MAX_BYTES - len(prefix.encode("utf-8")),
+    )
+    return [build_proactive_chat_payload(key, chunk, resolved_mention) for chunk in chunks]
+
+
 def attach_message_feedback(message_body: dict[str, Any], feedback_id: Optional[str]) -> dict[str, Any]:
     resolved_feedback_id = str(feedback_id or "").strip()
     body = dict(message_body or {})
@@ -3546,10 +3714,12 @@ async def send_ws_payload_with_ack(
         raise BridgeError(500, "payload req_id required for ack")
     if not bot.ws or bot.ws.closed:
         raise BridgeError(503, "bot websocket closed")
+    timeout = await prepare_wecom_send(bot, payload, send_timeout_sec)
     future = create_request_future(bot, req_id)
     try:
         try:
-            await asyncio.wait_for(bot.ws.send_json(payload), send_timeout_sec or WEBSOCKET_SEND_TIMEOUT_SEC)
+            await asyncio.wait_for(bot.ws.send_json(payload), timeout)
+            note_wecom_send(bot, payload)
         except asyncio.TimeoutError as exc:
             bot.pending_requests.pop(req_id, None)
             raise BridgeError(504, "websocket send timeout") from exc
@@ -3561,6 +3731,11 @@ async def send_ws_payload_with_ack(
     except Exception:
         bot.pending_requests.pop(req_id, None)
         raise
+    finally:
+        if bot.pending_requests.get(req_id) is future:
+            bot.pending_requests.pop(req_id, None)
+        if not future.done():
+            future.cancel()
 
 
 def build_session_text_payload(key: str, sess: SessionState, req_id: Optional[str], content: str, final: bool) -> Optional[dict[str, Any]]:
@@ -3568,29 +3743,31 @@ def build_session_text_payload(key: str, sess: SessionState, req_id: Optional[st
         stream_content = content
         if should_prepend_group_user_mention_to_reply(key, sess, req_id):
             stream_content = prepend_group_user_mention(content, chat_key_to_user_id(key))
-        return {
+        payload = {
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": req_id},
             "body": {"msgtype": "stream", "stream": {"id": sess.session_id, "finish": final, "content": stream_content}},
         }
+        return decorate_context_replies([payload], sess.reply_contexts.get(req_id), final=final)[0]
     if not final:
         return None
-    return build_proactive_chat_payload(key, content)
+    return decorate_context_replies([build_proactive_chat_payload(key, content)], sess.active_message_context, final=final)[0]
 
 
 def build_session_text_payloads(
     key: str, sess: SessionState, req_id: Optional[str], content: str, final: bool
 ) -> list[dict[str, Any]]:
     if req_id:
-        chunks = split_text_chunks(content, max_chars=STREAM_TEXT_MAX_CHARS)
-        payloads: list[dict[str, Any]] = []
-        for index, chunk in enumerate(chunks):
-            payload = build_session_text_payload(key, sess, req_id, chunk, final and index == len(chunks) - 1)
-            if payload is not None:
-                payloads.append(payload)
-        return payloads
-    payload = build_session_text_payload(key, sess, req_id, content, final)
-    return [payload] if payload is not None else []
+        stream_content = content
+        if should_prepend_group_user_mention_to_reply(key, sess, req_id):
+            stream_content = prepend_group_user_mention(content, chat_key_to_user_id(key))
+        payloads = build_wecom_text_response_payloads(
+            req_id, sess.session_id, stream_content, final=final, max_chars=STREAM_TEXT_MAX_CHARS
+        )
+        return decorate_context_replies(payloads, sess.reply_contexts.get(req_id), final=final)
+    if not final:
+        return []
+    return decorate_context_replies(build_proactive_chat_payloads(key, content), sess.active_message_context, final=final)
 
 
 async def send_transient_session_status(
@@ -3646,6 +3823,8 @@ async def send_session_status(
             sess.pending_stream_payloads = None
             return True
         except Exception as exc:
+            if isinstance(exc, BridgeError) and exc.status_code == 429:
+                return False
             failed_index = index if 'index' in locals() else 0
             add_log(bot, f"[{key}] stream status deferred req_id={payload_req_id(payloads[-1]) or '-'}: {exc}")
             add_event_log(
@@ -3674,10 +3853,9 @@ async def send_or_store_session_payloads(
     original_reply_req_id = payload_req_id(payloads[0]) if is_reply_payload(payloads[0]) else ""
     first_payload = outgoing_payloads[0]
     if first_payload.get("cmd") == "aibot_send_msg":
-        refreshed_req_id = uid()
         for outgoing_payload in outgoing_payloads:
             headers = dict((outgoing_payload.get("headers") or {}))
-            headers["req_id"] = refreshed_req_id
+            headers["req_id"] = uid()
             outgoing_payload["headers"] = headers
     elif is_reply_payload(first_payload):
         reply_req_id = payload_req_id(first_payload)
@@ -3693,19 +3871,21 @@ async def send_or_store_session_payloads(
             or reply_should_use_proactive(sess, reply_req_id)
         ):
             mark_reply_proactive(sess, reply_req_id)
-            proactive_payload = build_proactive_chat_payload(
-                key,
-                "".join(reply_payload_content(payload) for payload in outgoing_payloads),
-                (
-                    chat_key_to_user_id(key)
-                    if uncertain_stream_delivery and key.startswith("group-user:")
-                    else proactive_reply_mention_user_id(key, sess, reply_req_id)
-                ),
+            mention_user_id = (
+                chat_key_to_user_id(key)
+                if uncertain_stream_delivery and key.startswith("group-user:")
+                else proactive_reply_mention_user_id(key, sess, reply_req_id)
             )
+            proactive_payloads = [
+                part
+                for payload in outgoing_payloads
+                for part in build_proactive_chat_payloads(key, reply_payload_content(payload), mention_user_id)
+            ]
             sess.pending_stream_payload = None
             sess.pending_stream_payloads = None
             cleanup_reply_session(bot, reply_req_id, sess)
-            return await send_or_store_session_payload(bot, key, sess, proactive_payload, final)
+            proactive_payloads = decorate_context_replies(proactive_payloads, sess.reply_contexts.get(reply_req_id), final=final)
+            return await send_or_store_session_payloads(bot, key, sess, proactive_payloads, final)
     req_id = payload_req_id(outgoing_payloads[-1])
     payload_kind = "final" if final else "stream"
     if bot.ws and not bot.ws.closed:
@@ -3765,7 +3945,7 @@ async def send_or_store_session_payload(
             or reply_should_use_proactive(sess, reply_req_id)
         ):
             mark_reply_proactive(sess, reply_req_id)
-            outgoing_payload = build_proactive_chat_payload(
+            proactive_payloads = build_proactive_chat_payloads(
                 key,
                 reply_payload_content(outgoing_payload),
                 (
@@ -3777,6 +3957,8 @@ async def send_or_store_session_payload(
             sess.pending_stream_payload = None
             sess.pending_stream_payloads = None
             cleanup_reply_session(bot, reply_req_id, sess)
+            proactive_payloads = decorate_context_replies(proactive_payloads, sess.reply_contexts.get(reply_req_id), final=final)
+            return await send_or_store_session_payloads(bot, key, sess, proactive_payloads, final)
     req_id = payload_req_id(outgoing_payload)
     payload_kind = "final" if final else "stream"
     if bot.ws and not bot.ws.closed:
@@ -3965,22 +4147,10 @@ async def respond_info(
     sess = bot.reply_sessions.get(req_id)
     key = find_chat_key_for_session(bot, sess) if sess else None
     stream_id = sess.session_id if sess else uid()
-    chunks = split_text_chunks(message, max_chars=STREAM_TEXT_MAX_CHARS)
-    payloads = [
-        {
-            "cmd": "aibot_respond_msg",
-            "headers": {"req_id": req_id},
-            "body": {
-                "msgtype": "stream",
-                "stream": {
-                    "id": stream_id,
-                    "finish": final and index == len(chunks) - 1,
-                    "content": chunk,
-                },
-            },
-        }
-        for index, chunk in enumerate(chunks)
-    ]
+    payloads = build_wecom_text_response_payloads(
+        req_id, stream_id, message, final=final, max_chars=STREAM_TEXT_MAX_CHARS
+    )
+    payloads = decorate_context_replies(payloads, bot.callback_contexts.get(req_id), final=final)
     try:
         if sess and key and cache_on_failure:
             delivered = await send_or_store_session_payloads(bot, key, sess, payloads, final)
@@ -4074,8 +4244,6 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
         or event_key
         or "确认"
     )
-    processing_notice = f"已收到「{event_text}」，正在处理..."
-    await respond_info(bot, req_id, processing_notice, final=False)
     original_card = dict(bot.template_card_payloads.get(task_id) or {})
     if repeatable_event:
         update_card = build_refresh_progress_template_card(original_card, task_id)
@@ -4102,7 +4270,6 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
             rebuilt_buttons = [{"text": event_text, "style": 1, "key": event_key or "processed"}]
         update_card["button_list"] = rebuilt_buttons
         bot.consumed_template_card_actions.add(action_token)
-        await enqueue_message(bot, key, event_text, None, silent_lease_failure=True)
     save_template_card_delivery_meta(bot, update_card["task_id"], chat_key=key, template_card=update_card)
     try:
         response = await send_ws_payload_with_ack(
@@ -4123,6 +4290,8 @@ async def handle_template_card_event(bot: BotState, message: dict[str, Any]) -> 
         )
     except Exception as exc:
         add_log(bot, f"template card update skipped req_id={req_id}: {exc}")
+    if not repeatable_event:
+        await enqueue_message(bot, key, event_text, None, silent_lease_failure=True)
 
 
 async def respond_session_info(
@@ -4834,9 +5003,11 @@ def process_queue(bot: BotState, sess: SessionState, key: str) -> None:
     item = sess.queue.pop(0)
     sess.running = True
     sess.interrupt_requested = False
+    sess.interrupt_queue_resume_deferred = False
     sess.run_generation += 1
     run_generation = sess.run_generation
     register_reply_session(bot, item.get("reqId"), sess)
+    sess.active_message_context = dict(bot.callback_contexts.get(str(item.get("reqId") or ""), item.get("messageContext") or {}))
     sess.active_schedule_id = str(item.get("scheduleId") or "").strip() or None
     sess.active_scheduled_job_file = str(item.get("scheduledJobFile") or "").strip() or None
     sess.active_schedule_request_id = str(item.get("scheduleRequestId") or "").strip() or None
@@ -4918,7 +5089,7 @@ async def run_codex(
     try:
         if not owns_context():
             return
-        await send_session_status(bot, key, sess, req_id, build_session_status_text("正在启动处理"))
+        await send_session_status(bot, key, sess, req_id, "**运行状态：启动中**")
         async with semaphore:
             while True:
                 if not owns_context():
@@ -4984,6 +5155,7 @@ async def run_codex(
                         "WECOM_BRIDGE_SESSION_ID": sess.session_id,
                         "WECOM_BRIDGE_CHAT_KEY": key,
                         "WECOM_BRIDGE_AGENT_BACKEND": backend,
+                        "WECOM_BRIDGE_ASSISTANT_TASK_ID": str(sess.active_message_context.get("assistant_task_id") or ""),
                         "WECOM_BRIDGE_WORKSPACE_MODE": bot_workspace_mode(bot.config),
                         "WECOM_BRIDGE_WORKDIR_DIR": str(workspace_paths["workDir"]),
                         "WECOM_BRIDGE_CWD_DIR": str(sess.work_dir),
@@ -5012,7 +5184,9 @@ async def run_codex(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     limit=SUBPROCESS_STREAM_LIMIT,
+                    **isolated_subprocess_kwargs(),
                 )
+                remember_isolated_process(process)
                 active_process = process
                 if not owns_context():
                     await terminate_process(process)
@@ -5023,38 +5197,42 @@ async def run_codex(
                 add_log(bot, f"[{key}] {backend} {'resume' if attempted_resume else 'exec'} started")
 
                 latest_message = ""
+                latest_progress = AgentProgress("分析中")
                 stderr_parts: list[str] = []
-                run_started_at = time.monotonic()
 
                 async def ticker() -> None:
                     if not req_id:
                         return
-                    next_tick_at = time.monotonic() + STATUS_STREAM_INTERVAL_SEC
+                    last_sent_content = "**运行状态：分析中**"
                     while sess.running:
-                        await asyncio.sleep(max(0, next_tick_at - time.monotonic()))
-                        next_tick_at += STATUS_STREAM_INTERVAL_SEC
+                        await asyncio.sleep(STATUS_STREAM_INTERVAL_SEC)
                         if not sess.running or not owns_context():
                             return
-                        elapsed = int(time.monotonic() - run_started_at)
-                        if latest_message:
-                            content = build_status_stream_content(
-                                build_working_status_text(elapsed),
-                                latest_message,
-                            )
-                        else:
-                            content = build_thinking_status_text(elapsed)
-                        await send_session_status(bot, key, sess, req_id, content)
+                        if req_id not in sess.reply_proactive_req_ids and reply_age_too_long(sess, req_id):
+                            await close_reply_stream_for_proactive(bot, key, sess, req_id)
+                        content = build_status_stream_content(
+                            f"**运行状态：{latest_progress.status}**", latest_progress.summary
+                        )
+                        if content == last_sent_content:
+                            continue
+                        if await send_session_status(bot, key, sess, req_id, content):
+                            last_sent_content = content
 
                 async def read_stdout() -> None:
-                    nonlocal latest_message
+                    nonlocal latest_message, latest_progress
                     assert process.stdout is not None
                     async for line in iter_subprocess_lines(process.stdout, bot, key, "stdout"):
                         extracted_thread = extract_agent_thread_id(normalize_agent_backend(backend), line)
-                        if extracted_thread:
+                        if extracted_thread and owns_context():
                             sess.thread_id = extracted_thread
                         extracted_reply = extract_agent_reply(normalize_agent_backend(backend), line)
                         if extracted_reply:
                             latest_message = ANSI_RE.sub("", extracted_reply)
+                        extracted_progress = extract_agent_progress(normalize_agent_backend(backend), line)
+                        if extracted_progress is not None:
+                            latest_progress = latest_progress.updated(AgentProgress(
+                                extracted_progress.status, ANSI_RE.sub("", extracted_progress.summary)
+                            ))
 
                 async def read_stderr() -> None:
                     assert process.stderr is not None
@@ -5068,12 +5246,12 @@ async def run_codex(
                         stderr_parts.append(text)
                         add_log(bot, f"[{key}] {backend} stderr: {text}")
 
-                ticker_task = asyncio.create_task(ticker())
+                ticker_task = asyncio.create_task(ticker()) if STATUS_STREAM_PROGRESS_ENABLED else None
                 stdout_task = asyncio.create_task(read_stdout())
                 stderr_task = asyncio.create_task(read_stderr())
                 prompt_write_error: Optional[Exception] = None
                 try:
-                    await send_session_status(bot, key, sess, req_id, build_thinking_status_text(0))
+                    await send_session_status(bot, key, sess, req_id, "**运行状态：分析中**")
                     try:
                         await write_process_prompt(process, effective_prompt)
                     except Exception as exc:
@@ -5082,11 +5260,12 @@ async def run_codex(
                     await stdout_task
                     await stderr_task
                 finally:
-                    ticker_task.cancel()
-                    try:
-                        await ticker_task
-                    except asyncio.CancelledError:
-                        pass
+                    if ticker_task is not None:
+                        ticker_task.cancel()
+                        try:
+                            await ticker_task
+                        except asyncio.CancelledError:
+                            pass
                     for stream_task in (stdout_task, stderr_task):
                         if not stream_task.done():
                             stream_task.cancel()
@@ -5185,7 +5364,8 @@ async def run_codex(
                     "threadId": sess.thread_id,
                 },
             )
-            resume_session_queue(bot, sess, key, "interrupt")
+            if not sess.interrupt_queue_resume_deferred:
+                resume_session_queue(bot, sess, key, "interrupt")
             return
 
         if not owns_context():
@@ -5261,7 +5441,8 @@ async def run_codex(
                     "threadId": sess.thread_id,
                 },
             )
-            resume_session_queue(bot, sess, key, "interrupt")
+            if not sess.interrupt_queue_resume_deferred:
+                resume_session_queue(bot, sess, key, "interrupt")
             return
         if output_file is not None:
             try:
@@ -5395,6 +5576,7 @@ def interrupt_session(
     active_proc = sess.proc
     had_active_run = bool(sess.running or (active_task and not active_task.done()) or (active_proc and active_proc.returncode is None))
     sess.interrupt_requested = had_active_run
+    sess.interrupt_queue_resume_deferred = False
     if had_active_run:
         restore_session_run_thread_checkpoint(sess)
         sess.run_generation += 1
@@ -5424,7 +5606,7 @@ def interrupt_session(
             bot,
             key,
             sess.session_id,
-            "session reset before file send",
+            "new session before file send",
         )
         if cancelled_file_jobs:
             add_log(bot, f"[{key}] cancelled pending file sends: {cancelled_file_jobs}")
@@ -5493,6 +5675,55 @@ def interrupt_session(
         )
 
 
+async def interrupt_session_and_wait(bot: BotState, key: str) -> tuple[dict[str, Any], Optional[SessionState]]:
+    """Interrupt a live run only after its process and task have quiesced."""
+    async with get_session_lifecycle_lock(bot, key):
+        sess = bot.sessions.get(key)
+        if sess is None:
+            return control_session(bot, key, clear_thread=False, clear_chat=False), None
+
+        acquire_session_control_lease(bot, key, sess)
+        active_task = sess.run_task
+        active_proc = sess.proc
+        active_reply_req_ids = active_reply_request_ids(bot, sess)
+        had_active_run = bool(
+            sess.running
+            or (active_task is not None and not active_task.done())
+            or (active_proc is not None and active_proc.returncode is None)
+        )
+        if had_active_run:
+            sess.interrupt_requested = True
+            sess.interrupt_queue_resume_deferred = True
+            restore_session_run_thread_checkpoint(sess)
+            sess.run_generation += 1
+
+        await terminate_process(
+            active_proc,
+            timeout_sec=SESSION_CONTROL_EXIT_TIMEOUT_SEC,
+            require_exit=True,
+            skip_wait_if_exited=True,
+        )
+        task_stopped = await cancel_task(active_task, timeout_sec=SESSION_CONTROL_EXIT_TIMEOUT_SEC)
+        if not task_stopped:
+            raise BridgeError(409, "agent task did not exit; current session is still stopping")
+        if not session_lease_is_owned_by_current_instance(sess):
+            abandon_session_after_lease_loss(bot, key, sess)
+            raise BridgeError(409, f"session ownership changed while interrupting: {key}")
+
+        if sess.run_task is active_task:
+            sess.run_task = None
+        if sess.proc is active_proc:
+            sess.proc = None
+        sess.running = False
+        result = control_session(bot, key, clear_thread=False, clear_chat=False)
+        # control_session clears cached payload state.  Close the original reply
+        # streams afterwards so an unavailable websocket leaves a retryable final
+        # packet instead of a client-side loading indicator.
+        await finish_interrupted_reply_streams(bot, key, sess, active_reply_req_ids)
+        sess.interrupt_queue_resume_deferred = False
+        return result, sess
+
+
 def abandon_session_after_lease_loss(bot: BotState, key: str, sess: SessionState) -> None:
     active_task = sess.run_task
     active_proc = sess.proc
@@ -5520,6 +5751,7 @@ def abandon_session_after_lease_loss(bot: BotState, key: str, sess: SessionState
             pass
     sess.running = False
     sess.interrupt_requested = False
+    sess.interrupt_queue_resume_deferred = False
     sess.proc = None
     sess.active_schedule_id = None
     sess.active_scheduled_job_file = None
@@ -5537,18 +5769,129 @@ def abandon_session_after_lease_loss(bot: BotState, key: str, sess: SessionState
     cleanup_session_reply_contexts(bot, sess)
 
 
-async def reset_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
+async def quiesce_session_for_context_change(bot: BotState, key: str, action: str) -> SessionState:
+    sess = await get_or_create_session_ready(bot, key)
+    acquire_session_control_lease(bot, key, sess)
+    active_task = sess.run_task
+    active_proc = sess.proc
+    if sess.running or (active_task is not None and not active_task.done()) or (
+        active_proc is not None and active_proc.returncode is None
+    ):
+        sess.run_generation += 1
+    await terminate_process(
+        active_proc,
+        timeout_sec=SESSION_CONTROL_EXIT_TIMEOUT_SEC,
+        require_exit=True,
+    )
+    task_stopped = await cancel_task(active_task, timeout_sec=SESSION_CONTROL_EXIT_TIMEOUT_SEC)
+    if not task_stopped:
+        raise BridgeError(409, f"agent task did not exit; session was not {action}")
+    if not session_lease_is_owned_by_current_instance(sess):
+        abandon_session_after_lease_loss(bot, key, sess)
+        raise BridgeError(409, f"session ownership changed while {action}: {key}")
+    if sess.run_task is active_task:
+        sess.run_task = None
+    if sess.proc is active_proc:
+        sess.proc = None
+    sess.running = False
+    sess.interrupt_requested = False
+    sess.interrupt_queue_resume_deferred = False
+    return sess
+
+
+async def reset_session_context(bot: BotState, key: str) -> dict[str, Any]:
+    async with get_session_lifecycle_lock(bot, key):
+        sess = await quiesce_session_for_context_change(bot, key, "reset")
+        result = control_session(bot, key, clear_thread=True, clear_chat=True)
+        clear_resume_selection(sess)
+        return result
+
+
+async def new_session_context(bot: BotState, key: str) -> dict[str, Any]:
+    async with get_session_lifecycle_lock(bot, key):
+        previous = await quiesce_session_for_context_change(bot, key, "replaced")
+        previous_session_id = previous.session_id
+        previous_cwd = Path(previous.work_dir)
+
+        interrupt_session(
+            bot,
+            key,
+            previous,
+            clear_thread=False,
+            clear_chat=False,
+            clear_queue=True,
+        )
+        clear_resume_selection(previous)
+        record = create_fresh_session_record(
+            bot,
+            key,
+            expected_session_id=previous_session_id,
+            cwd_dir=previous_cwd,
+        )
+        current = SessionState(
+            session_id=str(record["sessionId"]),
+            work_dir=str(get_session_runtime_cwd(bot, key, session_id=record["sessionId"])),
+            lock_file=Path(record["lockFile"]),
+        )
+        bot.sessions[key] = current
+        add_log(bot, f"[{key}] switched to new session {current.session_id}; previous={previous_session_id}")
+        add_event_log(
+            bot,
+            "session.new",
+            chatKey=key,
+            sessionId=current.session_id,
+            previousSessionId=previous_session_id,
+        )
+        try:
+            rebuild_schedule_definition_session_bindings(bot)
+            rebuild_scheduled_job_session_bindings(bot)
+        except Exception as exc:
+            add_log(bot, f"[{key}] deferred schedule session rebinding after /new: {exc}")
+        return {
+            "key": key,
+            "sessionId": current.session_id,
+            "previousSessionId": previous_session_id,
+            "threadId": None,
+            "status": "idle",
+            "clearedThread": False,
+            "clearedChat": False,
+            "live": True,
+        }
+
+
+async def clear_session_command(
+    bot: BotState,
+    key: str,
+    req_id: Optional[str],
+    confirmation: str,
+) -> None:
+    await reset_session_context(bot, key)
     sess = bot.sessions.get(key)
-    control_session(bot, key, clear_thread=True, clear_chat=True)
     if sess:
         clear_resume_selection(sess)
         register_reply_session(bot, req_id, sess)
-    await respond_info(bot, req_id, "Session reset.")
+    await respond_info(bot, req_id, confirmation)
+
+
+async def new_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
+    await new_session_context(bot, key)
+    sess = bot.sessions.get(key)
+    if sess:
+        register_reply_session(bot, req_id, sess)
+    await respond_info(bot, req_id, "New session ready. Your next message will start a new thread.")
+
+
+async def reset_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
+    await clear_session_command(
+        bot,
+        key,
+        req_id,
+        "Session reset. Your next message will start a new thread.",
+    )
 
 
 async def interrupt_session_command(bot: BotState, key: str, req_id: Optional[str]) -> None:
-    sess = bot.sessions.get(key)
-    control_session(bot, key, clear_thread=False, clear_chat=False)
+    _result, sess = await interrupt_session_and_wait(bot, key)
     if sess:
         clear_resume_selection(sess)
         register_reply_session(bot, req_id, sess)
@@ -5914,6 +6257,7 @@ def bind_resume_candidate_to_session(
         if not local_resume_binding_allowed_for_chat(bot.config, key):
             raise BridgeError(403, "selected local session binding is no longer authorized")
         raise BridgeError(409, "本地 Codex 会话不能通过 /bridge-resume 继承，请使用 /local-resume。")
+    copy_bridge_session_resume_state(str(target_record["sessionId"]), sess.session_id)
     sess.thread_id = thread_id
     sess.chat = copied_recent_chat
     sess.use_global_codex_sessions = False
@@ -6163,7 +6507,7 @@ async def status_session_command(bot: BotState, key: str, req_id: Optional[str])
     record = read_session_record_by_key(bot.config["id"], key)
     scheduled_count = count_scheduled_messages_for_key(bot.config["id"], key)
     if sess:
-        status_text = (
+        bridge_status_text = (
             f"status={('running' if sess.running else 'idle')}; "
             f"queue={len(sess.queue)}; "
             f"scheduled={scheduled_count}; "
@@ -6171,17 +6515,40 @@ async def status_session_command(bot: BotState, key: str, req_id: Optional[str])
             f"threadId={sess.thread_id or '-'}; "
             f"cwd={sess.work_dir}"
         )
+        session_id = sess.session_id
+        thread_id = sess.thread_id
+        current_cwd = Path(sess.work_dir)
     elif record:
-        status_text = (
+        thread_id = str(record.get("threadId") or "").strip() or None
+        current_cwd = Path(record.get("cwdDir") or get_session_runtime_cwd(bot, key, session_id=record["sessionId"]))
+        bridge_status_text = (
             f"status={record.get('status', 'idle')}; "
             f"queue=0; "
             f"scheduled={scheduled_count}; "
             f"sessionId={record['sessionId']}; "
-            f"threadId=-; "
-            f"cwd={record.get('cwdDir') or get_session_runtime_cwd(bot, key, session_id=record['sessionId'])}"
+            f"threadId={thread_id or '-'}; "
+            f"cwd={current_cwd}"
         )
+        session_id = str(record["sessionId"])
     else:
-        status_text = f"status=empty; queue=0; scheduled={scheduled_count}; sessionId=-; threadId=-; cwd=-"
+        bridge_status_text = f"status=empty; queue=0; scheduled={scheduled_count}; sessionId=-; threadId=-; cwd=-"
+        session_id = None
+        thread_id = None
+        current_cwd = Path(str(bot.config.get("workDir") or DEFAULT_WORK_DIR)).expanduser().resolve()
+    native_status = await run_blocking(
+        collect_codex_status,
+        default_codex_home=DEFAULT_CODEX_HOME,
+        session_codex_home=(
+            get_session_codex_home_root(session_id)
+            if session_id
+            else get_bridge_codex_home_root() / "sessions" / "unbound"
+        ),
+        directory=current_cwd,
+        thread_id=thread_id,
+        exec_mode=CODEX_EXEC_MODE,
+        agent_backend=bot_agent_backend(bot.config),
+    )
+    status_text = f"{bridge_status_text}\n\n{format_codex_status(native_status)}"
     if sess:
         register_reply_session(bot, req_id, sess)
     await respond_info(bot, req_id, status_text)
@@ -6204,9 +6571,20 @@ def ensure_session_control_safe(record: dict[str, Any]) -> None:
         raise BridgeError(409, f"session is owned by another instance: {record['chatKey']}")
 
 
+def acquire_session_control_lease(bot: BotState, key: str, sess: SessionState) -> None:
+    with session_key_lock(str(bot.config["id"]), key):
+        record = read_session_record_by_id(sess.session_id)
+        if record is None:
+            raise BridgeError(404, f"session not found: {key}")
+        ensure_session_control_safe(record)
+        if not _acquire_session_lease_unlocked(bot, sess, key):
+            raise BridgeError(409, f"session is owned by another instance: {key}")
+
+
 def control_session(bot: BotState, key: str, clear_thread: bool, clear_chat: bool) -> dict[str, Any]:
     sess = bot.sessions.get(key)
     if sess:
+        acquire_session_control_lease(bot, key, sess)
         interrupt_session(
             bot,
             key,
@@ -6296,7 +6674,7 @@ def get_allowed_file_roots(bot: BotState, key: str, *, session_id: Optional[str]
     return deduped
 
 
-def validate_file_for_upload(bot: BotState, key: str, file_path: str, *, session_id: Optional[str] = None) -> Path:
+def validate_file_for_upload(bot: BotState, key: str, file_path: str, *, session_id: Optional[str] = None, media_type: str = "file") -> Path:
     resolved = Path(file_path).expanduser().resolve()
     if not resolved.exists():
         raise BridgeError(404, f"file not found: {resolved}")
@@ -6306,9 +6684,10 @@ def validate_file_for_upload(bot: BotState, key: str, file_path: str, *, session
     if not any(is_path_inside(resolved, root) for root in allowed_roots):
         allowed = ", ".join(str(root) for root in allowed_roots)
         raise BridgeError(403, f"filePath is outside allowed roots: {allowed}")
-    size = resolved.stat().st_size
-    if size > MAX_UPLOAD_SIZE:
-        raise BridgeError(413, f"file too large: {size} bytes (max {MAX_UPLOAD_SIZE})")
+    try:
+        validate_media_upload(resolved.name, resolved.stat().st_size, media_type, max_bytes=MAX_UPLOAD_SIZE)
+    except ValueError as exc:
+        raise BridgeError(413 if str(exc).startswith("file too large:") else 400, str(exc)) from exc
     return resolved
 
 
@@ -6370,6 +6749,7 @@ def resolve_schedule_target_bot_metadata(target_config_id: Optional[str], bot_na
 
 def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path]:
     file_path = data.get("filePath") or data.get("file_path")
+    media_type = str(data.get("mediaType") or data.get("media_type") or "file").strip()
     chat_key_value = data.get("chatKey") or data.get("chat_key")
     bot_name = normalize_optional_string(data.get("botName") or data.get("bot_name"))
     target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
@@ -6392,6 +6772,7 @@ def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path
                 bot,
                 validated_chat_key,
                 file_path,
+                media_type=media_type,
                 session_id=str((existing or {}).get("sessionId") or ""),
             )
             return bot, validated_chat_key, resolved_file
@@ -6416,6 +6797,7 @@ def resolve_file_send_request(data: dict[str, Any]) -> tuple[BotState, str, Path
                 bot,
                 resolved_chat_key,
                 file_path,
+                media_type=media_type,
                 session_id=str(record["sessionId"]),
             )
             return bot, resolved_chat_key, resolved_file
@@ -6726,8 +7108,22 @@ def resolve_message_send_request(data: dict[str, Any]) -> tuple[BotState, str, d
             "mentionUserId": normalize_optional_string(data.get("mentionUserId") or data.get("mention_user_id")),
             "feedbackId": feedback_id,
         }
+    elif msgtype in {"file", "image", "voice", "video"}:
+        media_id = data.get("mediaId") or data.get("media_id")
+        if not isinstance(media_id, str) or not media_id.strip():
+            raise BridgeError(400, "mediaId required")
+        payload_data = {"msgtype": msgtype, "mediaId": media_id, "title": str(data.get("title") or ""),
+                        "description": str(data.get("description") or "")}
     else:
         raise BridgeError(400, f"unsupported msgtype: {msgtype}")
+    try:
+        assistant = normalize_assistant_reply(data.get("toAiAssistant") or data.get("to_ai_assistant"), proactive=True)
+    except ValueError as exc:
+        raise BridgeError(400, str(exc)) from exc
+    if assistant:
+        if msgtype not in {"markdown", "file", "image", "video"}:
+            raise BridgeError(400, "assistant replies do not support this message type")
+        payload_data["toAiAssistant"] = assistant
 
     if reply_req_id:
         matching_bots = []
@@ -6802,11 +7198,22 @@ async def submit_send_message_request(data: dict[str, Any], source: str = "api")
         payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
         sent_template_card = dict(((payload.get("body") or {}).get("template_card") or {}))
         register_template_card_button_texts(bot, sent_template_card)
+        payloads = [payload]
+    elif payload_data["msgtype"] == "markdown":
+        payloads = build_proactive_chat_payloads(resolved_chat_key, payload_data["content"], payload_data.get("mentionUserId"))
+        for payload in payloads:
+            payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
     else:
-        payload = build_proactive_chat_payload(resolved_chat_key, payload_data["content"], payload_data.get("mentionUserId"))
-        payload["body"] = attach_message_feedback(payload["body"], payload_data.get("feedbackId"))
-    response = await send_ws_payload_with_ack(bot, payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
-    require_ack_success(response, "message send")
+        chat_type, chat_id = chat_key_to_send_target(resolved_chat_key)
+        body = {"chatid": chat_id, "chat_type": chat_type,
+                **native_media_body(payload_data["msgtype"], payload_data["mediaId"], title=payload_data["title"], description=payload_data["description"])}
+        payloads = [{"cmd": "aibot_send_msg", "headers": {"req_id": uid()}, "body": body}]
+    assistant = payload_data.get("toAiAssistant")
+    for index, payload in enumerate(payloads):
+        if assistant:
+            payload["body"]["to_ai_assistant"] = {**assistant, "reply_status": "waiting" if index < len(payloads) - 1 else assistant["reply_status"]}
+        response = await send_ws_payload_with_ack(bot, payload, PROACTIVE_SEND_ACK_TIMEOUT_SEC)
+        require_ack_success(response, "message send")
     if sent_template_card is not None:
         task_id = str(sent_template_card.get("task_id") or "").strip()
         if task_id:
@@ -6865,6 +7272,9 @@ def submit_local_send_message_request(data: dict[str, Any], source: str = "local
         "expiresAt": expires_at,
         "source": source,
     }
+    for name in ("mediaId", "title", "description", "toAiAssistant"):
+        if name in payload_data:
+            request[name] = payload_data[name]
     pending_file = local_queue_request_file_path(queue_paths["pending"], request_id)
     write_json_atomic(pending_file, request)
     add_log(bot, f"[{resolved_chat_key}] local message request accepted via {source}: {payload_data['msgtype']}")
@@ -6873,6 +7283,13 @@ def submit_local_send_message_request(data: dict[str, Any], source: str = "local
 
 def submit_file_send_request(data: dict[str, Any], source: str = "api") -> dict[str, Any]:
     bot, resolved_chat_key, resolved_file = resolve_file_send_request(data)
+    try:
+        assistant = normalize_assistant_reply(data.get("toAiAssistant") or data.get("to_ai_assistant"), proactive=True)
+    except ValueError as exc:
+        raise BridgeError(400, str(exc)) from exc
+    media_type = str(data.get("mediaType") or data.get("media_type") or "file").strip()
+    if assistant and media_type == "voice":
+        raise BridgeError(400, "assistant replies do not support voice")
     local_request_id = str(data.get("localRequestId") or data.get("local_request_id") or "").strip() or None
     local_processing_file = str(data.get("localProcessingFile") or data.get("local_processing_file") or "").strip() or None
     target_config_id = normalize_optional_string(data.get("targetConfigId") or data.get("target_config_id"))
@@ -6883,6 +7300,10 @@ def submit_file_send_request(data: dict[str, Any], source: str = "api") -> dict[
             "id": uid(),
             "chatKey": resolved_chat_key,
             "filePath": str(resolved_file),
+            "mediaType": media_type,
+            "title": str(data.get("title") or ""),
+            "description": str(data.get("description") or ""),
+            "toAiAssistant": assistant,
             "targetConfigId": target_config_id,
             "localRequestId": local_request_id,
             "localProcessingFile": local_processing_file,
@@ -8256,85 +8677,43 @@ async def upload_and_send_file(
     *,
     before_delivery: Optional[Any] = None,
     after_delivery: Optional[Any] = None,
+    media_type: str = "file",
+    title: str = "",
+    description: str = "",
+    to_ai_assistant: Optional[dict[str, Any]] = None,
 ) -> None:
     if not bot.ws or bot.ws.closed:
         raise BridgeError(503, "bot not connected")
-    file_bytes = Path(file_path).read_bytes()
-    file_name = Path(file_path).name
-    file_size = len(file_bytes)
-    chunk_size = 400 * 1024
-    total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
-    md5 = hashlib.md5(file_bytes).hexdigest()
-    chat_type, chat_id = chat_key_to_send_target(chat_key_value)
-
-    add_log(bot, f"upload file: {file_name} ({round(file_size / 1024)}KB, {total_chunks} chunks)")
-    add_event_log(bot, "file.upload_start", chatKey=chat_key_value, fileName=file_name, sizeBytes=file_size, chunks=total_chunks)
-    init_payload = {
-        "cmd": "aibot_upload_media_init",
-        "headers": {"req_id": uid()},
-        "body": {
-            "type": "file",
-            "filename": file_name,
-            "total_size": file_size,
-            "total_chunks": total_chunks,
-            "md5": md5,
-        },
-    }
-    init_response = await send_ws_payload_with_ack(bot, init_payload, 30)
-    upload_id = require_ack_success(init_response, "upload init", required_body_key="upload_id")["upload_id"]
-
-    chunk_futures: list[asyncio.Future] = []
-    chunk_req_ids: list[str] = []
-    for idx in range(total_chunks):
-        chunk = file_bytes[idx * chunk_size : (idx + 1) * chunk_size]
-        req_id = uid()
-        future = create_request_future(bot, req_id)
-        payload = {
-            "cmd": "aibot_upload_media_chunk",
-            "headers": {"req_id": req_id},
-            "body": {"upload_id": upload_id, "chunk_index": idx, "base64_data": base64.b64encode(chunk).decode("ascii")},
-        }
-        try:
-            await send_ws_payload(bot, payload)
-        except Exception:
-            bot.pending_requests.pop(req_id, None)
-            raise
-        chunk_req_ids.append(req_id)
-        chunk_futures.append(future)
-
+    path = Path(file_path)
     try:
-        chunk_responses = await asyncio.wait_for(asyncio.gather(*chunk_futures), max(5, total_chunks * 2))
-    except asyncio.TimeoutError as exc:
-        for req_id in chunk_req_ids:
-            bot.pending_requests.pop(req_id, None)
-        raise BridgeError(504, "upload chunk ack timeout") from exc
-    for req_id, response in zip(chunk_req_ids, chunk_responses):
-        try:
-            require_ack_success(response, "upload chunk")
-        except BridgeError as exc:
-            raise BridgeError(502, f"upload chunk failed: {req_id} {exc.message.removeprefix('upload chunk failed: ')}") from exc
-
-    finish_payload = {
-        "cmd": "aibot_upload_media_finish",
-        "headers": {"req_id": uid()},
-        "body": {"upload_id": upload_id},
-    }
-    finish_response = await send_ws_payload_with_ack(bot, finish_payload, 60)
-    media_id = require_ack_success(finish_response, "upload finish", required_body_key="media_id")["media_id"]
-
-    send_payload = {
-        "cmd": "aibot_send_msg",
-        "headers": {"req_id": uid()},
-        "body": {"chatid": chat_id, "chat_type": chat_type, "msgtype": "file", "file": {"media_id": media_id}},
-    }
+        assistant = normalize_assistant_reply(to_ai_assistant, proactive=True)
+        if assistant and media_type == "voice":
+            raise ValueError("assistant replies do not support voice")
+        validate_media_upload(path.name, path.stat().st_size, media_type, max_bytes=MAX_UPLOAD_SIZE)
+    except ValueError as exc:
+        raise BridgeError(413 if str(exc).startswith("file too large:") else 400, str(exc)) from exc
+    cache_root = SHARED_RUNTIME_ROOT / ".wecom-uploads" / quote(str(bot.config["id"]), safe="")
+    try:
+        media_id = await upload_media(
+            path, filename=path.name, media_type=media_type, owner=str(bot.config["botId"]), destination=chat_key_value,
+            cache_root=cache_root, send=lambda payload, timeout: send_ws_payload_with_ack(bot, payload, timeout),
+            uid=uid, max_bytes=MAX_UPLOAD_SIZE,
+        )
+    except MediaUploadRejected as exc:
+        raise BridgeError(502, str(exc)) from exc
+    chat_type, chat_id = chat_key_to_send_target(chat_key_value)
+    body = {"chatid": chat_id, "chat_type": chat_type, **native_media_body(media_type, media_id, title=title, description=description)}
+    if assistant:
+        body["to_ai_assistant"] = assistant
+    send_payload = {"cmd": "aibot_send_msg", "headers": {"req_id": uid()}, "body": body}
     if before_delivery:
         before_delivery()
     response = await send_ws_payload_with_ack(bot, send_payload, 30)
     require_ack_success(response, "file send")
     if after_delivery:
         after_delivery()
-    add_log(bot, f"file sent: {file_name}")
-    add_event_log(bot, "file.sent", chatKey=chat_key_value, fileName=file_name, mediaId=media_id)
+    add_log(bot, f"{media_type} sent: {path.name}")
+    add_event_log(bot, "file.sent", chatKey=chat_key_value, fileName=path.name, mediaId=media_id, mediaType=media_type)
 
 
 async def upload_worker(bot: BotState) -> None:
@@ -8407,6 +8786,10 @@ async def upload_worker(bot: BotState) -> None:
                     bot,
                     job["chatKey"],
                     job["filePath"],
+                    media_type=str(job.get("mediaType") or "file"),
+                    title=str(job.get("title") or ""),
+                    description=str(job.get("description") or ""),
+                    to_ai_assistant=job.get("toAiAssistant"),
                     before_delivery=before_delivery,
                 )
             )
@@ -9534,6 +9917,16 @@ def copy_missing_tree_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, destination, follow_symlinks=False)
 
 
+def copy_bridge_session_resume_state(source_session_id: str, target_session_id: str) -> None:
+    if source_session_id == target_session_id:
+        return
+    source = get_session_codex_home_root(source_session_id) / "sessions"
+    if not source.exists() or not source.is_dir():
+        return
+    target = get_session_codex_home_root(target_session_id) / "sessions"
+    copy_missing_tree_contents(source, target)
+
+
 def clone_payload_sequence(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(item) for item in payloads]
 
@@ -9871,27 +10264,43 @@ def save_bots() -> None:
         write_persisted_bot_configs_unlocked(stored)
 
 
-async def cancel_task(task: Optional[asyncio.Task]) -> None:
+async def cancel_task(task: Optional[asyncio.Task], timeout_sec: Optional[float] = None) -> bool:
     if not task:
-        return
+        return True
     task.cancel()
     try:
-        await task
+        if timeout_sec is None:
+            await task
+        else:
+            await asyncio.wait_for(asyncio.shield(task), timeout_sec)
     except asyncio.CancelledError:
-        pass
+        return True
+    except asyncio.TimeoutError:
+        return False
     except Exception:
-        pass
+        return True
+    return True
 
 
-async def terminate_process(process: Optional[asyncio.subprocess.Process], timeout_sec: int = 5) -> None:
+async def terminate_process(
+    process: Optional[asyncio.subprocess.Process],
+    timeout_sec: float = 5,
+    *,
+    require_exit: bool = False,
+    skip_wait_if_exited: bool = False,
+) -> bool:
     if not process:
-        return
-    if process.returncode is None:
-        process.kill()
-    try:
-        await asyncio.wait_for(process.wait(), timeout_sec)
-    except Exception:
-        pass
+        return True
+    if skip_wait_if_exited and process.returncode is not None:
+        session_id = getattr(process, "_bridge_process_session_id", None)
+        if session_id is None:
+            return True
+    exited = await terminate_process_tree(process, timeout_sec=timeout_sec)
+    if exited:
+        return True
+    if require_exit:
+        raise BridgeError(409, "agent process did not exit; session context was not cleared")
+    return False
 
 
 async def stop_bot(
@@ -9913,6 +10322,9 @@ async def stop_bot(
         await bot.ws.close()
     await cancel_task(bot.heartbeat_task)
     await cancel_task(bot.reader_task)
+    for task in list(bot.callback_tasks):
+        await cancel_task(task)
+    bot.callback_tasks.clear()
     await cancel_task(bot.runner_task)
     await cancel_task(bot.upload_worker_task)
     release_bot_runtime_lock(bot)
@@ -9955,7 +10367,118 @@ async def remove_bot(bot_id: str) -> None:
         delete_template_card_state(bot_id)
 
 
-async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
+async def dispatch_assistant_call(bot: BotState, frames: list[dict]) -> None:
+    first = frames[0]
+    assistant_info = _as_dict(
+        _as_dict(_as_dict(first.get("body")).get("compat_info")).get("from_ai_assistant")
+    )
+    task_id = str(assistant_info.get("task_id") or "")
+    timeout_task = bot.assistant_call_timeout_tasks.pop(task_id, None)
+    if timeout_task is not None and timeout_task is not asyncio.current_task():
+        timeout_task.cancel()
+    key = chat_key_for_bot(bot, first)
+    req_id = str(_as_dict(first.get("headers")).get("req_id") or "")
+    texts = [text_with_quote(message_text(_as_dict(frame.get("body"))), _as_dict(frame.get("body")))
+             for frame in frames if _as_dict(frame.get("body")).get("msgtype") == "text"]
+    content = "\n\n".join(text for text in texts if text)
+    if not content:
+        content = "本次智能助理调用只提供了附件，未提供文字指令。请询问需要执行的处理目标。"
+    async with get_session_lifecycle_lock(bot, key):
+        sess = await get_or_create_session_ready(bot, key)
+        if not acquire_session_lease(bot, sess, key):
+            await respond_queued_error(bot, req_id, "session is temporarily owned by another instance")
+            return
+        register_reply_session(bot, req_id, sess)
+        media = [(body.get("msgtype"), _as_dict(body.get(body.get("msgtype"))))
+                 for frame in frames if (body := _as_dict(frame.get("body"))).get("msgtype") in {"image", "file"}]
+        media.extend(item for frame in frames for item in quoted_media(_as_dict(frame.get("body"))))
+        if media:
+            await respond_info(bot, req_id, "正在接收本次调用的附件。", final=False)
+        for kind, payload in media:
+            sess.pending_media_downloads += 1
+            try:
+                sess.pending_media.append(await download_incoming_media(bot, sess, key, kind, payload))
+            except Exception as exc:
+                add_log(bot, f"[{key}] assistant attachment receive failed: {type(exc).__name__}")
+                sess.pending_media_notes.append("本次调用的附件接收失败；请说明需要重新提供附件，不能声称已读取成功。")
+            finally:
+                sess.pending_media_downloads = max(0, sess.pending_media_downloads - 1)
+        await enqueue_message_for_session(bot, sess, key, content, req_id, silent_lease_failure=False,
+                                          scheduled_job_file=None, schedule_id=None, schedule_request_id=None)
+
+
+async def expire_assistant_call(bot: BotState, task_id: str) -> None:
+    try:
+        await asyncio.sleep(ASSISTANT_CALL_TIMEOUT_SEC)
+        frames = bot.assistant_calls.expire(task_id, timeout_sec=ASSISTANT_CALL_TIMEOUT_SEC)
+        if not frames:
+            return
+        first = frames[0]
+        req_id = str(_as_dict(first.get("headers")).get("req_id") or "")
+        if req_id:
+            await respond_info(bot, req_id, "本次智能助理调用未在规定时间内收齐全部内容，已结束。")
+        add_log(bot, f"assistant call timed out task_id={task_id}")
+    finally:
+        bot.assistant_call_timeout_tasks.pop(task_id, None)
+
+
+async def enqueue_text_with_quoted_media(bot: BotState, message: dict[str, Any], content: str) -> None:
+    key = chat_key_for_bot(bot, message)
+    req_id = str(_as_dict(message.get("headers")).get("req_id") or "")
+    async with get_session_lifecycle_lock(bot, key):
+        sess = await get_or_create_session_ready(bot, key)
+        if not acquire_session_lease(bot, sess, key):
+            await respond_queued_error(bot, req_id, "session is temporarily owned by another instance")
+            return
+        register_reply_session(bot, req_id, sess)
+        await respond_info(bot, req_id, "正在接收引用消息的附件。", final=False)
+        for kind, payload in quoted_media(_as_dict(message.get("body"))):
+            try:
+                sess.pending_media.append(await download_incoming_media(bot, sess, key, kind, payload))
+            except Exception as exc:
+                add_log(bot, f"[{key}] quoted attachment receive failed: {type(exc).__name__}")
+                sess.pending_media_notes.append("引用附件无法下载，可能已过期；请说明需要重新发送，不能声称已读取成功。")
+        await enqueue_message_for_session(bot, sess, key, content, req_id, silent_lease_failure=False,
+                                          scheduled_job_file=None, schedule_id=None, schedule_request_id=None)
+
+
+def load_wecom_feedback(bot: BotState) -> dict[str, dict[str, Any]]:
+    if bot.feedback_records:
+        return bot.feedback_records
+    path = SHARED_RUNTIME_ROOT / ".wecom-feedback" / (quote(str(bot.config["id"]), safe="") + ".json")
+    try:
+        payload = json.loads(path.read_text("utf-8"))
+        records = payload.get("records") if isinstance(payload, dict) else []
+        if isinstance(records, list):
+            bot.feedback_records = {record["id"]: record for record in records if isinstance(record, dict) and isinstance(record.get("id"), str)}
+    except (OSError, ValueError):
+        pass
+    return bot.feedback_records
+
+
+def record_wecom_feedback(bot: BotState, body: dict[str, Any]) -> None:
+    load_wecom_feedback(bot)
+    record = feedback_event(body)
+    if record is None:
+        return
+    record = {**record, "user_id": str(_as_dict(body.get("from")).get("userid") or ""),
+              "source": message_source(body), "received_at": now_ms()}
+    for context in bot.callback_contexts.values():
+        if context.get("feedback_id") == record["id"]:
+            record["chat_key"] = context["chat_key"]
+            record["assistant_task_id"] = context.get("assistant_task_id")
+            break
+    # The latest verdict replaces the previous one; type 3 explicitly cancels it.
+    bot.feedback_records[record["id"]] = record
+    if len(bot.feedback_records) > 1000:
+        oldest = min(bot.feedback_records, key=lambda key: bot.feedback_records[key]["received_at"])
+        bot.feedback_records.pop(oldest, None)
+    path = SHARED_RUNTIME_ROOT / ".wecom-feedback" / (quote(str(bot.config["id"]), safe="") + ".json")
+    write_json_atomic(path, {"records": list(bot.feedback_records.values())})
+    add_event_log(bot, "wecom.feedback", feedbackId=record["id"], feedbackType=record["type"], source=record["source"])
+
+
+async def handle_wecom_message(bot: BotState, message: dict[str, Any], *, received_at: Optional[float] = None) -> None:
     if not isinstance(message, dict):
         return
     bot.last_inbound_at_ms = now_ms()
@@ -9969,6 +10492,14 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         inbound_chat_key = chat_key_for_bot(bot, message)
     except BridgeError:
         inbound_chat_key = None
+    if req_id and inbound_chat_key and message.get("cmd") in {"aibot_msg_callback", "aibot_event_callback"}:
+        now = bot.rate_limiter.clock()
+        bot.callback_contexts = {key: value for key, value in bot.callback_contexts.items() if now - value["received_at"] < 86400}
+        try:
+            bot.callback_contexts[str(req_id)] = callback_context(message, inbound_chat_key, chat_key_to_send_target(inbound_chat_key), received_at=received_at if received_at is not None else now)
+        except ValueError as exc:
+            add_log(bot, f"invalid callback context: {exc}")
+            return
     if req_id:
         response_url = extract_response_url(message)
         if response_url and inbound_chat_key:
@@ -9991,6 +10522,12 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
 
     command = message.get("cmd")
     msg_type = body.get("msgtype")
+    if command == "aibot_event_callback" and _as_dict(body.get("event")).get("eventtype") == "feedback_event":
+        try:
+            record_wecom_feedback(bot, body)
+        except ValueError as exc:
+            add_log(bot, f"invalid feedback event: {exc}")
+        return
     if command == "aibot_event_callback" and msg_type == "event":
         event = _as_dict(body.get("event"))
         if str(event.get("eventtype") or "").strip() == "disconnected_event":
@@ -10023,11 +10560,27 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         add_log(bot, f"ignore duplicate event: {event_key}")
         return
     RECENT_EVENTS[event_key] = time.time() + RECENT_EVENT_TTL
+    if command == "aibot_msg_callback" and message_source(body) == "ai_assistant":
+        try:
+            frames = bot.assistant_calls.add(message)
+        except ValueError as exc:
+            await respond_info(bot, req_id, f"本次调用的输入无法聚合：{exc}")
+            return
+        if frames is not None:
+            await dispatch_assistant_call(bot, frames)
+        else:
+            task_id = str(_as_dict(_as_dict(body.get("compat_info")).get("from_ai_assistant")).get("task_id") or "")
+            if task_id and task_id not in bot.assistant_call_timeout_tasks:
+                timeout_task = asyncio.create_task(expire_assistant_call(bot, task_id))
+                bot.assistant_call_timeout_tasks[task_id] = timeout_task
+                bot.callback_tasks.add(timeout_task)
+                timeout_task.add_done_callback(bot.callback_tasks.discard)
+        return
 
-    if command == "aibot_msg_callback" and msg_type == "text":
-        text_body = _as_dict(body.get("text"))
-        content = strip_text_mentions((text_body.get("content") or ""), bot.config.get("name"))
-        command_text = normalize_bridge_command_text((text_body.get("content") or ""), bot.config.get("name"))
+    if command == "aibot_msg_callback" and msg_type in {"text", "voice"}:
+        inbound_text = message_text(body)
+        content = strip_text_mentions(inbound_text, bot.config.get("name"))
+        command_text = normalize_bridge_command_text(inbound_text, bot.config.get("name"))
         key = inbound_chat_key
         add_log(bot, f'recv: "{content}" {key}')
         try:
@@ -10071,6 +10624,9 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
             if command_text == "/bridge-interrupt":
                 await interrupt_session_command(bot, key, req_id)
                 return
+            if command_text == "/new":
+                await new_session_command(bot, key, req_id)
+                return
             if command_text == "/bridge-reset":
                 await reset_session_command(bot, key, req_id)
                 return
@@ -10090,7 +10646,11 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
             await respond_info(bot, req_id, f"Bridge command failed: {exc.message}")
             return
         if content:
-            await enqueue_message(bot, key, content, req_id)
+            business_text = text_with_quote(content, body)
+            if quoted_media(body):
+                await enqueue_text_with_quoted_media(bot, message, business_text)
+            else:
+                await enqueue_message(bot, key, business_text, req_id)
         return
 
     if command == "aibot_msg_callback" and msg_type == "image":
@@ -10099,10 +10659,10 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         await enqueue_media_message(bot, message, "image")
         return
 
-    if command == "aibot_msg_callback" and msg_type == "file":
+    if command == "aibot_msg_callback" and msg_type in {"file", "video"}:
         key = chat_key_for_bot(bot, message)
         add_log(bot, f"recv file {key}")
-        await enqueue_media_message(bot, message, "file")
+        await enqueue_media_message(bot, message, msg_type)
         return
 
     if command == "aibot_msg_callback" and msg_type == "mixed":
@@ -10138,6 +10698,25 @@ async def handle_wecom_message(bot: BotState, message: dict[str, Any]) -> None:
         return
 
 
+async def handle_wecom_frame_safely(bot: BotState, payload: Any, received_at: Optional[float] = None) -> None:
+    try:
+        await handle_wecom_message(bot, payload, received_at=received_at)
+    except BridgeError as exc:
+        add_log(bot, f"message handling error: {exc.message}")
+        if isinstance(payload, dict) and payload.get("cmd") == "aibot_msg_callback":
+            req_id = _as_dict(payload.get("headers")).get("req_id")
+            await respond_info(bot, req_id, f"请求处理失败：{exc.message}")
+    except Exception as exc:
+        add_log(bot, f"message handling crash: {exc}")
+
+
+async def run_bounded_callback_task(bot: BotState, payload: Any, received_at: float) -> None:
+    try:
+        await handle_wecom_frame_safely(bot, payload, received_at)
+    finally:
+        bot.callback_semaphore.release()
+
+
 async def ws_reader_loop(bot: BotState, ws: aiohttp.ClientWebSocketResponse) -> None:
     async for raw_msg in ws:
         if raw_msg.type == WSMsgType.TEXT:
@@ -10145,14 +10724,12 @@ async def ws_reader_loop(bot: BotState, ws: aiohttp.ClientWebSocketResponse) -> 
                 payload = json.loads(raw_msg.data)
             except Exception:
                 continue
-            try:
-                await handle_wecom_message(bot, payload)
-            except BridgeError as exc:
-                add_log(bot, f"message handling error: {exc.message}")
-                req_id = ((payload.get("headers") or {}).get("req_id"))
-                await respond_info(bot, req_id, f"Bridge error: {exc.message}")
-            except Exception as exc:
-                add_log(bot, f"message handling crash: {exc}")
+            # Apply backpressure before creating a task. A semaphore inside the
+            # task would still allow an unbounded number of waiting tasks.
+            await bot.callback_semaphore.acquire()
+            task = asyncio.create_task(run_bounded_callback_task(bot, payload, bot.rate_limiter.clock()))
+            bot.callback_tasks.add(task)
+            task.add_done_callback(bot.callback_tasks.discard)
         elif raw_msg.type == WSMsgType.ERROR:
             raise BridgeError(503, f"websocket error: {ws.exception()}")
         elif raw_msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED):
@@ -10323,13 +10900,39 @@ async def enqueue_message(
     schedule_id: Optional[str] = None,
     schedule_request_id: Optional[str] = None,
 ) -> bool:
-    try:
-        sess = await get_or_create_session_ready(bot, key)
-    except Exception as exc:
-        if not silent_lease_failure:
-            add_log(bot, f"[{key}] init failed: {exc}")
-            await respond_queued_error(bot, req_id, f"init failed: {exc}")
-        return False
+    async with get_session_lifecycle_lock(bot, key):
+        try:
+            sess = await get_or_create_session_ready(bot, key)
+        except Exception as exc:
+            if not silent_lease_failure:
+                add_log(bot, f"[{key}] init failed: {exc}")
+                await respond_queued_error(bot, req_id, f"init failed: {exc}")
+            return False
+        return await enqueue_message_for_session(
+            bot,
+            sess,
+            key,
+            text,
+            req_id,
+            silent_lease_failure=silent_lease_failure,
+            scheduled_job_file=scheduled_job_file,
+            schedule_id=schedule_id,
+            schedule_request_id=schedule_request_id,
+        )
+
+
+async def enqueue_message_for_session(
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    text: str,
+    req_id: Optional[str],
+    *,
+    silent_lease_failure: bool,
+    scheduled_job_file: Optional[str],
+    schedule_id: Optional[str],
+    schedule_request_id: Optional[str],
+) -> bool:
     if not acquire_session_lease(bot, sess, key):
         if not silent_lease_failure:
             add_log(bot, f"[{key}] lease owned by another process, ignore message")
@@ -10374,12 +10977,24 @@ async def enqueue_message(
 async def enqueue_media_message(bot: BotState, message: dict[str, Any], kind: str) -> None:
     key = chat_key_for_bot(bot, message)
     req_id = ((message.get("headers") or {}).get("req_id"))
-    try:
-        sess = await get_or_create_session_ready(bot, key)
-    except Exception as exc:
-        add_log(bot, f"[{key}] media session init failed: {exc}")
-        await respond_queued_error(bot, req_id, f"init failed: {exc}")
-        return
+    async with get_session_lifecycle_lock(bot, key):
+        try:
+            sess = await get_or_create_session_ready(bot, key)
+        except Exception as exc:
+            add_log(bot, f"[{key}] media session init failed: {exc}")
+            await respond_queued_error(bot, req_id, f"init failed: {exc}")
+            return
+        await enqueue_media_message_for_session(bot, sess, key, req_id, message, kind)
+
+
+async def enqueue_media_message_for_session(
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    req_id: Optional[str],
+    message: dict[str, Any],
+    kind: str,
+) -> None:
     if not acquire_session_lease(bot, sess, key):
         add_log(bot, f"[{key}] lease owned by another process, ignore media message")
         add_event_log(bot, "session.lease_conflict", chatKey=key, sessionId=sess.session_id, action="drop_media_message")
@@ -10406,12 +11021,23 @@ async def enqueue_media_message(bot: BotState, message: dict[str, Any], kind: st
 async def enqueue_mixed_message(bot: BotState, message: dict[str, Any]) -> None:
     key = chat_key_for_bot(bot, message)
     req_id = ((message.get("headers") or {}).get("req_id"))
-    try:
-        sess = await get_or_create_session_ready(bot, key)
-    except Exception as exc:
-        add_log(bot, f"[{key}] mixed session init failed: {exc}")
-        await respond_queued_error(bot, req_id, f"init failed: {exc}")
-        return
+    async with get_session_lifecycle_lock(bot, key):
+        try:
+            sess = await get_or_create_session_ready(bot, key)
+        except Exception as exc:
+            add_log(bot, f"[{key}] mixed session init failed: {exc}")
+            await respond_queued_error(bot, req_id, f"init failed: {exc}")
+            return
+        await enqueue_mixed_message_for_session(bot, sess, key, req_id, message)
+
+
+async def enqueue_mixed_message_for_session(
+    bot: BotState,
+    sess: SessionState,
+    key: str,
+    req_id: Optional[str],
+    message: dict[str, Any],
+) -> None:
     if not acquire_session_lease(bot, sess, key):
         add_log(bot, f"[{key}] lease owned by another process, ignore mixed message")
         add_event_log(bot, "session.lease_conflict", chatKey=key, sessionId=sess.session_id, action="drop_mixed_message")
@@ -10438,7 +11064,17 @@ async def enqueue_mixed_message(bot: BotState, message: dict[str, Any]) -> None:
     if images:
         await respond_info(bot, req_id, "Mixed message images processed.", final=not bool(mixed_text))
     if mixed_text:
-        await enqueue_message(bot, key, mixed_text, req_id)
+        await enqueue_message_for_session(
+            bot,
+            sess,
+            key,
+            mixed_text,
+            req_id,
+            silent_lease_failure=False,
+            scheduled_job_file=None,
+            schedule_id=None,
+            schedule_request_id=None,
+        )
 
 
 async def session_recycler_loop() -> None:
@@ -10746,6 +11382,11 @@ def bot_to_payload(bot: BotState) -> dict[str, Any]:
         "secretSource": bot_secret_source(bot.config),
         "status": bot.status,
         "healthy": health["healthy"],
+        "capabilities": {"assistantAggregation": True, "assistantReplyState": True,
+                         "channelGroupCompatibility": True, "nativeChannelLongConnection": False,
+                         "nativeMediaTypes": ["file", "image", "voice", "video"],
+                         "resumableUploads": True, "feedbackCollection": True, "conversationRateLimits": True},
+        "callbackBusy": any(not task.done() for task in bot.callback_tasks),
         "wsConnected": health["wsConnected"],
         "runnerTaskDone": health["runnerTaskDone"],
         "uploadWorkerDone": health["uploadWorkerDone"],
@@ -10802,6 +11443,17 @@ def persisted_bot_to_payload(config: dict[str, Any]) -> dict[str, Any]:
         "logs": [],
         "sessions": [],
     }
+
+
+async def api_get_wecom_feedback(request: web.Request) -> web.Response:
+    bot = BOTS.get(request.match_info["bot_id"])
+    if bot is None:
+        raise web.HTTPNotFound(text="bot not found")
+    records = list(load_wecom_feedback(bot).values())
+    counts = {"accurate": sum(record.get("type") == 1 for record in records),
+              "inaccurate": sum(record.get("type") == 2 for record in records),
+              "cancelled": sum(record.get("type") == 3 for record in records)}
+    return web.json_response({"counts": counts, "records": sorted(records, key=lambda record: record.get("received_at", 0), reverse=True)[:100]})
 
 
 async def api_get_bots(request: web.Request) -> web.Response:
@@ -10895,11 +11547,22 @@ async def api_interrupt_session(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "bot not found"}, status=404)
     key = unquote(request.match_info["chat_key"])
     try:
-        result = control_session(bot, key, clear_thread=False, clear_chat=False)
-        sess = bot.sessions.get(key)
+        result, sess = await interrupt_session_and_wait(bot, key)
         if sess:
             resume_session_queue(bot, sess, key, "interrupt api")
         return web.json_response({"ok": True, "action": "interrupt", **result})
+    except BridgeError as exc:
+        return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
+
+
+async def api_new_session(request: web.Request) -> web.Response:
+    bot = BOTS.get(request.match_info["bot_id"])
+    if not bot:
+        return web.json_response({"ok": False, "error": "bot not found"}, status=404)
+    key = unquote(request.match_info["chat_key"])
+    try:
+        result = await new_session_context(bot, key)
+        return web.json_response({"ok": True, "action": "new", **result})
     except BridgeError as exc:
         return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
 
@@ -10910,7 +11573,7 @@ async def api_reset_session(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "bot not found"}, status=404)
     key = unquote(request.match_info["chat_key"])
     try:
-        result = control_session(bot, key, clear_thread=True, clear_chat=True)
+        result = await reset_session_context(bot, key)
         return web.json_response({"ok": True, "action": "reset", **result})
     except BridgeError as exc:
         return web.json_response({"ok": False, "error": exc.message}, status=exc.status_code)
@@ -11056,12 +11719,14 @@ def build_app() -> web.Application:
     app.router.add_get("/livez", api_livez)
     app.router.add_get("/healthz", api_healthz)
     app.router.add_get("/api/bots", api_get_bots)
+    app.router.add_get("/api/bots/{bot_id}/feedback", api_get_wecom_feedback)
     app.router.add_post("/api/bots", api_add_bot)
     app.router.add_delete("/api/bots/{bot_id}", api_delete_bot)
     app.router.add_post("/api/bots/{bot_id}/restart", api_restart_bot)
     app.router.add_post("/api/bots/{bot_id}/stop", api_stop_bot)
     app.router.add_get("/api/bots/{bot_id}/sessions/{chat_key}/chat", api_get_chat)
     app.router.add_post("/api/bots/{bot_id}/sessions/{chat_key}/interrupt", api_interrupt_session)
+    app.router.add_post("/api/bots/{bot_id}/sessions/{chat_key}/new", api_new_session)
     app.router.add_post("/api/bots/{bot_id}/sessions/{chat_key}/reset", api_reset_session)
     app.router.add_post("/api/send-message", api_send_message)
     app.router.add_post("/api/send-file", api_send_file)

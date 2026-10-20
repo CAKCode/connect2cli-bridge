@@ -10,6 +10,8 @@ from workspace_bridge.runtime import (
     cleanup_outdated_session_artifacts,
     cleanup_orphan_session_codex_homes,
     cleanup_stale_session_codex_homes,
+    create_new_session_run,
+    current_session_id,
     list_session_records,
     load_session_record,
     load_reply_url_state,
@@ -53,6 +55,48 @@ def test_stable_session_id_changes_when_workspace_identity_changes() -> None:
 
     assert first != second
     assert first != third
+
+
+def test_create_new_session_run_persists_new_binding_and_keeps_previous_record(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    source_dir = tmp_path / "repo"
+    global_skill_dir = tmp_path / "global-skills"
+    source_dir.mkdir()
+    global_skill_dir.mkdir()
+    models_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    context_module.DEFAULT_GLOBAL_SKILL_DIR = global_skill_dir.resolve()
+    bot = build_bot_config(
+        bot_id="bot-1",
+        bot_name="codex",
+        source_dir=source_dir,
+        runtime_root=tmp_path / "runtime",
+        workspace_namespace="team-a",
+        chatfile_root=tmp_path / "chatfiles",
+        workspace_mode="team",
+    )
+    previous = prepare_session_run(bot, "single:alice")
+    store_session_record(
+        bot.runtime_root,
+        replace(
+            previous.session,
+            thread_id="thread-old",
+            recent_chat=({"role": "user", "text": "keep-chat"},),
+        ),
+    )
+
+    current = create_new_session_run(bot, "single:alice")
+
+    assert current.session.session_id != previous.session.session_id
+    assert current_session_id(bot, "single:alice") == current.session.session_id
+    assert prepare_session_run(bot, "single:alice").session.session_id == current.session.session_id
+    assert current.session.thread_id is None
+    assert current.session.recent_chat == ()
+    previous_record = load_session_record(bot.runtime_root, previous.session.session_id)
+    assert previous_record is not None
+    assert previous_record.thread_id == "thread-old"
+    assert previous_record.recent_chat == ({"role": "user", "text": "keep-chat"},)
+    assert cleanup_outdated_session_artifacts(bot) == 0
 
 
 def test_build_bot_config_rejects_missing_source_dir(tmp_path: Path) -> None:

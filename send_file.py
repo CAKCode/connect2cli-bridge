@@ -57,6 +57,8 @@ EXPECTED_ARG_KEYS = {
     "timeout_ms",
     "file-path",
     "file_path",
+    "media-type", "media_type", "title", "description",
+    "assistant-task-id", "assistant_task_id", "reply-status", "reply_status",
 }
 DASH_PREFIX_VALUE_KEYS = {
     "file-path",
@@ -168,6 +170,15 @@ def main() -> None:
     bot_config_id = args.get("bot-config-id") or args.get("bot_config_id") or DEFAULT_BOT_CONFIG_ID
     timeout_ms = parse_timeout_ms(args.get("timeout-ms") or args.get("timeout_ms"))
     file_path_arg = args.get("file-path") or args.get("file_path") or ""
+    media_type = args.get("media-type") or args.get("media_type") or "file"
+    if media_type not in {"file", "image", "voice", "video"}:
+        fail("media-type must be file, image, voice or video", 2)
+    assistant_task_id = args.get("assistant-task-id") or args.get("assistant_task_id") or os.environ.get("WECOM_BRIDGE_ASSISTANT_TASK_ID", "")
+    reply_status = args.get("reply-status") or args.get("reply_status") or "waiting"
+    if reply_status not in {"waiting", "finished"}:
+        fail("reply-status must be waiting or finished", 2)
+    if assistant_task_id and media_type == "voice":
+        fail("assistant replies do not support voice", 2)
     _queue_root, pending_root, result_root = queue_paths_for_target(bot_config_id)
 
     if not session_id and not chat_key:
@@ -206,6 +217,15 @@ def main() -> None:
             "timeoutMs": max(1000, deadline_ms - requested_at),
             "expiresAt": deadline_ms,
         }
+
+        if media_type != "file":
+            request["mediaType"] = media_type
+        if args.get("title"):
+            request["title"] = args["title"]
+        if args.get("description"):
+            request["description"] = args["description"]
+        if assistant_task_id:
+            request["toAiAssistant"] = {"task_id": assistant_task_id, "reply_status": reply_status}
 
         pending_file = pending_root / f"{request_id}.json"
         result_file = result_root / f"{request_id}.json"

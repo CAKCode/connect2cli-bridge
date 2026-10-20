@@ -4,11 +4,121 @@ import json
 import os
 import shlex
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 
 AgentBackend = Literal["codex", "claude"]
+PROGRESS_SUMMARY_MAX_CHARS = 480
+
+
+@dataclass(frozen=True)
+class AgentProgress:
+    status: str
+    summary: str = ""
+
+    def updated(self, update: AgentProgress) -> AgentProgress:
+        return AgentProgress(update.status, update.summary or self.summary)
+
+
+def _progress_summary(value: object) -> str:
+    """Normalize an explicit agent-provided stage summary for display."""
+    if isinstance(value, list):
+        value = " ".join(_progress_summary(part) for part in value)
+    elif isinstance(value, dict):
+        value = value.get("text")
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if len(text) <= PROGRESS_SUMMARY_MAX_CHARS:
+        return text
+    return text[: PROGRESS_SUMMARY_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _codex_item_progress(item: object, event_type: str) -> AgentProgress | None:
+    """Keep public descriptions separate from tool and execution stages."""
+    if not isinstance(item, dict):
+        return None
+    item_type = str(item.get("type") or "").strip().lower()
+    if item_type in {"agent_message", "agentmessage"}:
+        if event_type != "item.completed":
+            return None
+        summary = _progress_summary(item.get("text"))
+        return AgentProgress("处理中", summary) if summary else None
+    if item_type == "command_execution":
+        return AgentProgress("执行中")
+    if item_type in {"mcp_tool_call", "function_call"}:
+        return AgentProgress("处理中")
+    if item_type == "file_change":
+        return AgentProgress("修改中")
+    if item_type == "web_search":
+        return AgentProgress("检索中")
+    if item_type == "reasoning":
+        return AgentProgress("分析中", _progress_summary(item.get("summary")))
+    return None
+
+
+def extract_agent_progress(backend: AgentBackend, stdout: str) -> AgentProgress | None:
+    """Extract a stage and any public description, excluding raw tool output."""
+    latest = None
+    for line in str(stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        progress = None
+        if backend == "claude":
+            payload_type = str(payload.get("type") or "").strip().lower()
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if payload_type == "assistant" and isinstance(content, list):
+                summary_parts = []
+                status = ""
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type") or "").strip().lower()
+                    if block_type == "tool_use":
+                        status = "处理中"
+                    elif block_type == "text":
+                        text = _progress_summary(block.get("text"))
+                        if text:
+                            summary_parts.append(text)
+                            status = status or "整理中"
+                if status:
+                    progress = AgentProgress(status, _progress_summary(" ".join(summary_parts)))
+            elif payload_type in {"tool_use", "tool_result"}:
+                progress = AgentProgress("处理中")
+            if progress is not None:
+                latest = latest.updated(progress) if latest is not None else progress
+            continue
+
+        event_type = str(payload.get("type") or "").strip().replace("/", ".")
+        item = payload.get("item")
+        if event_type in {"item.started", "item.updated", "item.completed"}:
+            progress = _codex_item_progress(item, event_type)
+        elif event_type in {
+            "item.reasoning.summaryPartAdded",
+            "item.reasoning.summaryTextDelta",
+            "item.reasoning.summaryTextDone",
+        }:
+            summary = _progress_summary(
+                payload.get("summary") or payload.get("text") or payload.get("content") or payload.get("delta")
+            )
+            if summary:
+                progress = AgentProgress("分析中", summary)
+        elif event_type == "turn.started":
+            progress = AgentProgress("分析中")
+        elif event_type == "error":
+            progress = AgentProgress("重试中")
+        # Raw reasoning, command output and unfinished answer deltas do not
+        # replace the last complete public description.
+        if progress is not None:
+            latest = latest.updated(progress) if latest is not None else progress
+    return latest
 
 
 def normalize_agent_backend(value: str | None) -> AgentBackend:

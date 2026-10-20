@@ -19,6 +19,13 @@ from .template_card_validation import (
     validate_feedback_id,
     validate_template_card_update_payload,
 )
+from .wecom_text import (
+    WECOM_CONTENT_MAX_BYTES,
+    split_markdown_chunks,
+    split_text_chunks as split_text_chunks,
+    truncate_markdown,
+)
+from .wecom_context import normalize_assistant_reply, message_text
 
 _UID_COUNTER = itertools.count()
 TEXT_MENTION_RE = re.compile(r"(?<!\S)@\S+(?:\s+|$)")
@@ -106,35 +113,7 @@ def prepend_group_user_mention(content: str, user_id: str | None) -> str:
 
 
 def limit_proactive_text(content: str) -> str:
-    text = str(content or "").strip()
-    if len(text) <= PROACTIVE_TEXT_MAX_CHARS:
-        return text
-    suffix = "...(truncated)"
-    return text[: max(0, PROACTIVE_TEXT_MAX_CHARS - len(suffix))].rstrip() + suffix
-
-
-def split_text_chunks(content: str, *, max_chars: int) -> list[str]:
-    text = str(content or "").strip()
-    if not text:
-        return [""]
-    chunks: list[str] = []
-    remaining = text
-    limit = max(1, int(max_chars))
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit + 1)
-        if split_at <= 0:
-            split_at = remaining.rfind(" ", 0, limit + 1)
-        if split_at <= 0:
-            split_at = limit
-        chunk = remaining[:split_at].rstrip()
-        if not chunk:
-            chunk = remaining[:limit]
-            split_at = len(chunk)
-        chunks.append(chunk)
-        remaining = remaining[split_at:].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
+    return truncate_markdown(content, max_chars=PROACTIVE_TEXT_MAX_CHARS, suffix="...(truncated)")
 
 
 def build_proactive_text_payload(chat_key: str, content: str, mention_user_id: str | None = None) -> dict:
@@ -153,6 +132,16 @@ def _resolve_message_body(message: OutboundMessage) -> dict:
 
 
 def _resolve_message_body_with_options(message: OutboundMessage, *, truncate_markdown: bool) -> dict:
+    body = _resolve_plain_message_body(message, truncate_markdown=truncate_markdown)
+    assistant = normalize_assistant_reply(message.to_ai_assistant, proactive=True)
+    if assistant:
+        if body["msgtype"] not in {"markdown", "file", "image", "video"}:
+            raise ValueError("assistant replies do not support this message type")
+        body["to_ai_assistant"] = assistant
+    return body
+
+
+def _resolve_plain_message_body(message: OutboundMessage, *, truncate_markdown: bool) -> dict:
     msgtype = str(message.msgtype or "").strip()
     feedback_id = validate_feedback_id(message.feedback_id) if message.feedback_id else None
     if msgtype == "markdown":
@@ -228,10 +217,21 @@ def build_proactive_message_payloads(message: OutboundMessage) -> list[dict]:
     if str(message.msgtype or "").strip() != "markdown":
         return [build_proactive_message_payload(message)]
     content = str(message.content or "")
-    mention_user_id = message.mention_user_id
-    chunks = split_text_chunks(content, max_chars=PROACTIVE_TEXT_MAX_CHARS)
+    mention_user_id = _normalize_optional_text(message.mention_user_id)
+    if not mention_user_id and message.chat_key.startswith("group-user:"):
+        mention_user_id = chat_key_to_user_id(message.chat_key)
+    mention = format_group_user_mention(mention_user_id)
+    mention_size = len((mention + "\n").encode("utf-8")) if mention else 0
+    chunks = split_markdown_chunks(
+        content,
+        max_chars=PROACTIVE_TEXT_MAX_CHARS,
+        max_bytes=WECOM_CONTENT_MAX_BYTES - mention_size,
+    )
     payloads: list[dict] = []
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
+        assistant = normalize_assistant_reply(message.to_ai_assistant, proactive=True)
+        if assistant and index < len(chunks) - 1:
+            assistant["reply_status"] = "waiting"
         payloads.append(
             build_proactive_message_payload_with_options(
                 OutboundMessage(
@@ -240,6 +240,7 @@ def build_proactive_message_payloads(message: OutboundMessage) -> list[dict]:
                     content=chunk,
                     mention_user_id=mention_user_id,
                     feedback_id=message.feedback_id,
+                    to_ai_assistant=assistant,
                 ),
                 truncate_markdown=False,
             )
@@ -275,10 +276,12 @@ def strip_text_mentions(content: str, bot_name: str | None = None) -> str:
 
 def normalize_bridge_command_text(content: str, bot_name: str | None = None) -> str:
     text = strip_text_mentions(content, bot_name)
-    if text.startswith("/bridge-") or text.startswith("/cwd"):
+    if text == "/new" or text.startswith(("/bridge-", "/cwd")):
         return text
     fallback = LEADING_MENTION_RE.sub("", str(content or ""), count=1).strip()
-    return fallback if fallback.startswith("/bridge-") or fallback.startswith("/cwd") else str(content or "").strip()
+    if fallback == "/new" or fallback.startswith(("/bridge-", "/cwd")):
+        return fallback
+    return str(content or "").strip()
 
 
 def build_subscribe_payload(bot: BotConfig, *, req_id: str | None = None) -> dict:
@@ -314,16 +317,29 @@ def build_template_card_update_payload(request: TemplateCardUpdateRequest) -> di
     }
 
 
-def build_text_response_payloads(req_id: str, session_id: str, content: str, *, final: bool) -> list[dict]:
-    chunks = split_text_chunks(content, max_chars=STREAM_TEXT_MAX_CHARS)
+def stream_text_preview(content: str, *, max_chars: int | None = None) -> str:
+    limit = STREAM_TEXT_MAX_CHARS if max_chars is None else max_chars
+    return truncate_markdown(content, max_chars=limit, suffix="\n\n（完整内容将在最终回复中显示。）")
+
+
+def build_text_response_payloads(
+    req_id: str, session_id: str, content: str, *, final: bool, max_chars: int | None = None
+) -> list[dict]:
+    limit = STREAM_TEXT_MAX_CHARS if max_chars is None else max_chars
+    if not final:
+        # Refreshes replace the existing stream's full content. Only the final
+        # reply creates additional messages, so progress never leaves stale streams.
+        preview = stream_text_preview(content, max_chars=limit)
+        return [build_text_response_payload(req_id, session_id, preview, final=False)]
+    chunks = split_markdown_chunks(content, max_chars=limit)
     payloads: list[dict] = []
     for index, chunk in enumerate(chunks):
         payloads.append(
             build_text_response_payload(
                 req_id,
-                session_id,
+                session_id if index == 0 else f"{session_id}-part-{index + 1}",
                 chunk,
-                final=final and index == len(chunks) - 1,
+                final=True,
             )
         )
     return payloads
@@ -333,7 +349,7 @@ def parse_text_callback(payload: dict) -> WeComTextMessage | None:
     if payload.get("cmd") != "aibot_msg_callback":
         return None
     body = _as_dict(payload.get("body"))
-    if body.get("msgtype") != "text":
+    if body.get("msgtype") not in {"text", "voice"}:
         return None
     try:
         chat_key = chat_key_from_message(payload)
@@ -342,7 +358,7 @@ def parse_text_callback(payload: dict) -> WeComTextMessage | None:
     return WeComTextMessage(
         req_id=str(_as_dict(payload.get("headers")).get("req_id") or ""),
         chat_key=chat_key,
-        content=str((_as_dict(body.get("text")).get("content")) or ""),
+        content=message_text(body),
         raw_payload=payload,
     )
 

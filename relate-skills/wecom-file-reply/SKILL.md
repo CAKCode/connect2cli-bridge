@@ -221,3 +221,11 @@ python3 /home/jenkins/.codex/skills/wecom-file-reply/scripts/publish_temp_link.p
 - 发送压缩包时只回复类似“文件超过企微上限，已发送压缩包：sample.zip”
 - 发送下载链接时只回复类似“文件超过企微上限，下载链接：<url>”
 - 失败时只回复类似“文件发送失败，我重新试一下”
+
+## 原生媒体预览
+
+当当前 `BridgeContext` 明确提供 `nativeMediaTypes` 时，可以在 `localSendFileCommand` 后追加 `--media-type image|video|voice`。截图或图片预览优先使用 `image`（PNG/JPEG/GIF，10 MB）；MP4 原生视频播放使用 `video`（10 MB）；AMR 原生语音使用 `voice`（2 MB）。用户明确要求原文件下载或保留原始文件时继续使用默认 `file`（20 MB）。媒体至少 5 字节；更小的文件可先打包 ZIP 后按普通文件发送。
+
+原生格式不支持或超过该媒体类型上限，但仍能作为普通文件发送时，可回退为 `file` 并说明发送形式；超过普通文件上限继续使用原有压缩或真实下载链接流程。只有当前 Context 声明支持时才追加这些参数，避免向旧版本命令传未知选项。
+
+智能助理调用（`messageSource: ai_assistant`）不支持原生语音或模板卡片回复。追加的文件/图片/视频会自动关联本次 `assistantTaskId` 并保持 `waiting`；标准执行最后的正文会声明 `finished`。还有后续回复时，不要提前手动指定 `--reply-status finished`。聊天继续只输出可读结果，不粘贴 YAML/JSON。

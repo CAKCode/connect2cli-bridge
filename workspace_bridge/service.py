@@ -8,6 +8,7 @@ for its existing library API and regression coverage, but it is not launched by
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from contextlib import suppress
 import json
 import hashlib
@@ -30,11 +31,11 @@ from .runtime import (
     cleanup_outdated_session_artifacts,
     cleanup_orphan_session_codex_homes,
     cleanup_stale_session_codex_homes,
+    current_session_id,
     load_reply_url_state,
     load_session_record,
     load_template_card_state,
     normalize_optional_int,
-    stable_session_id,
 )
 from .schedule_runtime import process_due_schedules_once, process_scheduled_jobs_once
 from .template_card_validation import validate_feedback_id, validate_template_card_payload, validate_template_card_update_payload
@@ -311,7 +312,13 @@ async def api_send_file(request) -> web.Response:
             session_id=launch.session.session_id,
             chat_key=chat_key,
             file_path=file_path,
+            media_type=str(data.get("mediaType") or data.get("media_type") or "file"),
+            title=str(data.get("title") or ""),
+            description=str(data.get("description") or ""),
+            to_ai_assistant=data.get("toAiAssistant") or data.get("to_ai_assistant"),
         )
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(text=str(exc)) from exc
     except PermissionError as exc:
@@ -417,8 +424,23 @@ async def api_send_message(request) -> web.Response:
             template_card=template_card,
             feedback_id=feedback_id,
         )
+    elif msgtype in {"file", "image", "voice", "video"}:
+        media_id = data.get("mediaId") or data.get("media_id")
+        if not isinstance(media_id, str) or not media_id.strip():
+            raise web.HTTPBadRequest(text="mediaId required")
+        message = OutboundMessage(chat_key=resolved_chat_key, msgtype=msgtype, media_id=media_id,
+                                  template_card={"title": str(data.get("title") or ""), "description": str(data.get("description") or "")} if msgtype == "video" else None)
     else:
         raise web.HTTPBadRequest(text=f"unsupported msgtype: {msgtype}")
+    from .wecom_context import normalize_assistant_reply
+    try:
+        assistant = normalize_assistant_reply(data.get("toAiAssistant") or data.get("to_ai_assistant"), proactive=True)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    if assistant:
+        if msgtype not in {"markdown", "file", "image", "video"}:
+            raise web.HTTPBadRequest(text="assistant replies do not support this message type")
+        message = replace(message, to_ai_assistant=assistant)
     if not reply_req_id and (runtime.ws is None or not runtime.connected):
         raise web.HTTPServiceUnavailable(text="bot not connected")
     try:
@@ -501,13 +523,7 @@ async def api_list_schedules(request) -> web.Response:
             **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": item.schedule_id,
             "chatKey": item.chat_key,
-            "sessionId": stable_session_id(
-                bot_id,
-                item.chat_key,
-                request.app[APP_CONFIG_KEY].source_dir,
-                request.app[APP_CONFIG_KEY].workspace_namespace,
-                request.app[APP_CONFIG_KEY].workspace_mode,
-            ),
+            "sessionId": current_session_id(request.app[APP_BOT_KEY], item.chat_key),
             "workspaceId": build_workspace_ref(
                 request.app[APP_CONFIG_KEY].runtime_root,
                 request.app[APP_CONFIG_KEY].workspace_namespace,
@@ -607,13 +623,7 @@ async def api_create_schedule(request) -> web.Response:
             **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": definition.schedule_id,
             "chatKey": definition.chat_key,
-            "sessionId": stable_session_id(
-                request.app[APP_CONFIG_KEY].bot_id,
-                definition.chat_key,
-                request.app[APP_CONFIG_KEY].source_dir,
-                request.app[APP_CONFIG_KEY].workspace_namespace,
-                request.app[APP_CONFIG_KEY].workspace_mode,
-            ),
+            "sessionId": current_session_id(request.app[APP_BOT_KEY], definition.chat_key),
             "workspaceId": build_workspace_ref(
                 request.app[APP_CONFIG_KEY].runtime_root,
                 request.app[APP_CONFIG_KEY].workspace_namespace,
@@ -646,13 +656,7 @@ async def api_get_schedule(request) -> web.Response:
             **_schedule_bot_identity_payload(request.app[APP_CONFIG_KEY]),
             "scheduleId": definition.schedule_id,
             "chatKey": definition.chat_key,
-            "sessionId": stable_session_id(
-                request.app[APP_CONFIG_KEY].bot_id,
-                definition.chat_key,
-                request.app[APP_CONFIG_KEY].source_dir,
-                request.app[APP_CONFIG_KEY].workspace_namespace,
-                request.app[APP_CONFIG_KEY].workspace_mode,
-            ),
+            "sessionId": current_session_id(request.app[APP_BOT_KEY], definition.chat_key),
             "workspaceId": build_workspace_ref(
                 request.app[APP_CONFIG_KEY].runtime_root,
                 request.app[APP_CONFIG_KEY].workspace_namespace,
@@ -841,6 +845,11 @@ def create_app(config: AppConfig) -> web.Application:
             schedule_task_.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await schedule_task_
+        for callback_task in list(runtime_.callback_tasks):
+            callback_task.cancel()
+        if runtime_.callback_tasks:
+            await asyncio.gather(*runtime_.callback_tasks, return_exceptions=True)
+        runtime_.callback_tasks.clear()
         for message_task in list(runtime_.message_tasks):
             message_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
