@@ -17828,6 +17828,7 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
     finals = []
     stream_closures = []
     expired = False
+    proactive_started_at = None
     real_sleep = asyncio.sleep
     now = bridge_module.time.monotonic()
 
@@ -17880,7 +17881,10 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
         return process
 
     async def send_status(_bot, _key, _sess, _req, content):
+        nonlocal proactive_started_at
         statuses.append(content)
+        if _req in _sess.reply_proactive_req_ids:
+            proactive_started_at = now
         return True
 
     async def send_final(_bot, _key, _sess, payload, final):
@@ -17888,8 +17892,16 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
         return True
 
     async def close_stream(_bot, _key, _sess, req_id):
+        nonlocal proactive_started_at
         stream_closures.append(req_id)
         _sess.reply_proactive_req_ids.add(req_id)
+        proactive_started_at = now
+
+    def proactive_due(_sess, _req_id):
+        return bool(
+            proactive_started_at is not None
+            and now - proactive_started_at >= bridge_module.PROACTIVE_STATUS_INTERVAL_SEC
+        )
 
     monkeypatch.setattr(bridge_module, "time", Clock())
     monkeypatch.setattr(bridge_module.asyncio, "sleep", controlled_sleep)
@@ -17898,6 +17910,7 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
     monkeypatch.setattr(bridge_module, "send_or_store_session_payload", send_final)
     monkeypatch.setattr(bridge_module, "reply_age_too_long", lambda *_args: expired)
     monkeypatch.setattr(bridge_module, "close_reply_stream_for_proactive", close_stream)
+    monkeypatch.setattr(bridge_module, "proactive_status_due", proactive_due)
     run = asyncio.create_task(bridge_module.run_codex(bot, sess, "single:test-user", "prompt", "req-1", []))
 
     async def next_tick():
@@ -17927,6 +17940,16 @@ async def test_run_codex_refreshes_only_changed_progress(bridge_module, monkeypa
             gate = await next_tick()
         assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 1
         assert stream_closures == (["req-1"] if expire_stream else [])
+        if expire_stream:
+            heartbeat_ticks = (
+                bridge_module.PROACTIVE_STATUS_INTERVAL_SEC
+                + bridge_module.STATUS_STREAM_INTERVAL_SEC
+                - 1
+            ) // bridge_module.STATUS_STREAM_INTERVAL_SEC
+            for _ in range(max(0, heartbeat_ticks - 3)):
+                gate.set_result(None)
+                gate = await next_tick()
+            assert statuses.count(f"**运行状态：{stage}**\n\n正在核对配置并整理结果") == 2
 
         tool_event = {
             "type": "item.started",

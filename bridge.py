@@ -5213,7 +5213,10 @@ async def run_codex(
                         content = build_status_stream_content(
                             f"**运行状态：{latest_progress.status}**", latest_progress.summary
                         )
-                        if content == last_sent_content:
+                        proactive_mode = req_id in sess.reply_proactive_req_ids
+                        if content == last_sent_content and not (
+                            proactive_mode and proactive_status_due(sess, req_id)
+                        ):
                             continue
                         if await send_session_status(bot, key, sess, req_id, content):
                             last_sent_content = content
