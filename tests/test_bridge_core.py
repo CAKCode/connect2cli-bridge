@@ -17490,7 +17490,7 @@ async def test_expired_stream_status_mentions_group_user_after_max_age(bridge_mo
 
 
 @pytest.mark.asyncio
-async def test_send_session_status_waits_for_heartbeat_interval_after_closing_stream(bridge_module, monkeypatch):
+async def test_send_session_status_sends_summary_when_closing_stream(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
     stream_payloads = []
@@ -17510,11 +17510,12 @@ async def test_send_session_status_waits_for_heartbeat_interval_after_closing_st
 
     delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "status")
 
-    assert delivered is False
+    assert delivered is True
     assert stream_payloads[0]["cmd"] == "aibot_respond_msg"
     assert stream_payloads[0]["body"]["stream"]["finish"] is True
     assert "后台运行" in stream_payloads[0]["body"]["stream"]["content"]
-    assert proactive_payloads == []
+    assert proactive_payloads[0]["cmd"] == "aibot_send_msg"
+    assert proactive_payloads[0]["body"]["markdown"]["content"] == "status"
 
 
 @pytest.mark.asyncio
@@ -18083,20 +18084,21 @@ async def test_run_codex_sends_fixed_heartbeats_after_stream_expiry(
         assert not sent[-1][1]["body"]["stream"]["finish"]
 
         await tick_at(expires_at)
-        assert proactive_messages() == []
-        close_notice = sent[-1][1]["body"]["stream"]
+        assert len(proactive_messages()) == 1
+        close_notice = sent[-2][1]["body"]["stream"]
         assert close_notice["finish"] is True
         assert "每 120 秒" in close_notice["content"]
 
         for heartbeat_number in (1, 2):
             due_at = expires_at + heartbeat_number * 120
             await tick_at(due_at - 5)
-            assert len(proactive_messages()) == heartbeat_number - 1
-            await tick_at(due_at)
             assert len(proactive_messages()) == heartbeat_number
+            await tick_at(due_at)
+            assert len(proactive_messages()) == heartbeat_number + 1
         heartbeats = proactive_messages()
-        assert [timestamp for timestamp, _payload in heartbeats] == [expires_at + 120, expires_at + 240]
+        assert [timestamp for timestamp, _payload in heartbeats] == [expires_at, expires_at + 120, expires_at + 240]
         assert heartbeats[0][1]["body"]["markdown"]["content"] == heartbeats[1][1]["body"]["markdown"]["content"]
+        assert heartbeats[1][1]["body"]["markdown"]["content"] == heartbeats[2][1]["body"]["markdown"]["content"]
         if progress_enabled:
             assert "正在检查日志" in heartbeats[0][1]["body"]["markdown"]["content"]
         else:

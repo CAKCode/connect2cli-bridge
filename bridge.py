@@ -3409,7 +3409,7 @@ def mark_reply_proactive(sess: SessionState, req_id: Optional[str]) -> None:
 def build_reply_window_expired_notice() -> str:
     return (
         "流式回复窗口即将到期，任务仍在后台运行，"
-        f"后续每 {PROACTIVE_STATUS_INTERVAL_SEC} 秒主动发送运行状态，完成后发送最终结果。"
+        f"窗口关闭时发送文字摘要，后续每 {PROACTIVE_STATUS_INTERVAL_SEC} 秒继续发送，完成后发送最终结果。"
     )
 
 
@@ -3430,17 +3430,13 @@ async def close_reply_stream_for_proactive(bot: BotState, key: str, sess: Sessio
     if not req_id or req_id in sess.reply_proactive_req_ids:
         return
     notice_payload = build_session_text_payload(key, sess, req_id, build_reply_window_expired_notice(), True)
-    notice_delivered = False
     if notice_payload:
         notice_payload = decorate_context_replies([notice_payload], sess.reply_contexts.get(req_id), final=False)[0]
         try:
             await send_session_payload(bot, sess, notice_payload)
-            notice_delivered = True
         except Exception as exc:
             add_log(bot, f"[{key}] stream close notice skipped req_id={req_id}: {exc}")
     mark_reply_proactive(sess, req_id)
-    if notice_delivered:
-        mark_proactive_status_sent(sess, req_id)
 
 
 async def acquire_session_send_lock(sess: SessionState, timeout_sec: Optional[int] = None) -> bool:
