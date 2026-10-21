@@ -17518,6 +17518,29 @@ async def test_send_session_status_waits_for_heartbeat_interval_after_closing_st
 
 
 @pytest.mark.asyncio
+async def test_send_session_status_retries_heartbeat_immediately_when_stream_close_fails(bridge_module):
+    bot = make_bot(bridge_module)
+    sess = make_session(bridge_module, bot)
+    proactive_payloads = []
+
+    bot.ws = make_flaky_acking_ws(
+        bot, fail_on_send_number=1, on_send=proactive_payloads.append,
+        error=bridge_module.BridgeError(503, "websocket closed"),
+    )
+    bridge_module.register_reply_session(bot, "req-1", sess)
+    sess.reply_started_at["req-1"] = time.time() - bridge_module.REPLY_MAX_AGE_FALLBACK_SEC - 1
+
+    delivered = await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "status")
+
+    assert delivered is True
+    assert len(proactive_payloads) == 1
+    assert proactive_payloads[0]["cmd"] == "aibot_send_msg"
+    assert proactive_payloads[0]["body"]["markdown"]["content"] == "status"
+    assert await bridge_module.send_session_status(bot, "single:test-user", sess, "req-1", "status") is False
+    assert len(proactive_payloads) == 1
+
+
+@pytest.mark.asyncio
 async def test_final_reply_after_max_age_falls_back_to_proactive(bridge_module, monkeypatch):
     bot = make_bot(bridge_module)
     sess = make_session(bridge_module, bot)
